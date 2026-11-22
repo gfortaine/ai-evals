@@ -1,0 +1,1819 @@
+diff --git a/app/controllers/api/v1/base_controller.rb b/app/controllers/api/v1/base_controller.rb
+index 3b3275c..cfa58df 100644
+--- a/app/controllers/api/v1/base_controller.rb
++++ b/app/controllers/api/v1/base_controller.rb
+@@ -171,6 +171,7 @@ module Api
+           subject: ticket.subject,
+           status: ticket.status,
+           requester_id: ticket.requester_id,
++          merged_into_id: ticket.merged_into_id,
+           created_at: ticket.created_at&.iso8601(3),
+           updated_at: (ticket.public_updated_at || ticket.updated_at)&.iso8601(3)
+         }
+@@ -220,6 +221,7 @@ module Api
+             id: ticket.assignee.id,
+             name: ticket.assignee.name
+           } : nil,
++          merged_into_id: ticket.merged_into_id,
+           created_at: ticket.created_at&.iso8601(3),
+           updated_at: ticket.updated_at&.iso8601(3)
+         }
+diff --git a/app/controllers/api/v1/requests_controller.rb b/app/controllers/api/v1/requests_controller.rb
+index 35a88e8..1923334 100644
+--- a/app/controllers/api/v1/requests_controller.rb
++++ b/app/controllers/api/v1/requests_controller.rb
+@@ -73,48 +73,64 @@ module Api
+         request_params = require_hash_param(params, :request)
+         comment_params = optional_hash_param(request_params, :comment)
+ 
+-        errors = {}
++        ActiveRecord::Base.transaction do
++          current_account.lock!
++          @ticket = own_tickets.lock.find_by(id: @ticket.id)
++          unless @ticket
++            render_error("Request not found", code: "not_found", status: :not_found)
++            raise ActiveRecord::Rollback
++          end
+ 
+-        status_provided = request_params.key?(:status)
+-        requested_status = request_params[:status]
+-        if status_provided && requested_status != "solved"
+-          errors[:status] = [ "can only be set to solved" ]
+-        end
++          if @ticket.closed?
++            render_validation_errors(
++              { status: [ "cannot update a closed request" ] },
++              message: "Closed requests cannot be updated"
++            )
++            raise ActiveRecord::Rollback
++          end
+ 
+-        comment = nil
+-        if comment_params
+-          comment = TicketComment.new(
+-            account: current_account,
+-            ticket: @ticket,
+-            author: current_user,
+-            body: comment_params.permit(:body)[:body],
+-            public: true
+-          )
+-          unless comment.valid?
+-            errors[:comment] = comment.errors.to_hash
++          errors = {}
++
++          status_provided = request_params.key?(:status)
++          requested_status = request_params[:status]
++          if status_provided && requested_status != "solved"
++            errors[:status] = [ "can only be set to solved" ]
+           end
+-        end
+ 
+-        if errors.any?
+-          render_validation_errors(errors)
+-          return
+-        end
++          comment = nil
++          if comment_params
++            comment = TicketComment.new(
++              account: current_account,
++              ticket: @ticket,
++              author: current_user,
++              body: comment_params.permit(:body)[:body],
++              public: true
++            )
++            unless comment.valid?
++              errors[:comment] = comment.errors.to_hash
++            end
++          end
+ 
+-        if status_provided && requested_status == "solved"
+-          @ticket.status = "solved"
+-        elsif comment && (@ticket.pending? || @ticket.solved?)
+-          @ticket.status = "open"
+-        end
++          if errors.any?
++            render_validation_errors(errors)
++            raise ActiveRecord::Rollback
++          end
+ 
+-        unless @ticket.valid?
+-          render_validation_errors(@ticket.errors.to_hash)
+-          return
+-        end
++          if status_provided && requested_status == "solved"
++            @ticket.status = "solved"
++          elsif comment && (@ticket.pending? || @ticket.solved?)
++            @ticket.status = "open"
++          end
++
++          unless @ticket.valid?
++            render_validation_errors(@ticket.errors.to_hash)
++            raise ActiveRecord::Rollback
++          end
+ 
+-        ActiveRecord::Base.transaction do
+           @ticket.save! if @ticket.changed?
+           comment&.save!
+         end
++        return if performed?
+ 
+         render json: { request: serialize_request(@ticket) }, status: :ok
+       end
+diff --git a/app/controllers/api/v1/tickets_controller.rb b/app/controllers/api/v1/tickets_controller.rb
+index 4187744..6918ee0 100644
+--- a/app/controllers/api/v1/tickets_controller.rb
++++ b/app/controllers/api/v1/tickets_controller.rb
+@@ -7,7 +7,7 @@ module Api
+       before_action :authenticate_user!
+       before_action :require_active_account!
+       before_action :require_staff!
+-      before_action :set_ticket, only: %i[show update comments]
++      before_action :set_ticket, only: %i[show update comments merge]
+ 
+       def index
+         scope = current_account.tickets.includes(:requester, :assignee, :group).recently_active_first
+@@ -105,12 +105,20 @@ module Api
+             raise ActiveRecord::Rollback
+           end
+ 
++          if @ticket.closed?
++            render_validation_errors(
++              { status: [ "cannot update a closed ticket" ] },
++              message: "Closed tickets cannot be updated"
++            )
++            raise ActiveRecord::Rollback
++          end
++
+           errors = {}
+ 
+           status_provided = ticket_params.key?(:status)
+           requested_status = ticket_params[:status]
+           if status_provided
+-            if requested_status.is_a?(String) && Ticket::STATUSES.include?(requested_status)
++            if requested_status.is_a?(String) && Ticket::EDITABLE_STATUSES.include?(requested_status)
+               @ticket.status = requested_status
+             else
+               errors[:status] = [ "is not included in the list" ]
+@@ -264,6 +272,111 @@ module Api
+         render json: { ticket: serialize_ticket(@ticket) }, status: :ok
+       end
+ 
++      def merge
++        merge_params = require_hash_param(params, :merge)
++        source_comment_params = optional_hash_param(merge_params, :source_comment)
++        target_comment_params = optional_hash_param(merge_params, :target_comment)
++        parsed_target_id = parse_positive_bigint(merge_params[:target_id])
++
++        source_id = nil
++        target_id = nil
++
++        ActiveRecord::Base.transaction do
++          current_account.lock!
++
++          ids_to_lock = [ @ticket.id ]
++          ids_to_lock << parsed_target_id if parsed_target_id && parsed_target_id != @ticket.id
++          locked_tickets = current_account.tickets.where(id: ids_to_lock).order(:id).lock.index_by(&:id)
++
++          source = locked_tickets[@ticket.id]
++          unless source
++            render_error("Ticket not found", code: "not_found", status: :not_found)
++            raise ActiveRecord::Rollback
++          end
++
++          target = parsed_target_id ? locked_tickets[parsed_target_id] : nil
++          errors = {}
++
++          if source.closed?
++            errors[:source] = [ "cannot merge a closed ticket" ]
++          end
++
++          if target.nil?
++            errors[:target_id] = [ "must be a valid ticket in this account" ]
++          elsif target.id == source.id
++            errors[:target_id] = [ "cannot be the same as the source ticket" ]
++          elsif target.closed?
++            errors[:target_id] = [ "cannot merge into a closed ticket" ]
++          elsif target.requester_id != source.requester_id
++            errors[:target_id] = [ "must belong to the same requester" ]
++          end
++
++          default_source_body = target ? "This ticket was closed and merged into ticket ##{target.id}." : "This ticket was closed and merged."
++          default_target_body = "Ticket ##{source.id} was closed and merged into this ticket."
++
++          parsed_source_comment = parse_merge_comment(source_comment_params, default_body: default_source_body)
++          errors[:source_comment] = parsed_source_comment[:errors] if parsed_source_comment[:errors].any?
++
++          parsed_target_comment = parse_merge_comment(target_comment_params, default_body: default_target_body)
++          errors[:target_comment] = parsed_target_comment[:errors] if parsed_target_comment[:errors].any?
++
++          if errors.any?
++            render_validation_errors(errors)
++            raise ActiveRecord::Rollback
++          end
++
++          source.status = "closed"
++          source.merged_into = target
++
++          source_comment = TicketComment.new(
++            account: current_account,
++            ticket: source,
++            author: current_user,
++            body: parsed_source_comment[:body],
++            public: parsed_source_comment[:public],
++            allow_closed_ticket: true
++          )
++
++          target_comment = TicketComment.new(
++            account: current_account,
++            ticket: target,
++            author: current_user,
++            body: parsed_target_comment[:body],
++            public: parsed_target_comment[:public]
++          )
++
++          source_valid = source.valid?
++          source_comment_valid = source_comment.valid?
++          target_comment_valid = target_comment.valid?
++
++          unless source_valid && source_comment_valid && target_comment_valid
++            model_errors = source.errors.to_hash
++            model_errors[:source_comment] = source_comment.errors.to_hash if source_comment.errors.any?
++            model_errors[:target_comment] = target_comment.errors.to_hash if target_comment.errors.any?
++            render_validation_errors(model_errors)
++            raise ActiveRecord::Rollback
++          end
++
++          source.save!
++          source_comment.save!
++          target_comment.save!
++
++          source_id = source.id
++          target_id = target.id
++        end
++        return if performed?
++
++        reloaded = current_account.tickets
++          .includes(:requester, :assignee, :group)
++          .where(id: [ source_id, target_id ])
++          .index_by(&:id)
++
++        render json: {
++          source: serialize_ticket(reloaded.fetch(source_id)),
++          target: serialize_ticket(reloaded.fetch(target_id))
++        }, status: :ok
++      end
++
+       def comments
+         result = paginate(@ticket.comments.includes(:author).oldest_first)
+         render json: {
+@@ -273,6 +386,44 @@ module Api
+ 
+       private
+ 
++      def parse_merge_comment(comment_params, default_body:)
++        comment_errors = {}
++
++        if comment_params.nil?
++          return { body: default_body, public: false, errors: comment_errors }
++        end
++
++        if comment_params.key?(:body)
++          raw_body = comment_params[:body]
++          if raw_body.is_a?(String)
++            body_value = raw_body
++            comment_errors[:body] = [ "can't be blank" ] if body_value.blank?
++          elsif raw_body.nil?
++            body_value = nil
++            comment_errors[:body] = [ "can't be blank" ]
++          else
++            body_value = nil
++            comment_errors[:body] = [ "must be a string" ]
++          end
++        else
++          body_value = default_body
++        end
++
++        if comment_params.key?(:public)
++          raw_public = comment_params[:public]
++          if raw_public == true || raw_public == false
++            is_public = raw_public
++          else
++            comment_errors[:public] = [ "must be a boolean" ]
++            is_public = false
++          end
++        else
++          is_public = false
++        end
++
++        { body: body_value, public: is_public, errors: comment_errors }
++      end
++
+       def set_ticket
+         @ticket = find_scoped_record(current_account.tickets.includes(:requester, :assignee, :group), params[:id])
+         return if @ticket
+diff --git a/app/mailboxes/support_mailbox.rb b/app/mailboxes/support_mailbox.rb
+index b163061..e1cc6e7 100644
+--- a/app/mailboxes/support_mailbox.rb
++++ b/app/mailboxes/support_mailbox.rb
+@@ -91,7 +91,7 @@ class SupportMailbox < ApplicationMailbox
+   private
+ 
+   def handle_reply(account:, ticket:, sender:, body:, inbound_message_id:)
+-    unless ticket.requester.email == sender[:email] && !ticket.requester.suspended?
++    if ticket.closed? || ticket.requester.email != sender[:email] || ticket.requester.suspended?
+       bounced!
+       return
+     end
+@@ -105,7 +105,7 @@ class SupportMailbox < ApplicationMailbox
+ 
+       ticket.lock!
+       requester = ticket.requester
+-      if requester.email != sender[:email] || requester.suspended?
++      if ticket.closed? || requester.email != sender[:email] || requester.suspended?
+         bounced!
+         raise ActiveRecord::Rollback
+       end
+diff --git a/app/models/ticket.rb b/app/models/ticket.rb
+index 07251ee..bb6456b 100644
+--- a/app/models/ticket.rb
++++ b/app/models/ticket.rb
+@@ -3,14 +3,17 @@
+ require "securerandom"
+ 
+ class Ticket < ApplicationRecord
+-  STATUSES = %w[open pending solved].freeze
++  STATUSES = %w[open pending solved closed].freeze
++  EDITABLE_STATUSES = %w[open pending solved].freeze
+   PRIORITIES = %w[normal high].freeze
+ 
+   belongs_to :account
+   belongs_to :requester, class_name: "User", inverse_of: :requested_tickets
+   belongs_to :group, optional: true, inverse_of: :tickets
+   belongs_to :assignee, class_name: "User", optional: true, inverse_of: :assigned_tickets
++  belongs_to :merged_into, class_name: "Ticket", optional: true, inverse_of: :merged_tickets
+ 
++  has_many :merged_tickets, class_name: "Ticket", foreign_key: :merged_into_id, dependent: :nullify, inverse_of: :merged_into
+   has_many :comments, class_name: "TicketComment", dependent: :delete_all, inverse_of: :ticket
+ 
+   normalizes :subject, with: ->(value) { value.to_s.strip }
+@@ -21,10 +24,13 @@ class Ticket < ApplicationRecord
+   validates :status, presence: true, inclusion: { in: STATUSES }
+   validates :priority, presence: true, inclusion: { in: PRIORITIES }
+   validates :email_reply_token, presence: true, uniqueness: true, if: :email_origin?
++  validate :cannot_modify_closed_ticket, on: :update, if: -> { status_in_database == "closed" }
+   validate :requester_belongs_to_account
+   validate :group_belongs_to_account, if: -> { group_id.present? }
+   validate :assignee_is_active_staff_in_account, if: -> { assignee_id.present? && (new_record? || will_save_change_to_assignee_id?) }
+   validate :assignee_belongs_to_group, if: -> { group_id.present? && assignee_id.present? && (new_record? || will_save_change_to_group_id? || will_save_change_to_assignee_id?) }
++  validate :merged_into_is_valid, if: -> { merged_into_id.present? && (new_record? || will_save_change_to_merged_into_id?) }
++  validate :merged_ticket_must_be_closed, if: -> { merged_into_id.present? }
+ 
+   before_create :initialize_public_updated_at
+   before_update :sync_public_updated_at
+@@ -80,6 +86,14 @@ class Ticket < ApplicationRecord
+     status == "solved"
+   end
+ 
++  def closed?
++    status == "closed"
++  end
++
++  def merged?
++    merged_into_id.present?
++  end
++
+   def normal_priority?
+     priority == "normal"
+   end
+@@ -108,13 +122,17 @@ class Ticket < ApplicationRecord
+   end
+ 
+   def sync_public_updated_at
+-    return unless will_save_change_to_status? || will_save_change_to_subject?
++    return unless will_save_change_to_status? || will_save_change_to_subject? || will_save_change_to_merged_into_id?
+ 
+     now = Time.current
+     self.updated_at = now
+     self.public_updated_at = now
+   end
+ 
++  def cannot_modify_closed_ticket
++    errors.add(:status, "cannot modify a closed ticket")
++  end
++
+   def requester_belongs_to_account
+     return unless requester && account_id
+ 
+@@ -146,4 +164,31 @@ class Ticket < ApplicationRecord
+       errors.add(:assignee_id, "must belong to the ticket's group")
+     end
+   end
++
++  def merged_into_is_valid
++    if id.present? && merged_into_id == id
++      errors.add(:merged_into_id, "cannot be the same as the ticket itself")
++      return
++    end
++
++    if merged_into.nil? || merged_into.account_id != account_id
++      errors.add(:merged_into_id, "must be a valid ticket in this account")
++      return
++    end
++
++    if merged_into.requester_id != requester_id
++      errors.add(:merged_into_id, "must belong to the same requester")
++      return
++    end
++
++    if merged_into.closed?
++      errors.add(:merged_into_id, "cannot merge into a closed ticket")
++    end
++  end
++
++  def merged_ticket_must_be_closed
++    unless closed?
++      errors.add(:status, "must be closed when merged into another ticket")
++    end
++  end
+ end
+diff --git a/app/models/ticket_comment.rb b/app/models/ticket_comment.rb
+index 359c4c8..2ccdbba 100644
+--- a/app/models/ticket_comment.rb
++++ b/app/models/ticket_comment.rb
+@@ -5,7 +5,7 @@ class TicketComment < ApplicationRecord
+   belongs_to :ticket, inverse_of: :comments
+   belongs_to :author, class_name: "User", inverse_of: :ticket_comments
+ 
+-  attr_accessor :skip_ticket_touch
++  attr_accessor :skip_ticket_touch, :allow_closed_ticket
+ 
+   normalizes :inbound_message_id, with: ->(value) { value.to_s.strip.presence }
+ 
+@@ -13,6 +13,7 @@ class TicketComment < ApplicationRecord
+   validates :public, inclusion: { in: [ true, false ] }
+   validates :inbound_message_id, uniqueness: true, allow_nil: true
+   validate :associations_belong_to_account
++  validate :ticket_is_not_closed, on: :create, unless: :allow_closed_ticket
+ 
+   after_create :touch_ticket, unless: :skip_ticket_touch
+ 
+@@ -43,4 +44,10 @@ class TicketComment < ApplicationRecord
+       errors.add(:author, "must belong to the same account")
+     end
+   end
++
++  def ticket_is_not_closed
++    if ticket&.closed?
++      errors.add(:ticket, "cannot add comments to a closed ticket")
++    end
++  end
+ end
+diff --git a/config/routes.rb b/config/routes.rb
+index 0c5424e..dfdbcc9 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -49,6 +49,7 @@ Rails.application.routes.draw do
+ 
+       resources :tickets, only: %i[index show update] do
+         get :comments, on: :member
++        post :merge, on: :member
+       end
+     end
+   end
+diff --git a/db/migrate/20261120000016_add_merged_into_to_tickets.rb b/db/migrate/20261120000016_add_merged_into_to_tickets.rb
+new file mode 100644
+index 0000000..acc4317
+--- /dev/null
++++ b/db/migrate/20261120000016_add_merged_into_to_tickets.rb
+@@ -0,0 +1,10 @@
++# frozen_string_literal: true
++
++class AddMergedIntoToTickets < ActiveRecord::Migration[8.1]
++  def change
++    add_reference :tickets, :merged_into, null: true, foreign_key: { to_table: :tickets, on_delete: :nullify }
++    add_index :tickets, [ :account_id, :merged_into_id ]
++    add_check_constraint :tickets, "merged_into_id IS NULL OR merged_into_id <> id",
++      name: "tickets_merged_into_not_self"
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index b35de0f..9f8c122 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.1].define(version: 2026_11_20_000015) do
++ActiveRecord::Schema[8.1].define(version: 2026_11_20_000016) do
+   # These are extensions that must be enabled in order to support this database
+   enable_extension "pg_catalog.plpgsql"
+ 
+@@ -171,9 +171,11 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_20_000015) do
+     t.boolean "email_origin", default: false, null: false
+     t.string "email_reply_token"
+     t.bigint "group_id"
++    t.bigint "merged_into_id"
+     t.index ["account_id", "assignee_id"], name: "index_tickets_on_account_id_and_assignee_id"
+     t.index ["account_id", "group_id", "assignee_id"], name: "index_tickets_on_account_id_and_group_id_and_assignee_id"
+     t.index ["account_id", "group_id"], name: "index_tickets_on_account_id_and_group_id"
++    t.index ["account_id", "merged_into_id"], name: "index_tickets_on_account_id_and_merged_into_id"
+     t.index ["account_id", "priority"], name: "index_tickets_on_account_id_and_priority"
+     t.index ["account_id", "requester_id", "public_updated_at", "id"], name: "index_tickets_on_account_requester_public_activity"
+     t.index ["account_id", "requester_id", "status"], name: "index_tickets_on_account_id_and_requester_id_and_status"
+@@ -184,7 +186,9 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_20_000015) do
+     t.index ["assignee_id"], name: "index_tickets_on_assignee_id"
+     t.index ["email_reply_token"], name: "index_tickets_on_email_reply_token", unique: true, where: "(email_reply_token IS NOT NULL)"
+     t.index ["group_id"], name: "index_tickets_on_group_id"
++    t.index ["merged_into_id"], name: "index_tickets_on_merged_into_id"
+     t.index ["requester_id"], name: "index_tickets_on_requester_id"
++    t.check_constraint "merged_into_id IS NULL OR merged_into_id <> id", name: "tickets_merged_into_not_self"
+   end
+ 
+   create_table "users", force: :cascade do |t|
+@@ -223,6 +227,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_20_000015) do
+   add_foreign_key "ticket_comments", "users", column: "author_id", on_delete: :cascade
+   add_foreign_key "tickets", "accounts", on_delete: :cascade
+   add_foreign_key "tickets", "groups", on_delete: :nullify
++  add_foreign_key "tickets", "tickets", column: "merged_into_id", on_delete: :nullify
+   add_foreign_key "tickets", "users", column: "assignee_id", on_delete: :nullify
+   add_foreign_key "tickets", "users", column: "requester_id", on_delete: :cascade
+   add_foreign_key "users", "accounts", on_delete: :cascade
+diff --git a/test/integration/ticket_merging_test.rb b/test/integration/ticket_merging_test.rb
+new file mode 100644
+index 0000000..eeb004f
+--- /dev/null
++++ b/test/integration/ticket_merging_test.rb
+@@ -0,0 +1,1047 @@
++# frozen_string_literal: true
++
++require "test_helper"
++
++class TicketMergingTest < ActionDispatch::IntegrationTest
++  RELAY_PATH = "/rails/action_mailbox/relay/inbound_emails"
++  RELAY_PASSWORD = "test-inbound-secret-password"
++
++  setup do
++    create_account_via_api(name: "Acme", subdomain: "acme", admin_name: "Jo", email: "jo@acme.test", password: "my-first-password")
++    verify_last_email!(subdomain: "acme")
++    @acme = Account.find_by!(subdomain: "acme")
++    @owner = @acme.owner
++    @owner_token = sign_in_via_api(subdomain: "acme", email: "jo@acme.test", password: "my-first-password")
++
++    invite_staff_via_api(token: @owner_token, email: "sam@acme.test", role: "agent")
++    accept_invitation_via_api(token: extract_last_invitation_token, name: "Sam", password: "sam-password")
++    @sam = User.find_by!(account: @acme, email: "sam@acme.test")
++    @sam_token = sign_in_via_api(subdomain: "acme", email: "sam@acme.test", password: "sam-password")
++
++    invite_staff_via_api(token: @owner_token, email: "morgan@acme.test", role: "agent")
++    accept_invitation_via_api(token: extract_last_invitation_token, name: "Morgan", password: "morgan-password")
++    @morgan = User.find_by!(account: @acme, email: "morgan@acme.test")
++    @morgan_token = sign_in_via_api(subdomain: "acme", email: "morgan@acme.test", password: "morgan-password")
++
++    register_customer_via_api(subdomain: "acme", name: "Avery", email: "avery@example.test", password: "avery-password")
++    verify_last_email!(subdomain: "acme")
++    @avery = User.find_by!(account: @acme, email: "avery@example.test")
++    @avery_token = sign_in_via_api(subdomain: "acme", email: "avery@example.test", password: "avery-password")
++
++    register_customer_via_api(subdomain: "acme", name: "Blake", email: "blake@example.test", password: "blake-password")
++    verify_last_email!(subdomain: "acme")
++    @blake = User.find_by!(account: @acme, email: "blake@example.test")
++    @blake_token = sign_in_via_api(subdomain: "acme", email: "blake@example.test", password: "blake-password")
++
++    create_account_via_api(name: "Globex", subdomain: "globex", admin_name: "Max", email: "max@globex.test", password: "globex-password")
++    verify_last_email!(subdomain: "globex")
++    @globex = Account.find_by!(subdomain: "globex")
++    @globex_token = sign_in_via_api(subdomain: "globex", email: "max@globex.test", password: "globex-password")
++
++    register_customer_via_api(subdomain: "globex", name: "Avery Globex", email: "avery@example.test", password: "avery-password")
++    verify_last_email!(subdomain: "globex")
++    @globex_avery = User.find_by!(account: @globex, email: "avery@example.test")
++    @globex_avery_token = sign_in_via_api(subdomain: "globex", email: "avery@example.test", password: "avery-password")
++
++    @billing_id = create_group("Billing")
++    @tech_id = create_group("Tech")
++    @m_sam_billing = create_membership(group_id: @billing_id, user_id: @sam.id, default: true)
++    @m_morgan_tech = create_membership(group_id: @tech_id, user_id: @morgan.id, default: true)
++
++    ActionMailer::Base.deliveries.clear
++  end
++
++  test "merges duplicate ticket with default private notes, preserves target state and comments, exposes merged_into_id and closed filtering to both views" do
++    base_time = Time.utc(2026, 11, 20, 10, 0, 0)
++
++    source_id = create_request(token: @avery_token, subject: "Duplicate receipt bug", body: "Source original message", at: base_time)
++    target_id = create_request(token: @avery_token, subject: "Primary receipt bug", body: "Target original message", at: base_time + 1.minute)
++    other_open_id = create_request(token: @avery_token, subject: "Unrelated question", body: "Just checking", at: base_time + 2.minutes)
++
++    # Unmerged records include merged_into_id: null in both views
++    get "/api/v1/requests/#{source_id}", headers: account_headers("acme", token: @avery_token)
++    assert_response :ok
++    assert json_body["request"].key?("merged_into_id")
++    assert_nil json_body.dig("request", "merged_into_id")
++
++    get "/api/v1/tickets/#{source_id}", headers: account_headers("acme", token: @owner_token)
++    assert_response :ok
++    assert json_body["ticket"].key?("merged_into_id")
++    assert_nil json_body.dig("ticket", "merged_into_id")
++
++    # Add comments and distinct assignments/status/priority to source and target
++    travel_to base_time + 5.minutes do
++      patch "/api/v1/tickets/#{source_id}",
++        params: {
++          ticket: {
++            group_id: @billing_id,
++            assignee_id: @sam.id,
++            comment: { body: "Source internal triage", public: false }
++          }
++        },
++        headers: account_headers("acme", token: @sam_token),
++        as: :json
++      assert_response :ok
++      assert json_body["ticket"].key?("merged_into_id")
++      assert_nil json_body.dig("ticket", "merged_into_id")
++
++      patch "/api/v1/tickets/#{target_id}",
++        params: {
++          ticket: {
++            status: "pending",
++            priority: "high",
++            group_id: @tech_id,
++            assignee_id: @morgan.id,
++            comment: { body: "Target staff question", public: true }
++          }
++        },
++        headers: account_headers("acme", token: @morgan_token),
++        as: :json
++      assert_response :ok
++    end
++
++    get "/api/v1/requests/#{source_id}", headers: account_headers("acme", token: @avery_token)
++    source_req_before = json_body["request"]
++    get "/api/v1/requests/#{target_id}", headers: account_headers("acme", token: @avery_token)
++    target_req_before = json_body["request"]
++
++    # Staff agent merges source into target using minimal payload
++    travel_to base_time + 15.minutes do
++      assert_no_difference -> { ActionMailer::Base.deliveries.size } do
++        post "/api/v1/tickets/#{source_id}/merge",
++          params: { merge: { target_id: target_id } },
++          headers: account_headers("acme", token: @sam_token),
++          as: :json
++      end
++    end
++    assert_response :ok
++
++    # Response returns source and target with full ticket payloads
++    source_json = json_body["source"]
++    target_json = json_body["target"]
++    assert_equal source_id, source_json["id"]
++    assert_equal "closed", source_json["status"]
++    assert_equal target_id, source_json["merged_into_id"]
++    assert_equal @billing_id, source_json["group_id"]
++    assert_equal @sam.id, source_json["assignee_id"]
++    assert_equal "normal", source_json["priority"]
++
++    assert_equal target_id, target_json["id"]
++    assert_equal "pending", target_json["status"]
++    assert_nil target_json["merged_into_id"]
++    assert target_json.key?("merged_into_id")
++    assert_equal @tech_id, target_json["group_id"]
++    assert_equal @morgan.id, target_json["assignee_id"]
++    assert_equal "high", target_json["priority"]
++    assert_equal "Primary receipt bug", target_json["subject"]
++
++    # Staff sees source still readable with all original comments + private default merge note
++    get "/api/v1/tickets/#{source_id}", headers: account_headers("acme", token: @owner_token)
++    assert_response :ok
++    assert_equal source_json, json_body["ticket"]
++
++    get "/api/v1/tickets/#{source_id}/comments", headers: account_headers("acme", token: @owner_token)
++    assert_response :ok
++    assert_equal 3, json_body["count"]
++    source_comments = json_body["comments"]
++    assert_equal "Source original message", source_comments[0]["body"]
++    assert_equal "Source internal triage", source_comments[1]["body"]
++    assert_equal false, source_comments[2]["public"]
++    assert_equal @sam.id, source_comments[2].dig("author", "id")
++    assert_includes source_comments[2]["body"], target_id.to_s
++    assert_match(/merge/i, source_comments[2]["body"])
++
++    # Target comments: old source comments NOT moved; only target's own comments + private default merge note
++    get "/api/v1/tickets/#{target_id}/comments", headers: account_headers("acme", token: @owner_token)
++    assert_response :ok
++    assert_equal 3, json_body["count"]
++    target_comments = json_body["comments"]
++    assert_equal "Target original message", target_comments[0]["body"]
++    assert_equal "Target staff question", target_comments[1]["body"]
++    assert_equal false, target_comments[2]["public"]
++    assert_equal @sam.id, target_comments[2].dig("author", "id")
++    assert_includes target_comments[2]["body"], source_id.to_s
++    assert_match(/merge/i, target_comments[2]["body"])
++
++    # Customer view: source is closed, readable, points to target_id, updated_at bumped, private merge note hidden
++    get "/api/v1/requests/#{source_id}", headers: account_headers("acme", token: @avery_token)
++    assert_response :ok
++    assert_equal "closed", json_body.dig("request", "status")
++    assert_equal target_id, json_body.dig("request", "merged_into_id")
++    assert_operator Time.iso8601(json_body.dig("request", "updated_at")), :>, Time.iso8601(source_req_before["updated_at"])
++
++    get "/api/v1/requests/#{source_id}/comments", headers: account_headers("acme", token: @avery_token)
++    assert_response :ok
++    assert_equal 1, json_body["count"]
++    assert_equal [ "Source original message" ], json_body["comments"].map { |c| c["body"] }
++
++    # Customer view: target has merged_into_id: null, private merge note hidden, public_updated_at UNCHANGED
++    get "/api/v1/requests/#{target_id}", headers: account_headers("acme", token: @avery_token)
++    assert_response :ok
++    assert_equal target_req_before, json_body["request"]
++    assert_nil json_body.dig("request", "merged_into_id")
++
++    get "/api/v1/requests/#{target_id}/comments", headers: account_headers("acme", token: @avery_token)
++    assert_response :ok
++    assert_equal 2, json_body["count"]
++    assert_equal [ "Target original message", "Target staff question" ], json_body["comments"].map { |c| c["body"] }
++
++    # Both views can filter for closed tickets and unfiltered lists expose merged_into_id properly
++    get "/api/v1/tickets", params: { status: "closed" }, headers: account_headers("acme", token: @owner_token)
++    assert_response :ok
++    assert_equal 1, json_body["count"]
++    assert_equal [ source_id ], json_body["tickets"].map { |t| t["id"] }
++    assert_equal target_id, json_body["tickets"].first["merged_into_id"]
++
++    get "/api/v1/tickets", params: { status: "closed", group_id: @billing_id, assignee_id: @sam.id, requester_id: @avery.id }, headers: account_headers("acme", token: @owner_token)
++    assert_response :ok
++    assert_equal [ source_id ], json_body["tickets"].map { |t| t["id"] }
++
++    get "/api/v1/tickets", params: { status: "open" }, headers: account_headers("acme", token: @owner_token)
++    assert_response :ok
++    assert_equal [ other_open_id ], json_body["tickets"].map { |t| t["id"] }
++    assert_nil json_body["tickets"].first["merged_into_id"]
++
++    get "/api/v1/tickets", headers: account_headers("acme", token: @owner_token)
++    assert_response :ok
++    assert_equal 3, json_body["count"]
++    by_id = json_body["tickets"].index_by { |t| t["id"] }
++    assert_equal target_id, by_id[source_id]["merged_into_id"]
++    assert_nil by_id[target_id]["merged_into_id"]
++    assert_nil by_id[other_open_id]["merged_into_id"]
++
++    get "/api/v1/requests", params: { status: "closed" }, headers: account_headers("acme", token: @avery_token)
++    assert_response :ok
++    assert_equal 1, json_body["count"]
++    assert_equal [ source_id ], json_body["requests"].map { |r| r["id"] }
++    assert_equal target_id, json_body["requests"].first["merged_into_id"]
++
++    get "/api/v1/requests", params: { status: "open" }, headers: account_headers("acme", token: @avery_token)
++    assert_response :ok
++    assert_equal [ other_open_id ], json_body["requests"].map { |r| r["id"] }
++
++    # Private merge note is NOT indexed by staff public search q=, while closed ticket subject IS searchable
++    get "/api/v1/tickets", params: { q: "Duplicate receipt bug" }, headers: account_headers("acme", token: @owner_token)
++    assert_response :ok
++    assert_equal [ source_id ], json_body["tickets"].map { |t| t["id"] }
++
++    get "/api/v1/tickets", params: { q: "closed and merged" }, headers: account_headers("acme", token: @owner_token)
++    assert_response :ok
++    assert_equal [], json_body["tickets"]
++  end
++
++  test "supports custom merge comment text and independent public/private visibility on each side" do
++    base_time = Time.utc(2026, 11, 20, 11, 0, 0)
++
++    # Pair 1: custom public source_comment + custom private target_comment
++    s1 = create_request(token: @avery_token, subject: "Dup 1", body: "Body 1", at: base_time)
++    t1 = create_request(token: @avery_token, subject: "Target 1", body: "Target body 1", at: base_time + 1.minute)
++
++    get "/api/v1/requests/#{t1}", headers: account_headers("acme", token: @avery_token)
++    t1_req_before = json_body["request"]
++
++    travel_to base_time + 10.minutes do
++      post "/api/v1/tickets/#{s1}/merge",
++        params: {
++          merge: {
++            target_id: t1,
++            source_comment: { body: "Continuing in ticket #{t1}.", public: true },
++            target_comment: { body: "Duplicate checked privately.", public: false }
++          }
++        },
++        headers: account_headers("acme", token: @owner_token),
++        as: :json
++    end
++    assert_response :ok
++
++    # Customer sees public source_comment, does NOT see private target_comment
++    get "/api/v1/requests/#{s1}/comments", headers: account_headers("acme", token: @avery_token)
++    assert_response :ok
++    assert_equal [ "Body 1", "Continuing in ticket #{t1}." ], json_body["comments"].map { |c| c["body"] }
++    assert_equal [ true, true ], json_body["comments"].map { |c| c["public"] }
++
++    get "/api/v1/requests/#{t1}/comments", headers: account_headers("acme", token: @avery_token)
++    assert_response :ok
++    assert_equal [ "Target body 1" ], json_body["comments"].map { |c| c["body"] }
++
++    # Target customer-facing updated_at NOT changed by private target_comment
++    get "/api/v1/requests/#{t1}", headers: account_headers("acme", token: @avery_token)
++    assert_equal t1_req_before, json_body["request"]
++
++    # Staff sees both notes with exact text and public flags
++    get "/api/v1/tickets/#{t1}/comments", headers: account_headers("acme", token: @owner_token)
++    assert_response :ok
++    assert_equal "Duplicate checked privately.", json_body["comments"].last["body"]
++    assert_equal false, json_body["comments"].last["public"]
++
++    # Search finds public source_comment, NOT private target_comment
++    get "/api/v1/tickets", params: { q: "Continuing in ticket" }, headers: account_headers("acme", token: @owner_token)
++    assert_equal [ s1 ], json_body["tickets"].map { |t| t["id"] }
++    get "/api/v1/tickets", params: { q: "Duplicate checked privately" }, headers: account_headers("acme", token: @owner_token)
++    assert_equal [], json_body["tickets"]
++
++    # Pair 2: default private source_comment (omitted) + public target_comment + string target_id + both tickets solved
++    s2 = create_request(token: @avery_token, subject: "Dup 2", body: "Body 2", at: base_time + 20.minutes)
++    t2 = create_request(token: @avery_token, subject: "Target 2", body: "Target body 2", at: base_time + 21.minutes)
++    patch "/api/v1/tickets/#{s2}", params: { ticket: { status: "solved" } }, headers: account_headers("acme", token: @owner_token), as: :json
++    patch "/api/v1/tickets/#{t2}", params: { ticket: { status: "solved" } }, headers: account_headers("acme", token: @owner_token), as: :json
++
++    get "/api/v1/requests/#{t2}", headers: account_headers("acme", token: @avery_token)
++    t2_req_before = json_body["request"]
++
++    travel_to base_time + 30.minutes do
++      post "/api/v1/tickets/#{s2}/merge",
++        params: {
++          merge: {
++            target_id: t2.to_s,
++            target_comment: { body: "Merged duplicate ##{s2} here.", public: true }
++          }
++        },
++        headers: account_headers("acme", token: @owner_token),
++        as: :json
++    end
++    assert_response :ok
++    assert_equal "closed", json_body.dig("source", "status")
++    assert_equal "solved", json_body.dig("target", "status") # surviving solved ticket stays solved!
++
++    # Customer sees public target_comment and target's customer updated_at bumped, while source's default note stays private
++    get "/api/v1/requests/#{s2}/comments", headers: account_headers("acme", token: @avery_token)
++    assert_equal [ "Body 2" ], json_body["comments"].map { |c| c["body"] }
++
++    get "/api/v1/requests/#{t2}/comments", headers: account_headers("acme", token: @avery_token)
++    assert_equal [ "Target body 2", "Merged duplicate ##{s2} here." ], json_body["comments"].map { |c| c["body"] }
++
++    get "/api/v1/requests/#{t2}", headers: account_headers("acme", token: @avery_token)
++    assert_operator Time.iso8601(json_body.dig("request", "updated_at")), :>, Time.iso8601(t2_req_before["updated_at"])
++
++    # Pair 3: custom body without public flag defaults to private; public: true without body uses default text
++    s3 = create_request(token: @avery_token, subject: "Dup 3", body: "Body 3", at: base_time + 40.minutes)
++    t3 = create_request(token: @avery_token, subject: "Target 3", body: "Target body 3", at: base_time + 41.minutes)
++
++    travel_to base_time + 45.minutes do
++      post "/api/v1/tickets/#{s3}/merge",
++        params: {
++          merge: {
++            target_id: t3,
++            source_comment: { public: true },
++            target_comment: { body: "Custom private without public flag" }
++          }
++        },
++        headers: account_headers("acme", token: @owner_token),
++        as: :json
++    end
++    assert_response :ok
++
++    get "/api/v1/requests/#{s3}/comments", headers: account_headers("acme", token: @avery_token)
++    assert_equal 2, json_body["count"]
++    assert_includes json_body["comments"].last["body"], t3.to_s
++    assert_equal true, json_body["comments"].last["public"]
++
++    get "/api/v1/tickets/#{t3}/comments", headers: account_headers("acme", token: @owner_token)
++    assert_equal "Custom private without public flag", json_body["comments"].last["body"]
++    assert_equal false, json_body["comments"].last["public"]
++
++    # Pair 4: explicit null / empty hash uses default private notes
++    s4 = create_request(token: @avery_token, subject: "Dup 4", body: "Body 4", at: base_time + 50.minutes)
++    t4 = create_request(token: @avery_token, subject: "Target 4", body: "Target body 4", at: base_time + 51.minutes)
++
++    travel_to base_time + 55.minutes do
++      post "/api/v1/tickets/#{s4}/merge",
++        params: { merge: { target_id: t4, source_comment: nil, target_comment: {} } },
++        headers: account_headers("acme", token: @owner_token),
++        as: :json
++    end
++    assert_response :ok
++
++    get "/api/v1/tickets/#{s4}/comments", headers: account_headers("acme", token: @owner_token)
++    assert_equal false, json_body["comments"].last["public"]
++    assert_includes json_body["comments"].last["body"], t4.to_s
++
++    get "/api/v1/tickets/#{t4}/comments", headers: account_headers("acme", token: @owner_token)
++    assert_equal false, json_body["comments"].last["public"]
++    assert_includes json_body["comments"].last["body"], s4.to_s
++  end
++
++  test "closed ticket rejects all further edits from staff and customer and cannot be merged again or targeted" do
++    base_time = Time.utc(2026, 11, 20, 12, 0, 0)
++    source_id = create_request(token: @avery_token, subject: "To close", body: "Initial", at: base_time)
++    target_id = create_request(token: @avery_token, subject: "Survivor", body: "Initial target", at: base_time + 1.minute)
++    third_id = create_request(token: @avery_token, subject: "Third", body: "Initial third", at: base_time + 2.minutes)
++
++    patch "/api/v1/tickets/#{source_id}",
++      params: { ticket: { group_id: @billing_id, assignee_id: @sam.id } },
++      headers: account_headers("acme", token: @owner_token),
++      as: :json
++    assert_response :ok
++
++    travel_to base_time + 5.minutes do
++      post "/api/v1/tickets/#{source_id}/merge",
++        params: { merge: { target_id: target_id } },
++        headers: account_headers("acme", token: @owner_token),
++        as: :json
++      assert_response :ok
++    end
++
++    get "/api/v1/tickets/#{source_id}", headers: account_headers("acme", token: @owner_token)
++    snapshot_ticket = json_body["ticket"]
++    get "/api/v1/requests/#{source_id}", headers: account_headers("acme", token: @avery_token)
++    snapshot_request = json_body["request"]
++    baseline_comment_count = Ticket.find(source_id).comments.count
++
++    travel_to base_time + 20.minutes do
++      # Staff cannot update ANY attribute or add comments (or even empty patch) on a closed ticket
++      [
++        { status: "open" },
++        { status: "pending" },
++        { status: "solved" },
++        { status: "closed" },
++        { priority: "high" },
++        { group_id: nil },
++        { group_id: @tech_id },
++        { assignee_id: nil },
++        { assignee_id: @morgan.id },
++        { comment: { body: "Trying to add public reply", public: true } },
++        { comment: { body: "Trying to add private note", public: false } },
++        { priority: "normal" }
++      ].each do |payload|
++        assert_no_difference [ "TicketComment.count", "ActionMailer::Base.deliveries.size" ] do
++          patch "/api/v1/tickets/#{source_id}",
++            params: { ticket: payload },
++            headers: account_headers("acme", token: @owner_token),
++            as: :json
++        end
++        assert_response :unprocessable_content, "Expected 422 for staff PATCH #{payload.inspect} on closed ticket"
++      end
++
++      # Customer cannot reply, mark solved, or send empty patch on a closed request
++      [
++        { comment: { body: "Customer follow-up" } },
++        { status: "solved" },
++        { status: "solved", comment: { body: "Closing again" } }
++      ].each do |payload|
++        assert_no_difference "TicketComment.count" do
++          patch "/api/v1/requests/#{source_id}",
++            params: { request: payload },
++            headers: account_headers("acme", token: @avery_token),
++            as: :json
++        end
++        assert_response :unprocessable_content, "Expected 422 for customer PATCH #{payload.inspect} on closed request"
++      end
++
++      # Cannot merge closed source again
++      assert_no_difference "TicketComment.count" do
++        post "/api/v1/tickets/#{source_id}/merge",
++          params: { merge: { target_id: third_id } },
++          headers: account_headers("acme", token: @owner_token),
++          as: :json
++      end
++      assert_response :unprocessable_content
++
++      # Cannot merge another ticket into closed ticket
++      assert_no_difference "TicketComment.count" do
++        post "/api/v1/tickets/#{third_id}/merge",
++          params: { merge: { target_id: source_id } },
++          headers: account_headers("acme", token: @owner_token),
++          as: :json
++      end
++      assert_response :unprocessable_content
++      assert json_body.dig("errors", "target_id").present?
++
++      # Staff still cannot manually set status: "closed" via PATCH on open ticket
++      patch "/api/v1/tickets/#{third_id}",
++        params: { ticket: { status: "closed" } },
++        headers: account_headers("acme", token: @owner_token),
++        as: :json
++      assert_response :unprocessable_content
++      assert_equal "open", Ticket.find(third_id).status
++
++      # Passing merged_into_id via PATCH /tickets or POST/PATCH /requests is ignored
++      patch "/api/v1/tickets/#{third_id}",
++        params: { ticket: { priority: "high", merged_into_id: target_id } },
++        headers: account_headers("acme", token: @owner_token),
++        as: :json
++      assert_response :ok
++      assert_nil json_body.dig("ticket", "merged_into_id")
++    end
++
++    # Closed ticket snapshot completely unchanged after all rejected attempts
++    get "/api/v1/tickets/#{source_id}", headers: account_headers("acme", token: @owner_token)
++    assert_equal snapshot_ticket, json_body["ticket"]
++    get "/api/v1/requests/#{source_id}", headers: account_headers("acme", token: @avery_token)
++    assert_equal snapshot_request, json_body["request"]
++    assert_equal baseline_comment_count, Ticket.find(source_id).comments.count
++  end
++
++  test "merge notes never send email, surviving email identity is preserved, and closed ticket rejects incoming email replies" do
++    with_env(RAILS_INBOUND_EMAIL_PASSWORD: RELAY_PASSWORD, HELPDESK_SUPPORT_DOMAIN: nil) do
++      # Create 2 email-origin tickets for Avery
++      post_relay(build_rfc822(
++        from: "Avery <avery@example.test>",
++        to: "acme@support.example.test",
++        subject: "Email Dup",
++        body: "First email about invoice",
++        message_id: "<email-dup-1@example.test>"
++      ))
++      assert_response :no_content
++
++      post_relay(build_rfc822(
++        from: "Avery <avery@example.test>",
++        to: "acme@support.example.test",
++        subject: "Email Main",
++        body: "Main email about invoice",
++        message_id: "<email-main-1@example.test>"
++      ))
++      assert_response :no_content
++
++      email_source = @acme.tickets.find_by!(subject: "Email Dup")
++      email_target = @acme.tickets.find_by!(subject: "Email Main")
++      source_reply_addr = email_source.email_reply_address
++      target_reply_addr = email_target.email_reply_address
++      target_token_before = email_target.email_reply_token
++
++      # Also create a portal-origin ticket for Avery
++      portal_target_id = create_request(token: @avery_token, subject: "Portal Main", body: "Portal ticket body")
++      portal_target = Ticket.find(portal_target_id)
++      assert_not portal_target.email_origin?
++
++      # Create another email-origin ticket to merge into portal_target
++      post_relay(build_rfc822(
++        from: "Avery <avery@example.test>",
++        to: "acme@support.example.test",
++        subject: "Email Into Portal",
++        body: "Emailed duplicate for portal ticket",
++        message_id: "<email-into-portal-1@example.test>"
++      ))
++      assert_response :no_content
++      email_into_portal_source = @acme.tickets.find_by!(subject: "Email Into Portal")
++
++      ActionMailer::Base.deliveries.clear
++
++      # 1. Merge email_source -> email_target with BOTH notes PUBLIC: must send ZERO emails!
++      assert_no_difference -> { ActionMailer::Base.deliveries.size } do
++        post "/api/v1/tickets/#{email_source.id}/merge",
++          params: {
++            merge: {
++              target_id: email_target.id,
++              source_comment: { body: "Continuing in ##{email_target.id}.", public: true },
++              target_comment: { body: "Merged ##{email_source.id} here.", public: true }
++            }
++          },
++          headers: account_headers("acme", token: @owner_token),
++          as: :json
++      end
++      assert_response :ok
++
++      # Surviving email_target keeps its exact email identity
++      email_target.reload
++      assert email_target.email_origin?
++      assert_equal target_token_before, email_target.email_reply_token
++      assert_equal target_reply_addr, email_target.email_reply_address
++
++      # Incoming email reply to closed email_source is rejected (bounced, no comment, no new ticket)
++      assert_no_difference [ "Ticket.count", "TicketComment.count", "ActionMailer::Base.deliveries.size" ] do
++        post_relay(build_rfc822(
++          from: "Avery <avery@example.test>",
++          to: source_reply_addr,
++          subject: "Re: Email Dup",
++          body: "Replying to closed ticket",
++          message_id: "<reply-to-closed-dup@example.test>"
++        ))
++        assert_response :no_content
++      end
++      assert_equal "closed", email_source.reload.status
++      assert ActionMailbox::InboundEmail.order(:id).last.bounced?
++
++      # Incoming email reply to closed source ALSO CC'ing plain support address still bounces (no new ticket)
++      assert_no_difference [ "Ticket.count", "TicketComment.count" ] do
++        post_relay(build_rfc822(
++          from: "Avery <avery@example.test>",
++          to: source_reply_addr,
++          cc: "acme@support.example.test",
++          subject: "Re: Email Dup",
++          body: "Replying with CC",
++          message_id: "<reply-to-closed-dup-cc@example.test>"
++        ))
++        assert_response :no_content
++      end
++      assert ActionMailbox::InboundEmail.order(:id).last.bounced?
++
++      # Staff public reply on closed email_source is rejected and sends NO email
++      assert_no_difference [ "TicketComment.count", "ActionMailer::Base.deliveries.size" ] do
++        patch "/api/v1/tickets/#{email_source.id}",
++          params: { ticket: { comment: { body: "Should not email", public: true } } },
++          headers: account_headers("acme", token: @owner_token),
++          as: :json
++      end
++      assert_response :unprocessable_content
++
++      # Incoming email reply to surviving email_target STILL works
++      assert_difference -> { email_target.comments.count }, 1 do
++        post_relay(build_rfc822(
++          from: "Avery <avery@example.test>",
++          to: target_reply_addr,
++          subject: "Re: Email Main",
++          body: "Follow-up on main thread",
++          message_id: "<reply-to-main-1@example.test>"
++        ))
++        assert_response :no_content
++      end
++
++      # Staff public reply on surviving email_target sends email with target's reply_to & ONLY target's References
++      assert_difference -> { ActionMailer::Base.deliveries.size }, 1 do
++        patch "/api/v1/tickets/#{email_target.id}",
++          params: { ticket: { status: "pending", comment: { body: "We are checking this now.", public: true } } },
++          headers: account_headers("acme", token: @owner_token),
++          as: :json
++      end
++      assert_response :ok
++      reply_mail = ActionMailer::Base.deliveries.last
++      assert_equal [ target_reply_addr ], reply_mail.reply_to
++      assert_includes reply_mail.header["References"].to_s, "<email-main-1@example.test>"
++      assert_includes reply_mail.header["References"].to_s, "<reply-to-main-1@example.test>"
++      assert_not_includes reply_mail.header["References"].to_s, "<email-dup-1@example.test>"
++
++      # 2. Merge email-origin ticket into portal-origin ticket with public notes: NO email sent, target stays portal-origin!
++      assert_no_difference -> { ActionMailer::Base.deliveries.size } do
++        post "/api/v1/tickets/#{email_into_portal_source.id}/merge",
++          params: {
++            merge: {
++              target_id: portal_target.id,
++              source_comment: { body: "Moving to portal ticket.", public: true },
++              target_comment: { body: "Linked email duplicate.", public: true }
++            }
++          },
++          headers: account_headers("acme", token: @owner_token),
++          as: :json
++      end
++      assert_response :ok
++
++      portal_target.reload
++      assert_not portal_target.email_origin?
++      assert_nil portal_target.email_reply_token
++
++      # Subsequent staff public reply on portal_target still sends NO email (email identity NOT copied from source!)
++      assert_no_difference -> { ActionMailer::Base.deliveries.size } do
++        patch "/api/v1/tickets/#{portal_target.id}",
++          params: { ticket: { comment: { body: "Portal update", public: true } } },
++          headers: account_headers("acme", token: @owner_token),
++          as: :json
++      end
++      assert_response :ok
++
++      # Incoming email reply to closed email_into_portal_source bounces (NOT routed to portal_target!)
++      assert_no_difference [ "Ticket.count", "TicketComment.count" ] do
++        post_relay(build_rfc822(
++          from: "Avery <avery@example.test>",
++          to: email_into_portal_source.email_reply_address,
++          subject: "Re: Email Into Portal",
++          body: "Should bounce",
++          message_id: "<reply-closed-portal-merge@example.test>"
++        ))
++        assert_response :no_content
++      end
++      assert ActionMailbox::InboundEmail.order(:id).last.bounced?
++
++      # 3. Merge portal-origin source into email-origin target: NO email sent by merge, target stays email-origin!
++      portal_source_id = create_request(token: @avery_token, subject: "Portal Dup", body: "Portal dup body")
++      assert_no_difference -> { ActionMailer::Base.deliveries.size } do
++        post "/api/v1/tickets/#{portal_source_id}/merge",
++          params: {
++            merge: {
++              target_id: email_target.id,
++              source_comment: { body: "Merged into email thread.", public: true },
++              target_comment: { body: "Portal duplicate merged.", public: true }
++            }
++          },
++          headers: account_headers("acme", token: @owner_token),
++          as: :json
++      end
++      assert_response :ok
++      assert email_target.reload.email_origin?
++      assert_equal target_token_before, email_target.email_reply_token
++    end
++  end
++
++  test "assignment cleanup (user suspend, membership delete, group delete) still applies to closed tickets" do
++    base_time = Time.utc(2026, 11, 20, 13, 0, 0)
++    sales_id = create_group("Sales")
++    create_membership(group_id: sales_id, user_id: @sam.id, default: false)
++    m_morgan_billing = create_membership(group_id: @billing_id, user_id: @morgan.id, default: false)
++
++    target_id = create_request(token: @avery_token, subject: "Target", body: "Main", at: base_time)
++    c_suspend = create_request(token: @avery_token, subject: "Closed for suspend", body: "S1", at: base_time + 1.minute)
++    c_membership = create_request(token: @avery_token, subject: "Closed for membership delete", body: "S2", at: base_time + 2.minutes)
++    c_group_delete = create_request(token: @avery_token, subject: "Closed for group delete", body: "S3", at: base_time + 3.minutes)
++
++    # Assign tickets before merging them closed
++    patch "/api/v1/tickets/#{c_suspend}", params: { ticket: { group_id: sales_id, assignee_id: @sam.id } }, headers: account_headers("acme", token: @owner_token), as: :json
++    assert_response :ok
++    patch "/api/v1/tickets/#{c_membership}", params: { ticket: { group_id: @billing_id, assignee_id: @morgan.id } }, headers: account_headers("acme", token: @owner_token), as: :json
++    assert_response :ok
++    patch "/api/v1/tickets/#{c_group_delete}", params: { ticket: { group_id: @billing_id, assignee_id: @sam.id } }, headers: account_headers("acme", token: @owner_token), as: :json
++    assert_response :ok
++
++    travel_to base_time + 10.minutes do
++      [ c_suspend, c_membership, c_group_delete ].each do |sid|
++        post "/api/v1/tickets/#{sid}/merge",
++          params: { merge: { target_id: target_id } },
++          headers: account_headers("acme", token: @owner_token),
++          as: :json
++        assert_response :ok
++      end
++    end
++
++    # Snapshot customer-facing /requests responses before cleanup
++    req_snapshots = [ c_suspend, c_membership, c_group_delete ].index_with do |sid|
++      get "/api/v1/requests/#{sid}", headers: account_headers("acme", token: @avery_token)
++      json_body["request"]
++    end
++
++    # 1. Removing Morgan's Billing membership clears assignee on closed c_membership while preserving group & closed state
++    travel_to base_time + 20.minutes do
++      delete "/api/v1/group_memberships/#{m_morgan_billing}", headers: account_headers("acme", token: @owner_token)
++      assert_response :no_content
++    end
++
++    get "/api/v1/tickets/#{c_membership}", headers: account_headers("acme", token: @owner_token)
++    assert_response :ok
++    assert_equal "closed", json_body.dig("ticket", "status")
++    assert_equal target_id, json_body.dig("ticket", "merged_into_id")
++    assert_equal @billing_id, json_body.dig("ticket", "group_id")
++    assert_nil json_body.dig("ticket", "assignee_id")
++
++    # 2. Suspending Sam clears assignee on closed c_suspend (and c_group_delete) while preserving group & closed state
++    travel_to base_time + 25.minutes do
++      patch "/api/v1/users/#{@sam.id}",
++        params: { user: { suspended: true } },
++        headers: account_headers("acme", token: @owner_token),
++        as: :json
++      assert_response :ok
++    end
++
++    get "/api/v1/tickets/#{c_suspend}", headers: account_headers("acme", token: @owner_token)
++    assert_response :ok
++    assert_equal "closed", json_body.dig("ticket", "status")
++    assert_equal target_id, json_body.dig("ticket", "merged_into_id")
++    assert_equal sales_id, json_body.dig("ticket", "group_id")
++    assert_nil json_body.dig("ticket", "assignee_id")
++
++    # 3. Deleting Billing group clears BOTH group_id and assignee_id on closed tickets in Billing
++    travel_to base_time + 30.minutes do
++      delete "/api/v1/groups/#{@billing_id}", headers: account_headers("acme", token: @owner_token)
++      assert_response :no_content
++    end
++
++    [ c_membership, c_group_delete ].each do |sid|
++      get "/api/v1/tickets/#{sid}", headers: account_headers("acme", token: @owner_token)
++      assert_response :ok
++      assert_equal "closed", json_body.dig("ticket", "status")
++      assert_equal target_id, json_body.dig("ticket", "merged_into_id")
++      assert_nil json_body.dig("ticket", "group_id")
++      assert_nil json_body.dig("ticket", "group")
++      assert_nil json_body.dig("ticket", "assignee_id")
++      assert_nil json_body.dig("ticket", "assignee")
++    end
++
++    # Customer-facing /requests timestamps did NOT change due to internal assignment cleanups!
++    req_snapshots.each do |sid, expected|
++      get "/api/v1/requests/#{sid}", headers: account_headers("acme", token: @avery_token)
++      assert_equal expected, json_body["request"]
++    end
++
++    # Filtering closed + unassigned works after cleanup
++    get "/api/v1/tickets", params: { status: "closed", group_id: "unassigned", assignee_id: "unassigned" }, headers: account_headers("acme", token: @owner_token)
++    assert_response :ok
++    assert_equal [ c_membership, c_group_delete ].sort, json_body["tickets"].map { |t| t["id"] }.sort
++  end
++
++  test "chained merges preserve original links rather than rewriting history" do
++    base_time = Time.utc(2026, 11, 20, 14, 0, 0)
++    a1 = create_request(token: @avery_token, subject: "Ticket A1", body: "A1 body", at: base_time)
++    a2 = create_request(token: @avery_token, subject: "Ticket A2", body: "A2 body", at: base_time + 1.minute)
++    b = create_request(token: @avery_token, subject: "Ticket B", body: "B body", at: base_time + 2.minutes)
++    c = create_request(token: @avery_token, subject: "Ticket C", body: "C body", at: base_time + 3.minutes)
++
++    # First merge A1 -> B and A2 -> B
++    travel_to base_time + 10.minutes do
++      post "/api/v1/tickets/#{a1}/merge", params: { merge: { target_id: b } }, headers: account_headers("acme", token: @owner_token), as: :json
++      assert_response :ok
++      post "/api/v1/tickets/#{a2}/merge", params: { merge: { target_id: b } }, headers: account_headers("acme", token: @owner_token), as: :json
++      assert_response :ok
++    end
++
++    get "/api/v1/tickets/#{a1}", headers: account_headers("acme", token: @owner_token)
++    a1_ticket_snapshot = json_body["ticket"]
++    get "/api/v1/requests/#{a1}", headers: account_headers("acme", token: @avery_token)
++    a1_request_snapshot = json_body["request"]
++
++    get "/api/v1/tickets/#{a2}", headers: account_headers("acme", token: @owner_token)
++    a2_ticket_snapshot = json_body["ticket"]
++
++    # Later merge B -> C
++    travel_to base_time + 25.minutes do
++      post "/api/v1/tickets/#{b}/merge", params: { merge: { target_id: c } }, headers: account_headers("acme", token: @owner_token), as: :json
++      assert_response :ok
++    end
++
++    assert_equal "closed", json_body.dig("source", "status")
++    assert_equal c, json_body.dig("source", "merged_into_id")
++    assert_equal "open", json_body.dig("target", "status")
++    assert_nil json_body.dig("target", "merged_into_id")
++
++    # Original links A1 -> B and A2 -> B are preserved untouched (NOT rewritten to C!)
++    get "/api/v1/tickets/#{a1}", headers: account_headers("acme", token: @owner_token)
++    assert_equal a1_ticket_snapshot, json_body["ticket"]
++    assert_equal b, json_body.dig("ticket", "merged_into_id")
++
++    get "/api/v1/requests/#{a1}", headers: account_headers("acme", token: @avery_token)
++    assert_equal a1_request_snapshot, json_body["request"]
++    assert_equal b, json_body.dig("request", "merged_into_id")
++
++    get "/api/v1/tickets/#{a2}", headers: account_headers("acme", token: @owner_token)
++    assert_equal a2_ticket_snapshot, json_body["ticket"]
++    assert_equal b, json_body.dig("ticket", "merged_into_id")
++
++    # Customer can follow A1 -> B -> C cleanly
++    get "/api/v1/requests/#{b}", headers: account_headers("acme", token: @avery_token)
++    assert_equal "closed", json_body.dig("request", "status")
++    assert_equal c, json_body.dig("request", "merged_into_id")
++
++    get "/api/v1/requests/#{c}", headers: account_headers("acme", token: @avery_token)
++    assert_equal "open", json_body.dig("request", "status")
++    assert_nil json_body.dig("request", "merged_into_id")
++
++    # Filtering closed returns all 3 closed tickets (A1, A2, B)
++    get "/api/v1/requests", params: { status: "closed" }, headers: account_headers("acme", token: @avery_token)
++    assert_equal [ a1, a2, b ].sort, json_body["requests"].map { |r| r["id"] }.sort
++
++    # None of the closed tickets can be merged or targeted again
++    [
++      [ c, a1 ],
++      [ c, b ],
++      [ a1, c ],
++      [ b, c ]
++    ].each do |src, tgt|
++      post "/api/v1/tickets/#{src}/merge", params: { merge: { target_id: tgt } }, headers: account_headers("acme", token: @owner_token), as: :json
++      assert_response :unprocessable_content, "Expected 422 merging #{src} -> #{tgt}"
++    end
++  end
++
++  test "enforces authorization, tenant isolation, same-requester rule, validation, and atomicity on merge" do
++    avery_t1 = create_request(token: @avery_token, subject: "Avery 1", body: "A1")
++    avery_t2 = create_request(token: @avery_token, subject: "Avery 2", body: "A2")
++    blake_t1 = create_request(token: @blake_token, subject: "Blake 1", body: "B1")
++    globex_t1 = create_request(token: @globex_avery_token, subject: "Globex Avery", body: "G1", subdomain: "globex")
++
++    # Unauthenticated -> 401
++    post "/api/v1/tickets/#{avery_t1}/merge",
++      params: { merge: { target_id: avery_t2 } },
++      headers: account_headers("acme"),
++      as: :json
++    assert_response :unauthorized
++
++    # Customer -> 403
++    post "/api/v1/tickets/#{avery_t1}/merge",
++      params: { merge: { target_id: avery_t2 } },
++      headers: account_headers("acme", token: @avery_token),
++      as: :json
++    assert_response :forbidden
++
++    # Cross-account source -> 404
++    post "/api/v1/tickets/#{globex_t1}/merge",
++      params: { merge: { target_id: avery_t2 } },
++      headers: account_headers("acme", token: @owner_token),
++      as: :json
++    assert_response :not_found
++
++    # Non-existent / invalid source IDs -> 404
++    [ "abc", "-1", "99999999999999999999999", "999999" ].each do |bad_id|
++      post "/api/v1/tickets/#{bad_id}/merge",
++        params: { merge: { target_id: avery_t2 } },
++        headers: account_headers("acme", token: @owner_token),
++        as: :json
++      assert_response :not_found, "Expected 404 for source id #{bad_id}"
++    end
++
++    # Cross-account target (even with same customer email in Globex!) -> 422
++    assert_no_difference "TicketComment.count" do
++      post "/api/v1/tickets/#{avery_t1}/merge",
++        params: { merge: { target_id: globex_t1 } },
++        headers: account_headers("acme", token: @owner_token),
++        as: :json
++    end
++    assert_response :unprocessable_content
++    assert json_body.dig("errors", "target_id").present?
++
++    # Different customer in same account -> 422
++    assert_no_difference "TicketComment.count" do
++      post "/api/v1/tickets/#{avery_t1}/merge",
++        params: { merge: { target_id: blake_t1 } },
++        headers: account_headers("acme", token: @owner_token),
++        as: :json
++    end
++    assert_response :unprocessable_content
++    assert json_body.dig("errors", "target_id").present?
++
++    # Self-merge -> 422
++    assert_no_difference "TicketComment.count" do
++      post "/api/v1/tickets/#{avery_t1}/merge",
++        params: { merge: { target_id: avery_t1 } },
++        headers: account_headers("acme", token: @owner_token),
++        as: :json
++    end
++    assert_response :unprocessable_content
++    assert json_body.dig("errors", "target_id").present?
++
++    # Invalid / missing target_id -> 422
++    [ nil, "", "abc", "0", "-5", "01", 0, -1, true, [ avery_t2 ], { id: avery_t2 }, 999_999, "99999999999999999999999" ].each do |bad_target|
++      assert_no_difference "TicketComment.count" do
++        post "/api/v1/tickets/#{avery_t1}/merge",
++          params: { merge: { target_id: bad_target } },
++          headers: account_headers("acme", token: @owner_token),
++          as: :json
++      end
++      assert_response :unprocessable_content, "Expected 422 for target_id=#{bad_target.inspect}"
++      assert json_body.dig("errors", "target_id").present?
++    end
++
++    # Malformed / empty envelopes -> 400
++    [
++      {},
++      { merge: {} },
++      { merge: "57" },
++      { merge: [ avery_t2 ] },
++      { merge: nil },
++      { merge: { target_id: avery_t2, source_comment: "plain text" } },
++      { merge: { target_id: avery_t2, target_comment: 123 } },
++      { merge: { target_id: avery_t2, source_comment: [ { body: "x" } ] } }
++    ].each do |bad_payload|
++      assert_no_difference "TicketComment.count" do
++        post "/api/v1/tickets/#{avery_t1}/merge",
++          params: bad_payload,
++          headers: account_headers("acme", token: @owner_token),
++          as: :json
++      end
++      assert_response :bad_request, "Expected 400 for payload #{bad_payload.inspect}"
++    end
++
++    # Invalid source_comment / target_comment fields roll back atomically (neither ticket modified, 0 comments added)
++    [
++      { target_id: avery_t2, source_comment: { body: "" } },
++      { target_id: avery_t2, source_comment: { body: "   " } },
++      { target_id: avery_t2, source_comment: { body: nil } },
++      { target_id: avery_t2, source_comment: { body: 123 } },
++      { target_id: avery_t2, source_comment: { body: "Valid", public: "true" } },
++      { target_id: avery_t2, source_comment: { body: "Valid", public: nil } },
++      { target_id: avery_t2, source_comment: { body: "Valid", public: 1 } },
++      { target_id: avery_t2, source_comment: { body: "Valid", public: true }, target_comment: { body: "   " } },
++      { target_id: avery_t2, source_comment: { body: "Valid", public: true }, target_comment: { body: 456 } },
++      { target_id: avery_t2, source_comment: { body: "Valid", public: true }, target_comment: { body: "Valid", public: "false" } }
++    ].each do |bad_merge|
++      assert_no_difference "TicketComment.count" do
++        post "/api/v1/tickets/#{avery_t1}/merge",
++          params: { merge: bad_merge },
++          headers: account_headers("acme", token: @owner_token),
++          as: :json
++      end
++      assert_response :unprocessable_content, "Expected 422 for merge=#{bad_merge.inspect}"
++      assert_equal "open", Ticket.find(avery_t1).status
++      assert_nil Ticket.find(avery_t1).merged_into_id
++      assert_equal "open", Ticket.find(avery_t2).status
++    end
++
++    # Cancelled account blocks merge with 403 account_cancelled
++    post "/api/v1/account/cancel", headers: account_headers("acme", token: @owner_token)
++    assert_response :ok
++    # Sign back in as owner while cancelled (owners can sign in to reactivate)
++    cancelled_owner_token = sign_in_via_api(subdomain: "acme", email: "jo@acme.test", password: "my-first-password")
++    post "/api/v1/tickets/#{avery_t1}/merge",
++      params: { merge: { target_id: avery_t2 } },
++      headers: account_headers("acme", token: cancelled_owner_token),
++      as: :json
++    assert_response :forbidden
++    assert_equal "account_cancelled", json_body["code"]
++
++    post "/api/v1/account/reactivate", headers: account_headers("acme", token: cancelled_owner_token)
++    assert_response :ok
++
++    # Staff can still merge two tickets belonging to a suspended customer
++    patch "/api/v1/users/#{@avery.id}",
++      params: { user: { suspended: true } },
++      headers: account_headers("acme", token: cancelled_owner_token),
++      as: :json
++    assert_response :ok
++
++    post "/api/v1/tickets/#{avery_t1}/merge",
++      params: { merge: { target_id: avery_t2 } },
++      headers: account_headers("acme", token: cancelled_owner_token),
++      as: :json
++    assert_response :ok
++    assert_equal "closed", json_body.dig("source", "status")
++    assert_equal avery_t2, json_body.dig("source", "merged_into_id")
++  end
++
++  private
++
++  def create_group(name)
++    post "/api/v1/groups",
++      params: { group: { name: name } },
++      headers: account_headers("acme", token: @owner_token),
++      as: :json
++    assert_response :created
++    json_body.dig("group", "id")
++  end
++
++  def create_membership(group_id:, user_id:, default: false)
++    post "/api/v1/group_memberships",
++      params: { group_membership: { group_id: group_id, user_id: user_id, default: default } },
++      headers: account_headers("acme", token: @owner_token),
++      as: :json
++    assert_response :created
++    json_body.dig("group_membership", "id")
++  end
++
++  def create_request(token:, subject:, body:, at: nil, subdomain: "acme")
++    ticket_id = nil
++    block = lambda do
++      post "/api/v1/requests",
++        params: { request: { subject: subject, comment: { body: body } } },
++        headers: account_headers(subdomain, token: token),
++        as: :json
++      assert_response :created
++      ticket_id = json_body.dig("request", "id")
++    end
++
++    if at
++      travel_to(at, &block)
++    else
++      block.call
++    end
++    ticket_id
++  end
++
++  def relay_auth_header(username: "actionmailbox", password: RELAY_PASSWORD)
++    ActionController::HttpAuthentication::Basic.encode_credentials(username, password)
++  end
++
++  def build_rfc822(from:, to:, subject:, body:, cc: nil, message_id: nil)
++    lines = []
++    lines << "From: #{from}" if from
++    lines << "To: #{to}" if to
++    lines << "Cc: #{cc}" if cc
++    lines << "Subject: #{subject}" unless subject.nil?
++    lines << "Message-ID: #{message_id}" if message_id
++    lines << "MIME-Version: 1.0"
++    lines << "Content-Type: text/plain; charset=UTF-8"
++    "#{lines.join("\r\n")}\r\n\r\n#{body}\r\n"
++  end
++
++  def post_relay(raw_email)
++    post RELAY_PATH,
++      params: raw_email,
++      headers: {
++        "Content-Type" => "message/rfc822",
++        "Authorization" => relay_auth_header
++      }
++  end
++end
+diff --git a/test/integration/ticket_priority_filtering_and_search_test.rb b/test/integration/ticket_priority_filtering_and_search_test.rb
+index 901e098..e37d399 100644
+--- a/test/integration/ticket_priority_filtering_and_search_test.rb
++++ b/test/integration/ticket_priority_filtering_and_search_test.rb
+@@ -479,7 +479,7 @@ class TicketPriorityFilteringAndSearchTest < ActionDispatch::IntegrationTest
+ 
+   test "invalid filter values on GET /api/v1/tickets return 422 cleanly" do
+     invalid_queries = [
+-      [ { status: "closed" }, "status" ],
++      [ { status: "archived" }, "status" ],
+       [ { status: "OPEN" }, "status" ],
+       [ { status: "   " }, "status" ],
+       [ { status: [ "open" ] }, "status" ],
+@@ -590,7 +590,7 @@ class TicketPriorityFilteringAndSearchTest < ActionDispatch::IntegrationTest
+     assert_not_includes json_body["requests"].map { |r| r["id"] }, b_open
+ 
+     # Invalid status values on GET /requests return 422
+-    [ "closed", "OPEN", "   ", [ "open" ], { a: "open" } ].each do |bad_status|
++    [ "archived", "OPEN", "   ", [ "open" ], { a: "open" } ].each do |bad_status|
+       get "/api/v1/requests", params: { status: bad_status }, headers: account_headers("acme", token: @avery_token)
+       assert_response :unprocessable_content, "Expected 422 for customer status=#{bad_status.inspect}"
+       assert json_body.dig("errors", "status").present?
+diff --git a/test/mailboxes/support_mailbox_test.rb b/test/mailboxes/support_mailbox_test.rb
+index 67a23cd..8061d66 100644
+--- a/test/mailboxes/support_mailbox_test.rb
++++ b/test/mailboxes/support_mailbox_test.rb
+@@ -235,4 +235,67 @@ class SupportMailboxTest < ActionMailbox::TestCase
+       assert inbound.bounced?
+     end
+   end
++
++  test "bounces incoming replies addressed to a closed or merged ticket" do
++    customer = @acme.users.create!(
++      name: "Avery",
++      email: "avery@example.test",
++      password: "avery-password",
++      role: "customer",
++      email_verified_at: Time.current
++    )
++    source = @acme.tickets.create!(
++      requester: customer,
++      subject: "Duplicate email ticket",
++      status: "open",
++      email_origin: true
++    )
++    target = @acme.tickets.create!(
++      requester: customer,
++      subject: "Surviving email ticket",
++      status: "open",
++      email_origin: true
++    )
++    source.update!(status: "closed", merged_into: target)
++
++    # Reply directly to closed ticket's reply address bounces cleanly
++    assert_no_difference [ "Ticket.count", "TicketComment.count" ] do
++      inbound = receive_inbound_email_from_mail do
++        from "Avery <avery@example.test>"
++        to source.email_reply_address
++        subject "Re: Duplicate email ticket"
++        message_id "<reply-closed-1@example.test>"
++        body "Are you still there?"
++      end
++      assert inbound.bounced?
++    end
++
++    assert_equal "closed", source.reload.status
++    assert_equal target.id, source.merged_into_id
++
++    # Reply addressed to both closed ticket reply address and plain account address also bounces (no new ticket)
++    assert_no_difference [ "Ticket.count", "TicketComment.count" ] do
++      inbound = receive_inbound_email_from_mail do
++        from "Avery <avery@example.test>"
++        to source.email_reply_address
++        cc "acme@support.example.test"
++        subject "Re: Duplicate email ticket"
++        message_id "<reply-closed-2@example.test>"
++        body "Trying again with CC"
++      end
++      assert inbound.bounced?
++    end
++
++    # Reply to surviving target ticket still succeeds normally
++    assert_difference -> { target.comments.count }, 1 do
++      inbound = receive_inbound_email_from_mail do
++        from "Avery <avery@example.test>"
++        to target.email_reply_address
++        subject "Re: Surviving email ticket"
++        message_id "<reply-target-1@example.test>"
++        body "Continuing on surviving ticket"
++      end
++      assert inbound.delivered?
++    end
++  end
+ end
+diff --git a/test/models/ticket_test.rb b/test/models/ticket_test.rb
+index 2ff4577..d40157e 100644
+--- a/test/models/ticket_test.rb
++++ b/test/models/ticket_test.rb
+@@ -70,7 +70,7 @@ class TicketTest < ActiveSupport::TestCase
+     assert_not blank_subject.valid?
+     assert blank_subject.errors[:subject].any?
+ 
+-    invalid_status = @acme.tickets.build(requester: @customer, subject: "Help", status: "closed")
++    invalid_status = @acme.tickets.build(requester: @customer, subject: "Help", status: "archived")
+     assert_not invalid_status.valid?
+     assert invalid_status.errors[:status].any?
+ 
+@@ -181,4 +181,117 @@ class TicketTest < ActiveSupport::TestCase
+     assert_not Ticket.exists?(ticket.id)
+     assert_not TicketComment.exists?(comment.id)
+   end
++
++  test "supports closed status, merged_into validations, closed immutability, and safe account/user deletion of merge chains" do
++    t1 = @acme.tickets.create!(requester: @customer, subject: "First")
++    t2 = @acme.tickets.create!(requester: @customer, subject: "Second")
++    t3 = @acme.tickets.create!(requester: @customer, subject: "Third")
++    other_customer = @acme.users.create!(
++      name: "Other Customer",
++      email: "other-cust@example.test",
++      password: "password123",
++      role: "customer",
++      email_verified_at: Time.current
++    )
++    t_other_customer = @acme.tickets.create!(requester: other_customer, subject: "Other customer ticket")
++    t_other_account = @globex.tickets.create!(requester: @other_user, subject: "Globex ticket")
++
++    assert_not t1.closed?
++    assert_not t1.merged?
++    assert_nil t1.merged_into_id
++
++    # Cannot set merged_into_id without closing
++    t1.merged_into = t2
++    assert_not t1.valid?
++    assert t1.errors[:status].any?
++    t1.reload
++
++    # Cannot merge into self
++    t1.status = "closed"
++    t1.merged_into = t1
++    assert_not t1.valid?
++    assert t1.errors[:merged_into_id].any?
++    t1.reload
++
++    # Cannot merge into another account's ticket
++    t1.status = "closed"
++    t1.merged_into = t_other_account
++    assert_not t1.valid?
++    assert t1.errors[:merged_into_id].any?
++    t1.reload
++
++    # Cannot merge into another requester's ticket
++    t1.status = "closed"
++    t1.merged_into = t_other_customer
++    assert_not t1.valid?
++    assert t1.errors[:merged_into_id].any?
++    t1.reload
++
++    # Valid merge t1 -> t2
++    t1.update!(status: "closed", merged_into: t2)
++    assert t1.closed?
++    assert t1.merged?
++    assert_equal t2.id, t1.merged_into_id
++    assert_equal [ t1.id ], t2.merged_tickets.pluck(:id)
++
++    # Closed ticket rejects further model edits
++    assert_not t1.update(priority: "high")
++    assert t1.errors[:status].any?
++    assert_equal "normal", t1.reload.priority
++
++    # Closed ticket rejects new comments unless allow_closed_ticket is explicitly set
++    blocked_comment = TicketComment.new(account: @acme, ticket: t1, author: @staff, body: "Nope")
++    assert_not blocked_comment.valid?
++    assert blocked_comment.errors[:ticket].any?
++
++    allowed_comment = TicketComment.create!(
++      account: @acme,
++      ticket: t1,
++      author: @staff,
++      body: "Allowed merge note",
++      public: false,
++      allow_closed_ticket: true
++    )
++    assert allowed_comment.persisted?
++
++    # Cannot merge another ticket into closed t1
++    t3.status = "closed"
++    t3.merged_into = t1
++    assert_not t3.valid?
++    assert t3.errors[:merged_into_id].any?
++    t3.reload
++
++    # Chained merge t2 -> t3 preserves t1 -> t2
++    t2.update!(status: "closed", merged_into: t3)
++    assert_equal t2.id, t1.reload.merged_into_id
++    assert_equal t3.id, t2.reload.merged_into_id
++    assert_nil t3.reload.merged_into_id
++
++    # DB check constraint blocks self-reference even via update_all
++    assert_raises(ActiveRecord::StatementInvalid) do
++      ActiveRecord::Base.transaction(requires_new: true) do
++        Ticket.where(id: t3.id).update_all(merged_into_id: t3.id)
++      end
++    end
++
++    # Purging a cancelled account with chained merges succeeds cleanly
++    @acme.update!(cancelled_at: 91.days.ago)
++    assert_equal 1, Account.purge_expired_cancelled!
++    assert_not Ticket.exists?(t1.id)
++    assert_not Ticket.exists?(t2.id)
++    assert_not Ticket.exists?(t3.id)
++  end
++
++  test "destroying a user with chained merged tickets succeeds cleanly" do
++    t1 = @acme.tickets.create!(requester: @customer, subject: "Chain 1")
++    t2 = @acme.tickets.create!(requester: @customer, subject: "Chain 2")
++    t3 = @acme.tickets.create!(requester: @customer, subject: "Chain 3")
++    t1.update!(status: "closed", merged_into: t2)
++    t2.update!(status: "closed", merged_into: t3)
++
++    @customer.destroy!
++    assert_not Ticket.exists?(t1.id)
++    assert_not Ticket.exists?(t2.id)
++    assert_not Ticket.exists?(t3.id)
++  end
+ end

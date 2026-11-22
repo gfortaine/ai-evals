@@ -1,0 +1,354 @@
+diff --git a/app/controllers/books/searches_controller.rb b/app/controllers/books/searches_controller.rb
+index 5268c55..98e2134 100644
+--- a/app/controllers/books/searches_controller.rb
++++ b/app/controllers/books/searches_controller.rb
+@@ -1,9 +1,38 @@
++require "ipaddr"
++
+ class Books::SearchesController < ApplicationController
+   allow_unauthenticated_access
+ 
++  before_action :enforce_search_rate_limit, only: :create
++
+   include BookScoped
+ 
++  SEARCH_RATE_LIMIT = 30
++  SEARCH_RATE_WINDOW = 1.minute
++
+   def create
+     @leaves = @book.leaves.active.search(params[:search]).favoring_title.limit(50)
+   end
++
++  private
++    def enforce_search_rate_limit
++      result = RateLimiter.check(
++        key: "rate-limit:books/searches:#{normalized_remote_ip}",
++        limit: SEARCH_RATE_LIMIT,
++        within: SEARCH_RATE_WINDOW,
++        store: self.class.cache_store
++      )
++
++      unless result.allowed?
++        response.set_header("Retry-After", result.retry_after.to_s)
++        head :too_many_requests
++      end
++    end
++
++    def normalized_remote_ip
++      raw_ip = request.remote_ip.presence || request.ip.presence || "unknown"
++      IPAddr.new(raw_ip).native.to_s
++    rescue IPAddr::InvalidAddressError
++      raw_ip
++    end
+ end
+diff --git a/app/models/rate_limiter.rb b/app/models/rate_limiter.rb
+new file mode 100644
+index 0000000..8e2062e
+--- /dev/null
++++ b/app/models/rate_limiter.rb
+@@ -0,0 +1,282 @@
++require "digest"
++require "fileutils"
++require "securerandom"
++
++class RateLimiter
++  REDIS_SLIDING_WINDOW_SCRIPT = <<~LUA
++    local key = KEYS[1]
++    local now = tonumber(ARGV[1])
++    local window = tonumber(ARGV[2])
++    local limit = tonumber(ARGV[3])
++    local member = ARGV[4]
++    local ttl = tonumber(ARGV[5])
++
++    redis.call("ZREMRANGEBYSCORE", key, "-inf", now - window)
++    redis.call("ZREMRANGEBYSCORE", key, now + 1000000, "+inf")
++
++    local count = redis.call("ZCARD", key)
++    if count >= limit then
++      local oldest = redis.call("ZRANGE", key, 0, 0, "WITHSCORES")
++      return { 0, oldest[2] or tostring(now) }
++    end
++
++    redis.call("ZADD", key, now, member)
++    redis.call("EXPIRE", key, ttl)
++    return { 1, 0 }
++  LUA
++
++  REDIS_RETRY_INTERVAL = 5.0
++  CLOCK_SKEW_TOLERANCE_US = 1_000_000
++  FILE_STALE_AGE = 600.0
++  FILE_PRUNE_INTERVAL = 300.0
++
++  Result = Data.define(:allowed, :retry_after) do
++    alias_method :allowed?, :allowed
++  end
++
++  @mutex = Mutex.new
++  @file_mutex = Mutex.new
++  @redis_mutex = Mutex.new
++  @redis_retry_at = 0.0
++  @last_prune_at = 0.0
++
++  class << self
++    def check(key:, limit:, within:, store: nil)
++      now = Time.now
++      now_us = now.tv_sec * 1_000_000 + now.tv_usec
++      window_us = (within.to_r * 1_000_000).to_i
++      resolved_store = resolve_store(store)
++
++      if redis_store?(resolved_store)
++        result = check_with_redis(
++          store: resolved_store,
++          key: key,
++          limit: limit,
++          within: within,
++          now_us: now_us,
++          window_us: window_us
++        )
++        return result if result
++
++        check_with_file(
++          dir: fallback_file_dir,
++          key: key,
++          limit: limit,
++          within: within,
++          now_us: now_us,
++          window_us: window_us
++        )
++      elsif file_store?(resolved_store)
++        check_with_file(
++          dir: File.join(resolved_store.cache_path, "_rate_limits"),
++          key: key,
++          limit: limit,
++          within: within,
++          now_us: now_us,
++          window_us: window_us
++        )
++      else
++        check_with_memory(
++          store: resolved_store,
++          key: key,
++          limit: limit,
++          within: within,
++          now_us: now_us,
++          window_us: window_us
++        )
++      end
++    end
++
++    private
++      def resolve_store(controller_store)
++        boot_store = Rails.application.config.x.rate_limiter.boot_cache_store
++        candidate = if controller_store && !controller_store.equal?(boot_store)
++          controller_store
++        else
++          Rails.cache
++        end
++
++        if candidate.nil? || candidate.is_a?(ActiveSupport::Cache::NullStore)
++          fallback_memory_store
++        else
++          candidate
++        end
++      end
++
++      def fallback_memory_store
++        Rails.application.config.x.rate_limiter.fallback_store ||= ActiveSupport::Cache::MemoryStore.new
++      end
++
++      def fallback_file_dir
++        Rails.root.join("tmp/cache/rate_limits").to_s
++      end
++
++      def redis_store?(store)
++        defined?(ActiveSupport::Cache::RedisCacheStore) && store.is_a?(ActiveSupport::Cache::RedisCacheStore)
++      end
++
++      def file_store?(store)
++        defined?(ActiveSupport::Cache::FileStore) && store.is_a?(ActiveSupport::Cache::FileStore)
++      end
++
++      def check_with_memory(store:, key:, limit:, within:, now_us:, window_us:)
++        @mutex.synchronize do
++          timestamps = prune(Array(store.read(key)), now_us, window_us)
++
++          if timestamps.size >= limit
++            Result.new(allowed: false, retry_after: retry_after_for(timestamps.min, now_us, window_us, within))
++          else
++            timestamps << now_us
++            store.write(key, timestamps, expires_in: within + 1.minute)
++            Result.new(allowed: true, retry_after: 0)
++          end
++        end
++      end
++
++      def check_with_redis(store:, key:, limit:, within:, now_us:, window_us:)
++        return nil if redis_in_backoff?
++
++        redis_key = namespaced_redis_key(store, key)
++        member = "#{now_us}:#{SecureRandom.hex(4)}"
++        ttl = within.to_i + 60
++
++        allowed, oldest = with_redis_client(store, redis_key) do |client|
++          client.eval(
++            REDIS_SLIDING_WINDOW_SCRIPT,
++            keys: [ redis_key ],
++            argv: [ now_us, window_us, limit, member, ttl ]
++          )
++        end
++
++        if allowed == 1
++          Result.new(allowed: true, retry_after: 0)
++        else
++          Result.new(allowed: false, retry_after: retry_after_for(oldest.to_i, now_us, window_us, within))
++        end
++      rescue ::Redis::BaseError, ::ConnectionPool::Error, ::ConnectionPool::TimeoutError, Errno::ECONNREFUSED, SocketError
++        mark_redis_unavailable!
++        nil
++      end
++
++      def with_redis_client(store, key)
++        pool = store.redis
++        if pool.respond_to?(:with)
++          pool.with do |client|
++            client = client.node_for(key) if defined?(::Redis::Distributed) && client.is_a?(::Redis::Distributed)
++            yield client
++          end
++        else
++          client = defined?(::Redis::Distributed) && pool.is_a?(::Redis::Distributed) ? pool.node_for(key) : pool
++          yield client
++        end
++      end
++
++      def namespaced_redis_key(store, key)
++        namespace = store.options[:namespace]
++        namespace = namespace.call if namespace.respond_to?(:call)
++        namespace ? "#{namespace}:#{key}" : key
++      end
++
++      def redis_in_backoff?
++        @redis_mutex.synchronize do
++          Process.clock_gettime(Process::CLOCK_MONOTONIC) < @redis_retry_at
++        end
++      end
++
++      def mark_redis_unavailable!
++        @redis_mutex.synchronize do
++          @redis_retry_at = Process.clock_gettime(Process::CLOCK_MONOTONIC) + REDIS_RETRY_INTERVAL
++        end
++      end
++
++      def check_with_file(dir:, key:, limit:, within:, now_us:, window_us:)
++        FileUtils.mkdir_p(dir)
++        path = File.join(dir, Digest::SHA256.hexdigest(key))
++
++        @file_mutex.synchronize do
++          result = open_locked_file(path) do |file|
++            timestamps = file.read.each_line.filter_map { |line| Integer(line.strip, exception: false) }
++            timestamps = prune(timestamps, now_us, window_us)
++
++            if timestamps.size >= limit
++              Result.new(allowed: false, retry_after: retry_after_for(timestamps.min, now_us, window_us, within))
++            else
++              timestamps << now_us
++              file.rewind
++              file.write(timestamps.join("\n"))
++              file.truncate(file.pos)
++              file.flush
++              Result.new(allowed: true, retry_after: 0)
++            end
++          end
++
++          prune_stale_files(dir)
++          result
++        end
++      end
++
++      def open_locked_file(path)
++        file = loop do
++          candidate = File.open(path, File::RDWR | File::CREAT, 0o600)
++          candidate.flock(File::LOCK_EX)
++
++          current_stat = begin
++            File.stat(path)
++          rescue Errno::ENOENT
++            nil
++          end
++
++          if current_stat && candidate.stat.ino == current_stat.ino
++            break candidate
++          end
++
++          candidate.close
++        end
++
++        begin
++          yield file
++        ensure
++          file.flock(File::LOCK_UN)
++          file.close
++        end
++      end
++
++      def prune_stale_files(dir)
++        monotonic_now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
++        return if monotonic_now - @last_prune_at < FILE_PRUNE_INTERVAL
++
++        @last_prune_at = monotonic_now
++        cutoff = Process.clock_gettime(Process::CLOCK_REALTIME) - FILE_STALE_AGE
++
++        Dir.each_child(dir) do |entry|
++          path = File.join(dir, entry)
++          next unless File.file?(path)
++
++          File.open(path, File::RDWR) do |file|
++            next unless file.flock(File::LOCK_EX | File::LOCK_NB)
++
++            begin
++              if file.mtime.to_f < cutoff
++                File.delete(path)
++              end
++            ensure
++              file.flock(File::LOCK_UN)
++            end
++          end
++        rescue Errno::ENOENT, Errno::EACCES
++          next
++        end
++      end
++
++      def prune(timestamps, now_us, window_us)
++        cutoff_us = now_us - window_us
++        future_cutoff_us = now_us + CLOCK_SKEW_TOLERANCE_US
++        timestamps.select { |ts| ts.is_a?(Integer) && ts > cutoff_us && ts <= future_cutoff_us }
++      end
++
++      def retry_after_for(oldest_us, now_us, window_us, within)
++        remaining_seconds = (oldest_us + window_us - now_us) / 1_000_000.0
++        remaining_seconds.ceil.clamp(1, within.to_i)
++      end
++  end
++end
+diff --git a/config/environments/test.rb b/config/environments/test.rb
+index 75f22c6..f251542 100644
+--- a/config/environments/test.rb
++++ b/config/environments/test.rb
+@@ -23,7 +23,7 @@ Rails.application.configure do
+   # Show full error reports and disable caching.
+   config.consider_all_requests_local = true
+   config.action_controller.perform_caching = false
+-  config.cache_store = :null_store
++  config.cache_store = :memory_store
+ 
+   # Render exception templates for rescuable exceptions and raise for other exceptions.
+   config.action_dispatch.show_exceptions = :rescuable
+diff --git a/config/initializers/rate_limiter.rb b/config/initializers/rate_limiter.rb
+new file mode 100644
+index 0000000..c28eb4d
+--- /dev/null
++++ b/config/initializers/rate_limiter.rb
+@@ -0,0 +1,4 @@
++Rails.application.config.after_initialize do |app|
++  app.config.x.rate_limiter.boot_cache_store = Rails.cache
++  app.config.x.rate_limiter.fallback_store = ActiveSupport::Cache::MemoryStore.new
++end

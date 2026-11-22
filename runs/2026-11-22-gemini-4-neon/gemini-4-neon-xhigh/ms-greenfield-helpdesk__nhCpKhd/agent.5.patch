@@ -1,0 +1,2187 @@
+diff --git a/.gitignore b/.gitignore
+index 55e8243..de29156 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -10,5 +10,9 @@
+ /tmp/pids/*
+ !/tmp/pids/.keep
+ 
++# Ignore uploaded files in development/production local disk storage.
++/storage/*
++!/storage/.keep
++
+ # Ignore key files for decrypting credentials and more.
+ /config/*.key
+diff --git a/app/controllers/api/v1/tickets_controller.rb b/app/controllers/api/v1/tickets_controller.rb
+index 9f2170d..90b6947 100644
+--- a/app/controllers/api/v1/tickets_controller.rb
++++ b/app/controllers/api/v1/tickets_controller.rb
+@@ -182,6 +182,11 @@ module Api
+         end
+ 
+         reloaded_ticket = current_account.tickets.includes(:requester, :assignee).find(ticket.id)
++
++        if reloaded_ticket.email_origin? && comment.present? && comment.public?
++          TicketMailer.staff_reply(ticket: reloaded_ticket, comment: comment).deliver_now
++        end
++
+         render json: { ticket: serialize_ticket(reloaded_ticket) }, status: :ok
+       end
+ 
+diff --git a/app/mailboxes/application_mailbox.rb b/app/mailboxes/application_mailbox.rb
+new file mode 100644
+index 0000000..783d073
+--- /dev/null
++++ b/app/mailboxes/application_mailbox.rb
+@@ -0,0 +1,3 @@
++class ApplicationMailbox < ActionMailbox::Base
++  routing :all => :support
++end
+diff --git a/app/mailboxes/support_mailbox.rb b/app/mailboxes/support_mailbox.rb
+new file mode 100644
+index 0000000..3ad0f70
+--- /dev/null
++++ b/app/mailboxes/support_mailbox.rb
+@@ -0,0 +1,497 @@
++require "loofah"
++require "securerandom"
++
++class SupportMailbox < ApplicationMailbox
++  LIST_HEADERS = %i[
++    list_id
++    list_unsubscribe
++    list_post
++    list_help
++    list_owner
++    list_subscribe
++    list_archive
++    mailing_list
++    x_mailing_list
++    x_list_id
++  ].freeze
++
++  AUTOMATED_PRECEDENCE_VALUES = %w[
++    bulk
++    list
++    junk
++    auto_reply
++    auto-reply
++    autoreply
++  ].freeze
++
++  AUTO_RESPONSE_SUPPRESS_TOKENS = %w[
++    all
++    oof
++    autoreply
++    auto-reply
++    dr
++    rn
++    nrn
++  ].freeze
++
++  AUTOMATED_SENDER_LOCAL_PATTERN = /\A(mailer-daemon|postmaster|no-?reply|do-?not-?reply|auto-?reply|bounces?)\z/i
++
++  def process
++    message_id = extract_normalized_message_id
++    return if message_id.present? && Comment.exists?(inbound_message_id: message_id)
++
++    if automated_or_list_mail?
++      bounced!
++      return
++    end
++
++    sender = extract_sender
++    if sender.nil? || automated_sender?(sender[:email])
++      bounced!
++      return
++    end
++
++    target = resolve_target(extract_support_recipient_locals)
++    if target.nil?
++      bounced!
++      return
++    end
++
++    body = extract_plain_text_body
++    if body.blank?
++      bounced!
++      return
++    end
++
++    case target[:mode]
++    when :reply
++      process_reply(
++        account: target[:account],
++        ticket: target[:ticket],
++        sender: sender,
++        body: body,
++        message_id: message_id
++      )
++    when :new_ticket
++      subject = extract_subject
++      if subject.blank?
++        bounced!
++        return
++      end
++
++      process_new_ticket(
++        account: target[:account],
++        sender: sender,
++        subject: subject,
++        body: body,
++        message_id: message_id
++      )
++    end
++  end
++
++  private
++
++  def process_reply(account:, ticket:, sender:, body:, message_id:)
++    requester = ticket.requester
++    unless requester.present? &&
++           requester.email == sender[:email] &&
++           requester.customer? &&
++           requester.active?
++      bounced!
++      return
++    end
++
++    duplicate = false
++    invalid = false
++
++    Account.transaction(requires_new: true) do
++      account.lock!
++      if account.cancelled?
++        invalid = true
++        next
++      end
++
++      if message_id.present? && Comment.exists?(inbound_message_id: message_id)
++        duplicate = true
++        next
++      end
++
++      locked_ticket = account.tickets.includes(:requester).find_by(id: ticket.id)
++      if locked_ticket.nil? ||
++         locked_ticket.requester.email != sender[:email] ||
++         !locked_ticket.requester.customer? ||
++         locked_ticket.requester.suspended?
++        invalid = true
++        next
++      end
++
++      if [ Ticket::PENDING, Ticket::SOLVED ].include?(locked_ticket.status)
++        locked_ticket.update!(status: Ticket::OPEN)
++      end
++
++      Comment.create!(
++        account: account,
++        ticket: locked_ticket,
++        author: locked_ticket.requester,
++        body: body,
++        public: true,
++        inbound_message_id: message_id
++      )
++    end
++
++    return if duplicate
++    bounced! if invalid
++  rescue ActiveRecord::RecordNotUnique
++    return if message_id.present? && Comment.exists?(inbound_message_id: message_id)
++
++    bounced!
++  rescue ActiveRecord::RecordInvalid
++    bounced!
++  end
++
++  def process_new_ticket(account:, sender:, subject:, body:, message_id:)
++    duplicate = false
++    invalid = false
++    new_customer = nil
++    verification_token = nil
++
++    Account.transaction(requires_new: true) do
++      account.lock!
++      if account.cancelled?
++        invalid = true
++        next
++      end
++
++      if message_id.present? && Comment.exists?(inbound_message_id: message_id)
++        duplicate = true
++        next
++      end
++
++      customer = account.users.find_by(email: sender[:email])
++      if customer.present?
++        if !customer.customer? || customer.suspended?
++          invalid = true
++          next
++        end
++      else
++        if account.invitations.pending.exists?(email: sender[:email])
++          invalid = true
++          next
++        end
++
++        customer = account.users.create!(
++          name: derive_customer_name(sender[:name], sender[:email]),
++          email: sender[:email],
++          password: SecureRandom.urlsafe_base64(32),
++          role: "customer",
++          email_verified_at: nil
++        )
++        verification_token = UserToken.issue_for!(user: customer, purpose: UserToken::EMAIL_VERIFICATION)
++        new_customer = customer
++      end
++
++      ticket = account.tickets.create!(
++        requester: customer,
++        subject: subject,
++        status: Ticket::OPEN,
++        priority: Ticket::NORMAL,
++        channel: Ticket::EMAIL
++      )
++
++      Comment.create!(
++        account: account,
++        ticket: ticket,
++        author: customer,
++        body: body,
++        public: true,
++        inbound_message_id: message_id
++      )
++    end
++
++    return if duplicate
++
++    if invalid
++      bounced!
++      return
++    end
++
++    if new_customer.present? && verification_token.present?
++      AuthMailer.email_verification(user: new_customer, token: verification_token).deliver_now
++    end
++  rescue ActiveRecord::RecordNotUnique
++    return if message_id.present? && Comment.exists?(inbound_message_id: message_id)
++
++    bounced!
++  rescue ActiveRecord::RecordInvalid
++    bounced!
++  end
++
++  def extract_normalized_message_id
++    raw_fields = Array(mail.header[:message_id])
++    has_explicit_header = raw_fields.any? { |field| field.unparsed_value.to_s.strip.present? }
++
++    raw_id = if has_explicit_header
++               mail.message_id.to_s.strip.presence || raw_fields.first.unparsed_value.to_s.strip
++             else
++               inbound_email.message_id.to_s.strip
++             end
++
++    normalized = sanitize_single_line_text(raw_id)
++    return nil if normalized.blank?
++
++    normalized = normalized.delete_prefix("<").delete_suffix(">").strip.downcase
++    normalized.presence
++  end
++
++  def automated_or_list_mail?
++    auto_submitted_header? ||
++      automated_precedence? ||
++      list_header_present? ||
++      auto_reply_or_bounce_header? ||
++      null_return_path? ||
++      bounce_mime_type?
++  end
++
++  def auto_submitted_header?
++    Array(mail.header[:auto_submitted]).any? do |field|
++      primary_value = field.value.to_s.split(";").first.to_s.strip.downcase
++      primary_value.present? && primary_value != "no"
++    end
++  end
++
++  def automated_precedence?
++    Array(mail.header[:precedence]).any? do |field|
++      AUTOMATED_PRECEDENCE_VALUES.include?(field.value.to_s.strip.downcase)
++    end
++  end
++
++  def list_header_present?
++    LIST_HEADERS.any? do |header_name|
++      Array(mail.header[header_name]).any? { |field| field.value.to_s.strip.present? }
++    end
++  end
++
++  def auto_reply_or_bounce_header?
++    %i[x_autoreply x_auto_reply].any? do |header_name|
++      Array(mail.header[header_name]).any? do |field|
++        val = field.value.to_s.strip.downcase
++        val.present? && !%w[no false 0].include?(val)
++      end
++    end ||
++      %i[x_autorespond x_failed_recipients x_loop].any? do |header_name|
++        Array(mail.header[header_name]).any? { |field| field.value.to_s.strip.present? }
++      end ||
++      Array(mail.header[:x_auto_response_suppress]).any? do |field|
++        tokens = field.value.to_s.downcase.split(/[,\s]+/).reject(&:empty?)
++        tokens.any? { |token| AUTO_RESPONSE_SUPPRESS_TOKENS.include?(token) }
++      end
++  end
++
++  def null_return_path?
++    Array(mail.header[:return_path]).any? do |field|
++      field.unparsed_value.to_s.strip == "<>" || field.value.to_s.strip.empty?
++    end
++  end
++
++  def bounce_mime_type?
++    mail.mime_type.to_s.downcase == "multipart/report"
++  end
++
++  def automated_sender?(sender_email)
++    local, domain = sender_email.split("@", 2)
++    return true if local.blank? || domain.blank?
++
++    base_local = local.split("+", 2).first.to_s
++    base_local.match?(AUTOMATED_SENDER_LOCAL_PATTERN) ||
++      sender_email == HelpdeskConfig.mail_from.downcase ||
++      domain == HelpdeskConfig.support_domain
++  end
++
++  def extract_sender
++    from_fields = Array(mail.header[:from])
++    return nil if from_fields.empty?
++
++    addrs = from_fields.flat_map do |field|
++      if field.respond_to?(:addrs)
++        field.addrs
++      else
++        Mail::AddressList.new(field.value.to_s).addresses
++      end
++    end
++    return nil unless addrs.size == 1
++
++    addr = addrs.first
++    email = addr.address.to_s.strip.downcase
++    return nil if email.blank? || email.include?("\x00") || !email.match?(User::EMAIL_FORMAT)
++
++    {
++      email: email,
++      name: sanitize_single_line_text(addr.display_name)
++    }
++  rescue Mail::Field::ParseError
++    nil
++  end
++
++  def extract_support_recipient_locals
++    support_domain = HelpdeskConfig.support_domain
++    raw_addresses = []
++
++    %i[to cc bcc].each do |field|
++      raw_addresses.concat(Array(mail.public_send(field)))
++    end
++
++    %i[x_original_to x_forwarded_to delivered_to].each do |field|
++      Array(mail.header[field]).each do |header_field|
++        raw_addresses.concat(parse_address_strings(header_field.value.to_s))
++      end
++    end
++
++    raw_addresses.filter_map do |addr|
++      normalized = addr.to_s.strip.downcase
++      next if normalized.blank? || normalized.match?(/\s/) || !normalized.include?("@")
++
++      local, _, domain = normalized.rpartition("@")
++      next unless domain == support_domain && local.present?
++
++      local
++    end.uniq
++  end
++
++  def parse_address_strings(raw)
++    return [] if raw.blank?
++
++    Mail::AddressList.new(raw).addresses.map(&:address).compact
++  rescue Mail::Field::ParseError
++    begin
++      [ Mail::Address.new(raw).address ].compact
++    rescue Mail::Field::ParseError
++      [ raw.strip.delete_prefix("<").delete_suffix(">").strip ]
++    end
++  end
++
++  def resolve_target(support_locals)
++    return nil if support_locals.empty?
++
++    subdomains = []
++    reply_tokens = []
++
++    support_locals.each do |local|
++      if local.include?("+")
++        subdomain, token = local.split("+", 2)
++        return nil if subdomain.blank? || token.blank?
++
++        subdomains << subdomain
++        reply_tokens << token
++      else
++        subdomains << local
++      end
++    end
++
++    subdomains.uniq!
++    reply_tokens.uniq!
++
++    return nil unless subdomains.size == 1
++    return nil if reply_tokens.size > 1
++
++    account = Account.find_by(subdomain: subdomains.first)
++    return nil if account.nil? || account.cancelled?
++
++    if reply_tokens.size == 1
++      ticket = account.tickets.find_by(reply_token: reply_tokens.first)
++      return nil if ticket.nil?
++
++      { mode: :reply, account: account, ticket: ticket }
++    else
++      { mode: :new_ticket, account: account }
++    end
++  end
++
++  def extract_subject
++    subject = sanitize_single_line_text(mail.subject)
++    return nil if subject.blank?
++
++    subject[0, 255].strip.presence
++  end
++
++  def extract_plain_text_body
++    text = if mail.multipart?
++             decode_part_text(mail.text_part)
++           elsif mail.mime_type.nil? || mail.mime_type.casecmp?("text/plain")
++             decode_part_text(mail)
++           end
++
++    return text if text.present?
++
++    html = if mail.multipart?
++             decode_part_text(mail.html_part)
++           elsif mail.mime_type&.casecmp?("text/html")
++             decode_part_text(mail)
++           end
++
++    return nil if html.blank?
++
++    html_to_plain_text(html)
++  end
++
++  def decode_part_text(part)
++    return nil if part.nil?
++
++    raw = begin
++      part.decoded
++    rescue Encoding::ConverterNotFoundError, Encoding::InvalidByteSequenceError, Encoding::UndefinedConversionError
++      part.body.decoded
++    end
++
++    sanitize_multiline_text(raw)
++  end
++
++  def html_to_plain_text(html)
++    doc = Loofah.fragment(html)
++    doc.xpath(".//script | .//style | .//head").remove
++    doc.xpath(".//br").each { |br| br.replace("\n") }
++    doc.xpath(".//p | .//div | .//li | .//tr | .//h1 | .//h2 | .//h3 | .//h4 | .//h5 | .//h6 | .//blockquote").each do |node|
++      node.add_next_sibling("\n")
++    end
++
++    text = doc.text(encode_special_chars: false)
++    text = sanitize_multiline_text(text)
++    return nil if text.blank?
++
++    text.gsub(/[ \t]+\n/, "\n").gsub(/\n{3,}/, "\n\n").strip.presence
++  end
++
++  def derive_customer_name(display_name, email)
++    candidate = display_name.presence || email.split("@", 2).first.presence || email
++    candidate = candidate[0, 255].strip
++    candidate.presence || email[0, 255]
++  end
++
++  def sanitize_single_line_text(value)
++    return nil if value.nil?
++
++    str = coerce_utf8(value)
++    str.delete!("\x00")
++    str.gsub!(/[\r\n]+/, " ")
++    str.strip!
++    str.presence
++  end
++
++  def sanitize_multiline_text(value)
++    return nil if value.nil?
++
++    str = coerce_utf8(value)
++    str.delete!("\x00")
++    str.gsub!("\r\n", "\n")
++    str.gsub!("\r", "\n")
++    str.strip!
++    str.presence
++  end
++
++  def coerce_utf8(value)
++    str = value.to_s.dup
++    if str.encoding == Encoding::ASCII_8BIT
++      str.force_encoding(Encoding::UTF_8)
++    end
++    str.encode(Encoding::UTF_8, invalid: :replace, undef: :replace, replace: "")
++  end
++end
+diff --git a/app/mailers/ticket_mailer.rb b/app/mailers/ticket_mailer.rb
+new file mode 100644
+index 0000000..40fc3c1
+--- /dev/null
++++ b/app/mailers/ticket_mailer.rb
+@@ -0,0 +1,40 @@
++class TicketMailer < ApplicationMailer
++  def staff_reply(ticket:, comment:)
++    @ticket = ticket
++    @account = ticket.account
++    @comment = comment
++    @requester = ticket.requester
++    @author = comment.author
++
++    references = ticket.comments
++      .where.not(inbound_message_id: nil)
++      .chronological
++      .pluck(:inbound_message_id)
++      .map { |id| format_message_id_header(id) }
++      .compact
++
++    if references.any?
++      headers["In-Reply-To"] = references.last
++      headers["References"] = references.join(" ")
++    end
++
++    mail(
++      to: @requester.email,
++      reply_to: @ticket.reply_address,
++      subject: reply_subject(@ticket.subject)
++    )
++  end
++
++  private
++
++  def reply_subject(subject)
++    subject.match?(/\ARe:/i) ? subject : "Re: #{subject}"
++  end
++
++  def format_message_id_header(message_id)
++    cleaned = message_id.to_s.strip.delete_prefix("<").delete_suffix(">").strip
++    return nil if cleaned.empty? || cleaned.match?(/\s/) || !cleaned.include?("@")
++
++    "<#{cleaned}>"
++  end
++end
+diff --git a/app/models/account.rb b/app/models/account.rb
+index 7967d89..aa50375 100644
+--- a/app/models/account.rb
++++ b/app/models/account.rb
+@@ -54,6 +54,10 @@ class Account < ApplicationRecord
+     cancelled? && cancelled_at > as_of - CANCELLED_RETENTION_PERIOD
+   end
+ 
++  def support_address
++    HelpdeskConfig.support_address(self)
++  end
++
+   def cancel!
+     transaction do
+       update!(cancelled_at: Time.current)
+diff --git a/app/models/comment.rb b/app/models/comment.rb
+index 21f9cfa..3d092ba 100644
+--- a/app/models/comment.rb
++++ b/app/models/comment.rb
+@@ -5,6 +5,7 @@ class Comment < ApplicationRecord
+ 
+   validates :body, presence: true
+   validates :public, inclusion: { in: [ true, false ] }
++  validates :inbound_message_id, uniqueness: true, allow_nil: true
+   validate :ticket_and_author_belong_to_account
+ 
+   after_create :touch_ticket_timestamps
+diff --git a/app/models/ticket.rb b/app/models/ticket.rb
+index 4991880..b073e07 100644
+--- a/app/models/ticket.rb
++++ b/app/models/ticket.rb
+@@ -1,3 +1,5 @@
++require "securerandom"
++
+ class Ticket < ApplicationRecord
+   OPEN = "open"
+   PENDING = "pending"
+@@ -8,6 +10,10 @@ class Ticket < ApplicationRecord
+   HIGH = "high"
+   PRIORITIES = [ NORMAL, HIGH ].freeze
+ 
++  PORTAL = "portal"
++  EMAIL = "email"
++  CHANNELS = [ PORTAL, EMAIL ].freeze
++
+   MAX_BIGINT = 9_223_372_036_854_775_807
+ 
+   belongs_to :account
+@@ -17,9 +23,13 @@ class Ticket < ApplicationRecord
+ 
+   normalizes :subject, with: ->(value) { value.strip }
+ 
++  before_validation :assign_reply_token, on: :create
++
+   validates :subject, presence: true, length: { maximum: 255 }
+   validates :status, presence: true, inclusion: { in: STATUSES }
+   validates :priority, presence: true, inclusion: { in: PRIORITIES }
++  validates :channel, presence: true, inclusion: { in: CHANNELS }
++  validates :reply_token, presence: true, uniqueness: true
+   validate :requester_belongs_to_account
+   validate :assignee_must_be_active_staff_in_account
+ 
+@@ -51,8 +61,20 @@ class Ticket < ApplicationRecord
+     SQL
+   }
+ 
++  def email_origin?
++    channel == EMAIL
++  end
++
++  def reply_address
++    HelpdeskConfig.ticket_reply_address(self)
++  end
++
+   private
+ 
++  def assign_reply_token
++    self.reply_token ||= SecureRandom.hex(16)
++  end
++
+   def customer_facing_attribute_changed?
+     will_save_change_to_status? || will_save_change_to_subject?
+   end
+diff --git a/app/views/ticket_mailer/staff_reply.text.erb b/app/views/ticket_mailer/staff_reply.text.erb
+new file mode 100644
+index 0000000..9aa7a72
+--- /dev/null
++++ b/app/views/ticket_mailer/staff_reply.text.erb
+@@ -0,0 +1,5 @@
++<%= @comment.body %>
++
++--
++<%= @author.name %>
++<%= @account.name %> Support
+diff --git a/config/application.rb b/config/application.rb
+index 51ed1bb..2d04348 100644
+--- a/config/application.rb
++++ b/config/application.rb
+@@ -4,8 +4,10 @@ require "rails"
+ require "active_model/railtie"
+ require "active_job/railtie"
+ require "active_record/railtie"
++require "active_storage/engine"
+ require "action_controller/railtie"
+ require "action_mailer/railtie"
++require "action_mailbox/engine"
+ require "action_view/railtie"
+ require "rails/test_unit/railtie"
+ 
+@@ -22,6 +24,9 @@ module Helpdesk
+ 
+     config.api_only = true
+ 
++    config.active_storage.variant_processor = :disabled
++    config.action_mailbox.ingress = :relay
++
+     config.hosts.clear
+     config.middleware.insert_before 0, CorsMiddleware
+     config.exceptions_app = JsonExceptionsApp.new
+diff --git a/config/environments/development.rb b/config/environments/development.rb
+index 0aa1eca..62b481e 100644
+--- a/config/environments/development.rb
++++ b/config/environments/development.rb
+@@ -13,6 +13,7 @@ Rails.application.configure do
+   end
+ 
+   config.cache_store = :memory_store
++  config.active_storage.service = :local
+ 
+   config.action_mailer.raise_delivery_errors = false
+   config.action_mailer.perform_caching = false
+diff --git a/config/environments/production.rb b/config/environments/production.rb
+index d82ea77..1f8af98 100644
+--- a/config/environments/production.rb
++++ b/config/environments/production.rb
+@@ -6,6 +6,7 @@ Rails.application.configure do
+   config.consider_all_requests_local = false
+ 
+   config.public_file_server.headers = { "cache-control" => "public, max-age=#{1.year.to_i}" }
++  config.active_storage.service = :local
+ 
+   if ENV["FORCE_SSL"] == "true"
+     config.assume_ssl = true
+diff --git a/config/environments/test.rb b/config/environments/test.rb
+index 0135de3..7c697aa 100644
+--- a/config/environments/test.rb
++++ b/config/environments/test.rb
+@@ -28,6 +28,14 @@ Rails.application.configure do
+   # Disable request forgery protection in test environment.
+   config.action_controller.allow_forgery_protection = false
+ 
++  # Store uploaded files on the local file system in a temporary directory.
++  config.active_storage.service = :test
++
++  # Process Active Job (including Action Mailbox routing) inline during the request
++  # so a separate worker is not needed in test.
++  config.active_job.queue_adapter = :inline
++  config.action_mailbox.incinerate = false
++
+   # Tell Action Mailer not to deliver emails to the real world.
+   # The :test delivery method accumulates sent emails in the
+   # ActionMailer::Base.deliveries array.
+@@ -43,7 +51,7 @@ Rails.application.configure do
+   # config.i18n.raise_on_missing_translations = true
+ 
+   # Annotate rendered view with file names.
+-  # config.action_view.annotate_rendered_view_with_filenames = true
++  config.action_view.annotate_rendered_view_with_filenames = true
+ 
+   # Raise error when a before_action's only/except options reference missing actions.
+   config.action_controller.raise_on_missing_callback_actions = true
+diff --git a/config/storage.yml b/config/storage.yml
+new file mode 100644
+index 0000000..695f17b
+--- /dev/null
++++ b/config/storage.yml
+@@ -0,0 +1,7 @@
++test:
++  service: Disk
++  root: <%= Rails.root.join("tmp/storage") %>
++
++local:
++  service: Disk
++  root: <%= Rails.root.join("storage") %>
+diff --git a/db/migrate/20261121110001_create_active_storage_tables.rb b/db/migrate/20261121110001_create_active_storage_tables.rb
+new file mode 100644
+index 0000000..7d831e5
+--- /dev/null
++++ b/db/migrate/20261121110001_create_active_storage_tables.rb
+@@ -0,0 +1,34 @@
++class CreateActiveStorageTables < ActiveRecord::Migration[8.1]
++  def change
++    create_table :active_storage_blobs do |t|
++      t.string   :key,          null: false
++      t.string   :filename,     null: false
++      t.string   :content_type
++      t.text     :metadata
++      t.string   :service_name, null: false
++      t.bigint   :byte_size,    null: false
++      t.string   :checksum
++      t.datetime :created_at,   null: false
++
++      t.index [ :key ], unique: true
++    end
++
++    create_table :active_storage_attachments do |t|
++      t.string     :name,     null: false
++      t.references :record,   null: false, polymorphic: true, index: false
++      t.references :blob,     null: false
++      t.datetime   :created_at, null: false
++
++      t.index [ :record_type, :record_id, :name, :blob_id ], name: :index_active_storage_attachments_uniqueness, unique: true
++      t.foreign_key :active_storage_blobs, column: :blob_id
++    end
++
++    create_table :active_storage_variant_records do |t|
++      t.belongs_to :blob, null: false, index: false
++      t.string :variation_digest, null: false
++
++      t.index [ :blob_id, :variation_digest ], name: :index_active_storage_variant_records_uniqueness, unique: true
++      t.foreign_key :active_storage_blobs, column: :blob_id
++    end
++  end
++end
+diff --git a/db/migrate/20261121110002_create_action_mailbox_tables.rb b/db/migrate/20261121110002_create_action_mailbox_tables.rb
+new file mode 100644
+index 0000000..533ff67
+--- /dev/null
++++ b/db/migrate/20261121110002_create_action_mailbox_tables.rb
+@@ -0,0 +1,18 @@
++class CreateActionMailboxTables < ActiveRecord::Migration[8.1]
++  def change
++    create_table :action_mailbox_inbound_emails do |t|
++      t.integer :status, default: 0, null: false
++      t.string  :message_id, null: false
++      t.string  :message_checksum, null: false
++
++      t.timestamps
++
++      # Exclude failed (3) and bounced (4) records so invalid deliveries never
++      # block a later valid retry even with identical raw RFC 822 bytes.
++      t.index [ :message_id, :message_checksum ],
++        name: "index_action_mailbox_inbound_emails_uniqueness",
++        unique: true,
++        where: "status IN (0, 1, 2)"
++    end
++  end
++end
+diff --git a/db/migrate/20261121110003_add_email_support_to_tickets_and_comments.rb b/db/migrate/20261121110003_add_email_support_to_tickets_and_comments.rb
+new file mode 100644
+index 0000000..c90a364
+--- /dev/null
++++ b/db/migrate/20261121110003_add_email_support_to_tickets_and_comments.rb
+@@ -0,0 +1,32 @@
++require "securerandom"
++
++class AddEmailSupportToTicketsAndComments < ActiveRecord::Migration[8.1]
++  class MigrationTicket < ApplicationRecord
++    self.table_name = "tickets"
++  end
++
++  def up
++    add_column :tickets, :channel, :string, null: false, default: "portal"
++    add_column :tickets, :reply_token, :string
++
++    MigrationTicket.reset_column_information
++    MigrationTicket.where(reply_token: nil).find_each do |ticket|
++      ticket.update_columns(reply_token: SecureRandom.hex(16))
++    end
++
++    change_column_null :tickets, :reply_token, false
++    add_index :tickets, :reply_token, unique: true
++
++    add_column :comments, :inbound_message_id, :string
++    add_index :comments, :inbound_message_id, unique: true, where: "inbound_message_id IS NOT NULL"
++  end
++
++  def down
++    remove_index :comments, :inbound_message_id
++    remove_column :comments, :inbound_message_id
++
++    remove_index :tickets, :reply_token
++    remove_column :tickets, :reply_token
++    remove_column :tickets, :channel
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 74509c1..5f1cd3e 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.1].define(version: 2026_11_21_101000) do
++ActiveRecord::Schema[8.1].define(version: 2026_11_21_110003) do
+   # These are extensions that must be enabled in order to support this database
+   enable_extension "pg_catalog.plpgsql"
+ 
+@@ -26,6 +26,43 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_21_101000) do
+     t.index ["subdomain"], name: "index_accounts_on_subdomain", unique: true
+   end
+ 
++  create_table "action_mailbox_inbound_emails", force: :cascade do |t|
++    t.integer "status", default: 0, null: false
++    t.string "message_id", null: false
++    t.string "message_checksum", null: false
++    t.datetime "created_at", null: false
++    t.datetime "updated_at", null: false
++    t.index ["message_id", "message_checksum"], name: "index_action_mailbox_inbound_emails_uniqueness", unique: true, where: "(status = ANY (ARRAY[0, 1, 2]))"
++  end
++
++  create_table "active_storage_attachments", force: :cascade do |t|
++    t.string "name", null: false
++    t.string "record_type", null: false
++    t.bigint "record_id", null: false
++    t.bigint "blob_id", null: false
++    t.datetime "created_at", null: false
++    t.index ["blob_id"], name: "index_active_storage_attachments_on_blob_id"
++    t.index ["record_type", "record_id", "name", "blob_id"], name: "index_active_storage_attachments_uniqueness", unique: true
++  end
++
++  create_table "active_storage_blobs", force: :cascade do |t|
++    t.string "key", null: false
++    t.string "filename", null: false
++    t.string "content_type"
++    t.text "metadata"
++    t.string "service_name", null: false
++    t.bigint "byte_size", null: false
++    t.string "checksum"
++    t.datetime "created_at", null: false
++    t.index ["key"], name: "index_active_storage_blobs_on_key", unique: true
++  end
++
++  create_table "active_storage_variant_records", force: :cascade do |t|
++    t.bigint "blob_id", null: false
++    t.string "variation_digest", null: false
++    t.index ["blob_id", "variation_digest"], name: "index_active_storage_variant_records_uniqueness", unique: true
++  end
++
+   create_table "comments", force: :cascade do |t|
+     t.bigint "account_id", null: false
+     t.bigint "ticket_id", null: false
+@@ -34,8 +71,10 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_21_101000) do
+     t.boolean "public", default: true, null: false
+     t.datetime "created_at", null: false
+     t.datetime "updated_at", null: false
++    t.string "inbound_message_id"
+     t.index ["account_id"], name: "index_comments_on_account_id"
+     t.index ["author_id"], name: "index_comments_on_author_id"
++    t.index ["inbound_message_id"], name: "index_comments_on_inbound_message_id", unique: true, where: "(inbound_message_id IS NOT NULL)"
+     t.index ["ticket_id", "created_at", "id"], name: "index_comments_on_ticket_id_and_created_at_and_id"
+     t.index ["ticket_id", "public", "created_at", "id"], name: "index_comments_on_ticket_id_and_public_and_created_at_and_id"
+     t.index ["ticket_id"], name: "index_comments_on_ticket_id"
+@@ -82,6 +121,8 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_21_101000) do
+     t.bigint "assignee_id"
+     t.datetime "customer_updated_at", null: false
+     t.string "priority", default: "normal", null: false
++    t.string "channel", default: "portal", null: false
++    t.string "reply_token", null: false
+     t.index ["account_id", "assignee_id"], name: "index_tickets_on_account_id_and_assignee_id"
+     t.index ["account_id", "priority"], name: "index_tickets_on_account_id_and_priority"
+     t.index ["account_id", "requester_id", "customer_updated_at", "id"], name: "index_tickets_on_account_requester_customer_activity"
+@@ -90,6 +131,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_21_101000) do
+     t.index ["account_id", "updated_at", "id"], name: "index_tickets_on_account_id_and_updated_at_and_id"
+     t.index ["account_id"], name: "index_tickets_on_account_id"
+     t.index ["assignee_id"], name: "index_tickets_on_assignee_id"
++    t.index ["reply_token"], name: "index_tickets_on_reply_token", unique: true
+     t.index ["requester_id"], name: "index_tickets_on_requester_id"
+   end
+ 
+@@ -125,6 +167,8 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_21_101000) do
+   end
+ 
+   add_foreign_key "accounts", "users", column: "owner_id", on_delete: :nullify
++  add_foreign_key "active_storage_attachments", "active_storage_blobs", column: "blob_id"
++  add_foreign_key "active_storage_variant_records", "active_storage_blobs", column: "blob_id"
+   add_foreign_key "comments", "accounts", on_delete: :cascade
+   add_foreign_key "comments", "tickets", on_delete: :cascade
+   add_foreign_key "comments", "users", column: "author_id", on_delete: :cascade
+diff --git a/lib/helpdesk_config.rb b/lib/helpdesk_config.rb
+index 65c4a46..dc18556 100644
+--- a/lib/helpdesk_config.rb
++++ b/lib/helpdesk_config.rb
+@@ -4,6 +4,7 @@ require "uri"
+ module HelpdeskConfig
+   DEFAULT_FRONTEND_URL = "http://localhost:3001"
+   DEFAULT_MAIL_FROM = "support@example.test"
++  DEFAULT_SUPPORT_DOMAIN = "support.example.test"
+ 
+   module_function
+ 
+@@ -33,6 +34,20 @@ module HelpdeskConfig
+     sender.strip
+   end
+ 
++  def support_domain
++    domain = ENV["HELPDESK_SUPPORT_DOMAIN"]
++    domain = DEFAULT_SUPPORT_DOMAIN if domain.nil? || domain.strip.empty?
++    domain.strip.downcase
++  end
++
++  def support_address(account)
++    "#{account.subdomain}@#{support_domain}"
++  end
++
++  def ticket_reply_address(ticket)
++    "#{ticket.account.subdomain}+#{ticket.reply_token}@#{support_domain}"
++  end
++
+   def verification_url(account:, token:)
+     "#{frontend_url}/verify-email?account=#{CGI.escape(account.subdomain)}&token=#{CGI.escape(token)}"
+   end
+diff --git a/storage/.keep b/storage/.keep
+new file mode 100644
+index 0000000..e69de29
+diff --git a/test/integration/api/v1/inbound_email_and_replies_test.rb b/test/integration/api/v1/inbound_email_and_replies_test.rb
+new file mode 100644
+index 0000000..0bf2252
+--- /dev/null
++++ b/test/integration/api/v1/inbound_email_and_replies_test.rb
+@@ -0,0 +1,1084 @@
++require "base64"
++require "test_helper"
++
++class Api::V1::InboundEmailAndRepliesTest < ActionDispatch::IntegrationTest
++  RELAY_PATH = "/rails/action_mailbox/relay/inbound_emails"
++  RELAY_PASSWORD = "relay-test-secret-password"
++
++  def relay_headers(password: RELAY_PASSWORD, username: "actionmailbox", content_type: "message/rfc822")
++    headers = {}
++    headers["CONTENT_TYPE"] = content_type unless content_type.nil?
++    if username && password
++      headers["Authorization"] = ActionController::HttpAuthentication::Basic.encode_credentials(username, password)
++    end
++    headers
++  end
++
++  def build_raw_email(
++    from: "Avery Chen <avery@example.test>",
++    to: "acme@support.example.test",
++    cc: nil,
++    bcc: nil,
++    subject: "Cannot download receipt",
++    body: "The download button does nothing.",
++    message_id: "<msg-#{SecureRandom.hex(8)}@example.test>",
++    extra_headers: {},
++    content_type: "text/plain; charset=UTF-8"
++  )
++    lines = []
++    lines << "From: #{from}" unless from.nil?
++    lines << "To: #{to}" unless to.nil?
++    lines << "Cc: #{cc}" unless cc.nil?
++    lines << "Bcc: #{bcc}" unless bcc.nil?
++    lines << "Message-ID: #{message_id}" unless message_id.nil?
++    lines << "Subject: #{subject}" unless subject.nil?
++    lines << "MIME-Version: 1.0"
++    lines << "Content-Type: #{content_type}" unless content_type.nil?
++    extra_headers.each do |k, v|
++      lines << "#{k}: #{v}"
++    end
++    lines << ""
++    lines << body.to_s
++    lines.join("\r\n")
++  end
++
++  def post_relay(raw_email, password: RELAY_PASSWORD, env_password: RELAY_PASSWORD, headers: nil, env: {})
++    merged_env = { "RAILS_INBOUND_EMAIL_PASSWORD" => env_password }.merge(env)
++    with_env(merged_env) do
++      post RELAY_PATH, params: raw_email, headers: (headers || relay_headers(password: password))
++    end
++  end
++
++  test "relay ingress enforces HTTP Basic authentication with RAILS_INBOUND_EMAIL_PASSWORD and message/rfc822 media type" do
++    signup_and_verify!
++    raw = build_raw_email(message_id: "<auth-check-1@example.test>")
++
++    # Missing credentials -> 401
++    post_relay(raw, headers: { "CONTENT_TYPE" => "message/rfc822" })
++    assert_response :unauthorized
++    assert_equal 0, Ticket.count
++
++    # Wrong password -> 401
++    post_relay(raw, password: "wrong-password")
++    assert_response :unauthorized
++    assert_equal 0, Ticket.count
++
++    # Wrong username -> 401
++    post_relay(raw, headers: relay_headers(username: "someoneelse", password: RELAY_PASSWORD))
++    assert_response :unauthorized
++    assert_equal 0, Ticket.count
++
++    # Unsupported media type -> 415
++    post_relay(raw, headers: relay_headers(content_type: "text/plain"))
++    assert_response :unsupported_media_type
++    assert_equal 0, Ticket.count
++
++    post_relay(raw, headers: relay_headers(content_type: "application/json"))
++    assert_response :unsupported_media_type
++    assert_equal 0, Ticket.count
++
++    # Unconfigured ingress -> 404
++    with_env("RAILS_INBOUND_EMAIL_PASSWORD" => RELAY_PASSWORD) do
++      post "/rails/action_mailbox/postmark/inbound_emails", params: "{}", headers: { "CONTENT_TYPE" => "application/json" }
++      assert_response :not_found
++    end
++
++    # Valid retry with same Message-ID succeeds immediately before request completes
++    ActionMailer::Base.deliveries.clear
++    post_relay(raw)
++    assert_response :no_content
++    assert_equal 1, Ticket.count
++    assert_equal "Cannot download receipt", Ticket.last.subject
++  end
++
++  test "incoming email creates unverified customer, sends verification email, opens ticket, and allows later portal access" do
++    signup_and_verify!(name: "Acme", subdomain: "acme", admin_name: "Jo", email: "jo@acme.test")
++    owner_token = sign_in!(subdomain: "acme", email: "jo@acme.test")["session"]["token"]
++    ActionMailer::Base.deliveries.clear
++
++    raw = build_raw_email(
++      from: "Avery Chen <AVERY@Example.Test>",
++      to: "ACME@Support.Example.Test",
++      subject: "  Need help with billing  ",
++      body: "Line 1\r\nLine 2\r\n"
++    )
++
++    post_relay(raw)
++    assert_response :no_content
++
++    # Verification email was sent to the newly created customer
++    assert_equal 1, ActionMailer::Base.deliveries.size
++    verification_mail = ActionMailer::Base.deliveries.last
++    assert_equal [ "avery@example.test" ], verification_mail.to
++    parsed_verification = extract_token_from_mail(verification_mail, path: "/verify-email")
++    assert_equal "acme", parsed_verification[:account]
++
++    # Staff sees ticket and unverified customer
++    get "/api/v1/tickets", headers: account_headers("acme", token: owner_token)
++    assert_response :ok
++    assert_equal 1, json_body["tickets"].size
++    ticket = json_body["tickets"].first
++    assert_equal "Need help with billing", ticket["subject"]
++    assert_equal "open", ticket["status"]
++    assert_equal "normal", ticket["priority"]
++    assert_equal "Avery Chen", ticket["requester"]["name"]
++    assert_equal "avery@example.test", ticket["requester"]["email"]
++    assert_not ticket.key?("reply_token")
++    assert_not ticket.key?("reply_address")
++
++    get "/api/v1/tickets/#{ticket["id"]}/comments", headers: account_headers("acme", token: owner_token)
++    assert_response :ok
++    assert_equal 1, json_body["comments"].size
++    assert_equal "Line 1\nLine 2", json_body["comments"].first["body"]
++    assert_equal true, json_body["comments"].first["public"]
++
++    get "/api/v1/users?role=customer", headers: account_headers("acme", token: owner_token)
++    assert_response :ok
++    customer_json = json_body["users"].find { |u| u["email"] == "avery@example.test" }
++    assert customer_json
++    assert_equal false, customer_json["verified"]
++    assert_nil customer_json["email_verified_at"]
++
++    # Receiving a second email reuses existing customer, keeps them unverified, sends no second verification email
++    ActionMailer::Base.deliveries.clear
++    post_relay(build_raw_email(
++      from: "Different Name <avery@example.test>",
++      to: "acme@support.example.test",
++      subject: "Second question",
++      body: "Another question here."
++    ))
++    assert_response :no_content
++    assert_equal 0, ActionMailer::Base.deliveries.size
++
++    account = Account.find_by!(subdomain: "acme")
++    customer = account.users.find_by!(email: "avery@example.test")
++    assert_equal "Avery Chen", customer.name
++    assert_not customer.verified?
++    assert_equal 2, account.tickets.count
++
++    # Customer sets password via reset flow, still cannot sign in until verifying email
++    post "/api/v1/password_resets",
++      params: { password_reset: { email: "avery@example.test" } },
++      headers: account_headers("acme"),
++      as: :json
++    assert_response :ok
++    reset_token = extract_token_from_mail(ActionMailer::Base.deliveries.last, path: "/reset-password")[:token]
++
++    post "/api/v1/password_resets/confirm",
++      params: { password_reset: { token: reset_token, password: "portal-password-1" } },
++      headers: account_headers("acme"),
++      as: :json
++    assert_response :ok
++
++    post "/api/v1/sessions",
++      params: { session: { email: "avery@example.test", password: "portal-password-1" } },
++      headers: account_headers("acme"),
++      as: :json
++    assert_response :forbidden
++
++    # Customer verifies email using token from initial verification email and signs in to portal
++    post "/api/v1/email_verifications/confirm",
++      params: { email_verification: { token: parsed_verification[:token] } },
++      headers: account_headers("acme"),
++      as: :json
++    assert_response :ok
++    assert_equal true, json_body["user"]["verified"]
++
++    customer_token = sign_in!(subdomain: "acme", email: "avery@example.test", password: "portal-password-1")["session"]["token"]
++    get "/api/v1/requests", headers: account_headers("acme", token: customer_token)
++    assert_response :ok
++    assert_equal 2, json_body["requests"].size
++  end
++
++  test "reuses existing portal customer without sending verification email or altering verified state, and derives fallback name" do
++    signup_and_verify!
++    register_customer(subdomain: "acme", name: "Existing Unverified", email: "unverified@example.test", password: "cust-password-1")
++    assert_response :created
++    register_and_verify_customer!(subdomain: "acme", name: "Existing Verified", email: "verified@example.test", password: "cust-password-2")
++    ActionMailer::Base.deliveries.clear
++
++    # Unverified existing customer emails support -> reused, remains unverified, no new verification email
++    post_relay(build_raw_email(
++      from: "unverified@example.test",
++      to: "acme@support.example.test",
++      subject: "From unverified",
++      body: "Still unverified."
++    ))
++    assert_response :no_content
++    assert_equal 0, ActionMailer::Base.deliveries.size
++    account = Account.find_by!(subdomain: "acme")
++    unverified_user = account.users.find_by!(email: "unverified@example.test")
++    assert_not unverified_user.verified?
++    assert_equal "Existing Unverified", unverified_user.name
++
++    # Verified existing customer emails support -> reused, remains verified, no email sent
++    post_relay(build_raw_email(
++      from: "verified@example.test",
++      to: "acme@support.example.test",
++      subject: "From verified",
++      body: "Already verified."
++    ))
++    assert_response :no_content
++    assert_equal 0, ActionMailer::Base.deliveries.size
++    verified_user = account.users.find_by!(email: "verified@example.test")
++    assert verified_user.verified?
++
++    # New customer with bare email address (no display name) gets local-part fallback name
++    post_relay(build_raw_email(
++      from: "bare.sender@example.test",
++      to: "acme@support.example.test",
++      subject: "Bare sender",
++      body: "Hello from bare email."
++    ))
++    assert_response :no_content
++    assert_equal 1, ActionMailer::Base.deliveries.size
++    bare_user = account.users.find_by!(email: "bare.sender@example.test")
++    assert_equal "bare.sender", bare_user.name
++    assert_not bare_user.verified?
++  end
++
++  test "extracts plain-text message from multipart emails with html and attachments, and strips html-only fallback" do
++    signup_and_verify!
++    owner_token = sign_in!["session"]["token"]
++    ActionMailer::Base.deliveries.clear
++
++    # Multipart/mixed containing multipart/alternative + text/plain attachment
++    multipart_mail = Mail.new do
++      from "Avery <avery@example.test>"
++      to "acme@support.example.test"
++      message_id "<multi-1@example.test>"
++      subject "Multipart ticket"
++      add_file filename: "debug.txt", content: "ATTACHMENT SHOULD NOT BE BODY"
++      text_part do
++        content_type "text/plain; charset=UTF-8"
++        body "This is the plain text version."
++      end
++      html_part do
++        content_type "text/html; charset=UTF-8"
++        body "<p>This is the <b>HTML</b> version.</p>"
++      end
++    end
++
++    post_relay(multipart_mail.to_s)
++    assert_response :no_content
++
++    # HTML-only email -> converted cleanly to plain text
++    html_only = build_raw_email(
++      from: "avery@example.test",
++      to: "acme@support.example.test",
++      message_id: "<html-only-1@example.test>",
++      subject: "HTML only ticket",
++      content_type: "text/html; charset=UTF-8",
++      body: "<style>p { color: red; }</style><p>Hello <b>support</b> &amp; team!</p><p>Line two<br>Line three</p>"
++    )
++    post_relay(html_only)
++    assert_response :no_content
++
++    # ISO-8859-1 quoted-printable email with UTF-8 RFC 2047 subject
++    qp_mail = [
++      "From: =?UTF-8?B?SsO8cmdlbiBNw7xsbGVy?= <jurgen@example.test>",
++      "To: acme@support.example.test",
++      "Message-ID: <qp-1@example.test>",
++      "Subject: =?UTF-8?B?Q2Fmw6kgaXNzdWU=?=",
++      "MIME-Version: 1.0",
++      "Content-Type: text/plain; charset=ISO-8859-1",
++      "Content-Transfer-Encoding: quoted-printable",
++      "",
++      "Caf=E9 order failed"
++    ].join("\r\n")
++    post_relay(qp_mail)
++    assert_response :no_content
++
++    get "/api/v1/tickets", headers: account_headers("acme", token: owner_token)
++    assert_response :ok
++    tickets_by_subject = json_body["tickets"].index_by { |t| t["subject"] }
++
++    assert tickets_by_subject.key?("Multipart ticket")
++    get "/api/v1/tickets/#{tickets_by_subject["Multipart ticket"]["id"]}/comments", headers: account_headers("acme", token: owner_token)
++    assert_equal "This is the plain text version.", json_body["comments"].first["body"]
++
++    assert tickets_by_subject.key?("HTML only ticket")
++    get "/api/v1/tickets/#{tickets_by_subject["HTML only ticket"]["id"]}/comments", headers: account_headers("acme", token: owner_token)
++    assert_equal "Hello support & team!\nLine two\nLine three", json_body["comments"].first["body"]
++
++    assert tickets_by_subject.key?("Café issue")
++    assert_equal "Jürgen Müller", tickets_by_subject["Café issue"]["requester"]["name"]
++    get "/api/v1/tickets/#{tickets_by_subject["Café issue"]["id"]}/comments", headers: account_headers("acme", token: owner_token)
++    assert_equal "Café order failed", json_body["comments"].first["body"]
++  end
++
++  test "finds business from To or Cc, ignores mail addressed to multiple businesses or unknown/cancelled businesses" do
++    signup_and_verify!(name: "Acme", subdomain: "acme", admin_name: "Jo", email: "jo@acme.test")
++    signup_and_verify!(name: "Beta", subdomain: "beta", admin_name: "Bo", email: "bo@beta.test")
++    ActionMailer::Base.deliveries.clear
++
++    # Business in Cc with external To -> accepted
++    post_relay(build_raw_email(
++      from: "avery@example.test",
++      to: "colleague@customer.test",
++      cc: "Acme Support <acme@support.example.test>, manager@customer.test",
++      subject: "Via Cc",
++      body: "CC'd support on this."
++    ))
++    assert_response :no_content
++    acme = Account.find_by!(subdomain: "acme")
++    beta = Account.find_by!(subdomain: "beta")
++    assert_equal 1, acme.tickets.count
++    assert_equal 0, beta.tickets.count
++
++    # Same business in both To and Cc -> single ticket created
++    post_relay(build_raw_email(
++      from: "avery@example.test",
++      to: "acme@support.example.test",
++      cc: "ACME@SUPPORT.EXAMPLE.TEST",
++      subject: "Duplicate recipient same biz",
++      body: "Both To and Cc are Acme."
++    ))
++    assert_response :no_content
++    assert_equal 2, acme.tickets.count
++
++    # Multiple businesses in To -> ignored
++    ActionMailer::Base.deliveries.clear
++    post_relay(build_raw_email(
++      from: "newperson@example.test",
++      to: "acme@support.example.test, beta@support.example.test",
++      subject: "Both in To",
++      body: "Should be ignored."
++    ))
++    assert_response :no_content
++    assert_equal 2, acme.tickets.count
++    assert_equal 0, beta.tickets.count
++    assert_nil acme.users.find_by(email: "newperson@example.test")
++    assert_nil beta.users.find_by(email: "newperson@example.test")
++    assert_equal 0, ActionMailer::Base.deliveries.size
++
++    # Multiple businesses across To and Cc -> ignored
++    post_relay(build_raw_email(
++      from: "newperson@example.test",
++      to: "acme@support.example.test",
++      cc: "beta@support.example.test",
++      subject: "One To one Cc",
++      body: "Should also be ignored."
++    ))
++    assert_response :no_content
++    assert_equal 2, acme.tickets.count
++    assert_equal 0, beta.tickets.count
++    assert_equal 0, ActionMailer::Base.deliveries.size
++
++    # Unknown business -> ignored
++    post_relay(build_raw_email(
++      from: "newperson@example.test",
++      to: "unknown@support.example.test",
++      subject: "Unknown",
++      body: "No such account."
++    ))
++    assert_response :no_content
++    assert_equal 0, ActionMailer::Base.deliveries.size
++
++    # Cancelled business -> ignored
++    beta.cancel!
++    post_relay(build_raw_email(
++      from: "newperson@example.test",
++      to: "beta@support.example.test",
++      subject: "Cancelled",
++      body: "Account is cancelled."
++    ))
++    assert_response :no_content
++    assert_equal 0, beta.tickets.count
++    assert_equal 0, ActionMailer::Base.deliveries.size
++  end
++
++  test "staff public reply emails requester with private reply address, requester replies route and reopen, non-requesters blocked, plain address opens new ticket" do
++    signup_and_verify!(name: "Acme", subdomain: "acme", admin_name: "Jo", email: "jo@acme.test")
++    signup_and_verify!(name: "Beta", subdomain: "beta", admin_name: "Bo", email: "bo@beta.test")
++    owner_token = sign_in!(subdomain: "acme", email: "jo@acme.test")["session"]["token"]
++    agent_info = invite_and_accept!(subdomain: "acme", admin_token: owner_token, email: "sam@acme.test", role: "agent", name: "Sam")
++    agent_token = sign_in!(subdomain: "acme", email: "sam@acme.test", password: "my-team-password")["session"]["token"]
++    ActionMailer::Base.deliveries.clear
++
++    # Customer opens two separate email-origin tickets
++    post_relay(build_raw_email(
++      from: "Avery <avery@example.test>",
++      to: "acme@support.example.test",
++      message_id: "<t1-open@example.test>",
++      subject: "Receipt problem",
++      body: "First ticket opening body."
++    ))
++    assert_response :no_content
++    assert_equal 1, ActionMailer::Base.deliveries.size # verification email
++
++    post_relay(build_raw_email(
++      from: "Avery <avery@example.test>",
++      to: "acme@support.example.test",
++      message_id: "<t2-open@example.test>",
++      subject: "Login problem",
++      body: "Second ticket opening body."
++    ))
++    assert_response :no_content
++    assert_equal 1, ActionMailer::Base.deliveries.size # no second verification email
++
++    acme = Account.find_by!(subdomain: "acme")
++    ticket1 = acme.tickets.find_by!(subject: "Receipt problem")
++    ticket2 = acme.tickets.find_by!(subject: "Login problem")
++    assert_not_equal ticket1.reply_address, ticket2.reply_address
++
++    ActionMailer::Base.deliveries.clear
++
++    # Staff posts private note on email-origin ticket -> NO email sent
++    patch "/api/v1/tickets/#{ticket1.id}",
++      params: { ticket: { comment: { body: "Internal note only", public: false } } },
++      headers: account_headers("acme", token: owner_token),
++      as: :json
++    assert_response :ok
++    assert_equal 0, ActionMailer::Base.deliveries.size
++
++    # Staff updates status/priority/assignee without comment -> NO email sent
++    patch "/api/v1/tickets/#{ticket1.id}",
++      params: { ticket: { status: "pending", priority: "high", assignee_id: agent_info[:user]["id"] } },
++      headers: account_headers("acme", token: owner_token),
++      as: :json
++    assert_response :ok
++    assert_equal 0, ActionMailer::Base.deliveries.size
++
++    # Agent posts public reply on email-origin ticket -> email sent with private reply address
++    patch "/api/v1/tickets/#{ticket1.id}",
++      params: { ticket: { status: "pending", comment: { body: "Please check your spam folder." } } },
++      headers: account_headers("acme", token: agent_token),
++      as: :json
++    assert_response :ok
++    assert_equal "pending", json_body["ticket"]["status"]
++    assert_equal 1, ActionMailer::Base.deliveries.size
++
++    reply_mail_1 = ActionMailer::Base.deliveries.last
++    assert_equal [ "avery@example.test" ], reply_mail_1.to
++    assert_equal "Re: Receipt problem", reply_mail_1.subject
++    assert_includes reply_mail_1.body.decoded, "Please check your spam folder."
++    assert_equal 1, reply_mail_1.reply_to.size
++    t1_reply_address = reply_mail_1.reply_to.first
++    assert t1_reply_address.end_with?("@support.example.test")
++    assert_not_equal "acme@support.example.test", t1_reply_address
++
++    # Staff replies to ticket2 as well -> gets a distinct private reply address
++    patch "/api/v1/tickets/#{ticket2.id}",
++      params: { ticket: { status: "solved", comment: { body: "Your login is fixed." } } },
++      headers: account_headers("acme", token: owner_token),
++      as: :json
++    assert_response :ok
++    assert_equal 2, ActionMailer::Base.deliveries.size
++    t2_reply_address = ActionMailer::Base.deliveries.last.reply_to.first
++    assert_not_equal t1_reply_address, t2_reply_address
++
++    ActionMailer::Base.deliveries.clear
++
++    # Non-requester customer trying to reply to ticket1 -> IGNORED (no comment, no reopen, no new user, no email)
++    post_relay(build_raw_email(
++      from: "Intruder <intruder@example.test>",
++      to: t1_reply_address,
++      subject: "Re: Receipt problem",
++      body: "I am not the requester."
++    ))
++    assert_response :no_content
++    assert_equal "pending", ticket1.reload.status
++    assert_equal 3, ticket1.comments.count
++    assert_nil acme.users.find_by(email: "intruder@example.test")
++    assert_equal 0, ActionMailer::Base.deliveries.size
++
++    # Staff trying to reply via email to ticket1 -> IGNORED
++    post_relay(build_raw_email(
++      from: "Jo <jo@acme.test>",
++      to: t1_reply_address,
++      subject: "Re: Receipt problem",
++      body: "Staff emailing reply address."
++    ))
++    assert_response :no_content
++    assert_equal "pending", ticket1.reload.status
++    assert_equal 3, ticket1.comments.count
++
++    # Tampered reply token or cross-business reply address -> IGNORED (must not open a new ticket!)
++    post_relay(build_raw_email(
++      from: "avery@example.test",
++      to: "acme+invalidtoken123@support.example.test",
++      subject: "Re: Receipt problem",
++      body: "Tampered token."
++    ))
++    assert_response :no_content
++    assert_equal 2, acme.tickets.count
++
++    post_relay(build_raw_email(
++      from: "avery@example.test",
++      to: "beta+#{ticket1.reply_token}@support.example.test",
++      subject: "Re: Receipt problem",
++      body: "Wrong business subdomain with valid token."
++    ))
++    assert_response :no_content
++    assert_equal 2, acme.tickets.count
++    assert_equal 0, Account.find_by!(subdomain: "beta").tickets.count
++
++    # Reply addressed to ticket1 AND another business -> IGNORED
++    post_relay(build_raw_email(
++      from: "avery@example.test",
++      to: t1_reply_address,
++      cc: "beta@support.example.test",
++      subject: "Re: Receipt problem",
++      body: "Multi-business reply."
++    ))
++    assert_response :no_content
++    assert_equal "pending", ticket1.reload.status
++    assert_equal 3, ticket1.comments.count
++
++    # Reply addressed to two different ticket reply addresses -> IGNORED
++    post_relay(build_raw_email(
++      from: "avery@example.test",
++      to: "#{t1_reply_address}, #{t2_reply_address}",
++      subject: "Ambiguous",
++      body: "Which ticket?"
++    ))
++    assert_response :no_content
++    assert_equal "pending", ticket1.reload.status
++    assert_equal "solved", ticket2.reload.status
++
++    # Requester replies to pending ticket1 (via Reply-All including Cc plain address) -> adds comment & reopens to open!
++    post_relay(build_raw_email(
++      from: "AVERY@example.test",
++      to: t1_reply_address,
++      cc: "acme@support.example.test",
++      message_id: "<t1-reply-1@example.test>",
++      subject: "",
++      body: "Checked spam, still missing."
++    ))
++    assert_response :no_content
++    assert_equal 2, acme.tickets.count # did NOT open a new ticket
++    assert_equal "open", ticket1.reload.status
++    assert_equal "Checked spam, still missing.", ticket1.comments.chronological.last.body
++    assert_equal true, ticket1.comments.chronological.last.public
++    assert_not ticket1.requester.reload.verified? # replying still does NOT verify account!
++    assert_equal 0, ActionMailer::Base.deliveries.size
++
++    # Requester replies to solved ticket2 (via Cc) -> adds comment & reopens to open!
++    post_relay(build_raw_email(
++      from: "avery@example.test",
++      to: "colleague@customer.test",
++      cc: t2_reply_address,
++      message_id: "<t2-reply-1@example.test>",
++      subject: "Re: Login problem",
++      body: "Actually it broke again."
++    ))
++    assert_response :no_content
++    assert_equal 2, acme.tickets.count
++    assert_equal "open", ticket2.reload.status
++    assert_equal "Actually it broke again.", ticket2.comments.chronological.last.body
++
++    # New message from requester to plain support address (even with Re: subject & In-Reply-To) -> opens a NEW ticket!
++    post_relay(build_raw_email(
++      from: "avery@example.test",
++      to: "acme@support.example.test",
++      message_id: "<t3-open@example.test>",
++      subject: "Re: Receipt problem",
++      extra_headers: { "In-Reply-To" => "<t1-open@example.test>" },
++      body: "Starting a fresh thread to plain address."
++    ))
++    assert_response :no_content
++    assert_equal 3, acme.tickets.count
++    assert_equal 4, ticket1.reload.comments.count
++  end
++
++  test "portal-origin ticket does not send email when staff posts public reply" do
++    signup_and_verify!
++    register_and_verify_customer!
++    owner_token = sign_in!["session"]["token"]
++    customer_token = sign_in!(email: "avery@example.test", password: "my-customer-password")["session"]["token"]
++
++    post "/api/v1/requests",
++      params: { request: { subject: "Portal request", comment: { body: "Created via API" } } },
++      headers: account_headers("acme", token: customer_token),
++      as: :json
++    assert_response :created
++    ticket_id = json_body["request"]["id"]
++
++    ActionMailer::Base.deliveries.clear
++
++    patch "/api/v1/tickets/#{ticket_id}",
++      params: { ticket: { comment: { body: "Portal reply from staff" } } },
++      headers: account_headers("acme", token: owner_token),
++      as: :json
++    assert_response :ok
++    assert_equal 0, ActionMailer::Base.deliveries.size
++  end
++
++  test "deduplicates deliveries by Message-ID across identical and modified payloads, while invalid deliveries never block valid retries" do
++    signup_and_verify!(name: "Acme", subdomain: "acme", admin_name: "Jo", email: "jo@acme.test")
++    signup_and_verify!(name: "Beta", subdomain: "beta", admin_name: "Bo", email: "bo@beta.test")
++    owner_token = sign_in!(subdomain: "acme", email: "jo@acme.test")["session"]["token"]
++    acme = Account.find_by!(subdomain: "acme")
++    ActionMailer::Base.deliveries.clear
++
++    # 1. Valid delivery followed by identical bytes AND modified bytes with same Message-ID (case-insensitive)
++    raw1 = build_raw_email(
++      from: "Avery <avery@example.test>",
++      to: "acme@support.example.test",
++      message_id: "<dedup-open-1@Example.Test>",
++      subject: "Dedup test",
++      body: "Original body"
++    )
++    post_relay(raw1)
++    assert_response :no_content
++    assert_equal 1, acme.tickets.count
++    assert_equal 1, ActionMailer::Base.deliveries.size
++
++    # Exact duplicate bytes
++    post_relay(raw1)
++    assert_response :no_content
++    assert_equal 1, acme.tickets.count
++    assert_equal 1, ActionMailer::Base.deliveries.size
++
++    # Same Message-ID (different case + extra header + different body => different checksum!)
++    raw1_modified = build_raw_email(
++      from: "Avery <avery@example.test>",
++      to: "acme@support.example.test",
++      message_id: "<DEDUP-OPEN-1@example.test>",
++      subject: "Dedup test retry",
++      body: "Modified retry body",
++      extra_headers: { "X-Relay-Attempt" => "2" }
++    )
++    post_relay(raw1_modified)
++    assert_response :no_content
++    assert_equal 1, acme.tickets.count
++    assert_equal 1, acme.tickets.first.comments.count
++
++    # Staff reply so we can test reply dedup & unauthorized-reply retry
++    ticket = acme.tickets.first
++    patch "/api/v1/tickets/#{ticket.id}",
++      params: { ticket: { status: "pending", comment: { body: "Staff reply" } } },
++      headers: account_headers("acme", token: owner_token),
++      as: :json
++    assert_response :ok
++    reply_address = ActionMailer::Base.deliveries.last.reply_to.first
++
++    # 2. Invalid delivery: unauthorized sender replying with Message-ID -> must NOT block valid retry from requester!
++    post_relay(build_raw_email(
++      from: "wrong@example.test",
++      to: reply_address,
++      message_id: "<retry-reply-1@example.test>",
++      subject: "Re: Dedup test",
++      body: "Unauthorized attempt"
++    ))
++    assert_response :no_content
++    assert_equal "pending", ticket.reload.status
++    assert_equal 2, ticket.comments.count
++
++    post_relay(build_raw_email(
++      from: "avery@example.test",
++      to: reply_address,
++      message_id: "<retry-reply-1@example.test>",
++      subject: "Re: Dedup test",
++      body: "Valid requester retry"
++    ))
++    assert_response :no_content
++    assert_equal "open", ticket.reload.status
++    assert_equal 3, ticket.comments.count
++    assert_equal "Valid requester retry", ticket.comments.chronological.last.body
++
++    # Duplicate of the valid reply with different headers -> ignored
++    post_relay(build_raw_email(
++      from: "avery@example.test",
++      to: reply_address,
++      message_id: "<retry-reply-1@example.test>",
++      subject: "Re: Dedup test",
++      body: "Duplicate reply",
++      extra_headers: { "X-Relay-Attempt" => "2" }
++    ))
++    assert_response :no_content
++    assert_equal 3, ticket.comments.count
++
++    # 3. Invalid delivery: blank body -> valid retry with same Message-ID succeeds
++    post_relay(build_raw_email(
++      from: "avery@example.test",
++      to: "acme@support.example.test",
++      message_id: "<retry-blank-body@example.test>",
++      subject: "Blank body first",
++      body: "   \r\n  "
++    ))
++    assert_response :no_content
++    assert_equal 1, acme.tickets.count
++
++    post_relay(build_raw_email(
++      from: "avery@example.test",
++      to: "acme@support.example.test",
++      message_id: "<retry-blank-body@example.test>",
++      subject: "Blank body first",
++      body: "Now with a real body"
++    ))
++    assert_response :no_content
++    assert_equal 2, acme.tickets.count
++
++    # 4. Invalid delivery: blank subject -> valid retry with same Message-ID succeeds
++    post_relay(build_raw_email(
++      from: "avery@example.test",
++      to: "acme@support.example.test",
++      message_id: "<retry-blank-subj@example.test>",
++      subject: "   ",
++      body: "Has body but blank subject"
++    ))
++    assert_response :no_content
++    assert_equal 2, acme.tickets.count
++
++    post_relay(build_raw_email(
++      from: "avery@example.test",
++      to: "acme@support.example.test",
++      message_id: "<retry-blank-subj@example.test>",
++      subject: "Valid subject now",
++      body: "Has body and subject"
++    ))
++    assert_response :no_content
++    assert_equal 3, acme.tickets.count
++
++    # 5. Invalid delivery: multi-business -> valid single-business retry with same Message-ID succeeds
++    post_relay(build_raw_email(
++      from: "avery@example.test",
++      to: "acme@support.example.test, beta@support.example.test",
++      message_id: "<retry-multi-biz@example.test>",
++      subject: "Multi biz first",
++      body: "Addressed to two businesses"
++    ))
++    assert_response :no_content
++    assert_equal 3, acme.tickets.count
++
++    post_relay(build_raw_email(
++      from: "avery@example.test",
++      to: "acme@support.example.test",
++      message_id: "<retry-multi-biz@example.test>",
++      subject: "Multi biz first",
++      body: "Addressed to one business now"
++    ))
++    assert_response :no_content
++    assert_equal 4, acme.tickets.count
++
++    # 6. Invalid delivery: automated header -> valid human retry with same Message-ID succeeds
++    post_relay(build_raw_email(
++      from: "avery@example.test",
++      to: "acme@support.example.test",
++      message_id: "<retry-auto@example.test>",
++      subject: "Auto first",
++      body: "Auto body",
++      extra_headers: { "Auto-Submitted" => "auto-replied" }
++    ))
++    assert_response :no_content
++    assert_equal 4, acme.tickets.count
++
++    post_relay(build_raw_email(
++      from: "avery@example.test",
++      to: "acme@support.example.test",
++      message_id: "<retry-auto@example.test>",
++      subject: "Auto first",
++      body: "Human retry body"
++    ))
++    assert_response :no_content
++    assert_equal 5, acme.tickets.count
++
++    # 7. Invalid delivery: cancelled account with IDENTICAL raw bytes retried after reactivation!
++    beta = Account.find_by!(subdomain: "beta")
++    beta.cancel!
++    exact_raw = build_raw_email(
++      from: "avery@example.test",
++      to: "beta@support.example.test",
++      message_id: "<retry-exact-bytes@example.test>",
++      subject: "Sent while cancelled",
++      body: "Exact same bytes retried later."
++    )
++    post_relay(exact_raw)
++    assert_response :no_content
++    assert_equal 0, beta.tickets.count
++
++    beta.reactivate!
++    post_relay(exact_raw)
++    assert_response :no_content
++    assert_equal 1, beta.tickets.count
++
++    # Third delivery of exact same bytes now deduplicates!
++    post_relay(exact_raw)
++    assert_response :no_content
++    assert_equal 1, beta.tickets.count
++  end
++
++  test "ignores automated and mailing-list mail for both new tickets and replies while allowing Auto-Submitted: no" do
++    signup_and_verify!
++    acme = Account.find_by!(subdomain: "acme")
++    customer = acme.users.create!(name: "Avery", email: "avery@example.test", password: "my-customer-password", role: "customer")
++    existing_ticket = acme.tickets.create!(requester: customer, subject: "Existing", status: Ticket::SOLVED, channel: Ticket::EMAIL)
++    Comment.create!(account: acme, ticket: existing_ticket, author: customer, body: "Initial")
++    ActionMailer::Base.deliveries.clear
++
++    automated_cases = [
++      { extra_headers: { "Auto-Submitted" => "auto-replied" } },
++      { extra_headers: { "Auto-Submitted" => "auto-generated" } },
++      { extra_headers: { "Auto-Submitted" => "auto-notified; owner-email=ops@example.test" } },
++      { extra_headers: { "Precedence" => "bulk" } },
++      { extra_headers: { "Precedence" => "list" } },
++      { extra_headers: { "Precedence" => "junk" } },
++      { extra_headers: { "Precedence" => "auto_reply" } },
++      { extra_headers: { "List-Id" => "<newsletter.example.test>" } },
++      { extra_headers: { "List-Unsubscribe" => "<mailto:unsub@example.test>" } },
++      { extra_headers: { "List-Post" => "<mailto:list@example.test>" } },
++      { extra_headers: { "Mailing-List" => "list team@example.test" } },
++      { extra_headers: { "X-Autoreply" => "yes" } },
++      { extra_headers: { "X-Auto-Reply" => "true" } },
++      { extra_headers: { "X-Autorespond" => "yes" } },
++      { extra_headers: { "X-Auto-Response-Suppress" => "OOF, AutoReply" } },
++      { extra_headers: { "X-Auto-Response-Suppress" => "All" } },
++      { extra_headers: { "X-Failed-Recipients" => "avery@example.test" } },
++      { extra_headers: { "X-Loop" => "acme@support.example.test" } },
++      { extra_headers: { "Return-Path" => "<>" } },
++      { from: "mailer-daemon@example.test" },
++      { from: "postmaster@example.test" },
++      { from: "no-reply@example.test" },
++      { from: "noreply@example.test" },
++      { from: "do-not-reply@example.test" },
++      { from: "support@example.test" },
++      { from: "acme@support.example.test" }
++    ]
++
++    automated_cases.each_with_index do |opts, idx|
++      raw = build_raw_email(
++        from: opts.fetch(:from, "bot#{idx}@example.test"),
++        to: "acme@support.example.test",
++        subject: "Automated #{idx}",
++        body: "Automated content #{idx}",
++        extra_headers: opts.fetch(:extra_headers, {})
++      )
++      post_relay(raw)
++      assert_response :no_content
++    end
++
++    # DSN multipart/report bounce
++    dsn_raw = <<~EMAIL.gsub("\n", "\r\n")
++      From: avery@example.test
++      To: acme@support.example.test
++      Message-ID: <dsn-1@example.test>
++      Subject: Delivery Status Notification
++      MIME-Version: 1.0
++      Content-Type: multipart/report; report-type=delivery-status; boundary="dsn"
++
++      --dsn
++      Content-Type: text/plain; charset=UTF-8
++
++      Delivery failed.
++      --dsn--
++    EMAIL
++    post_relay(dsn_raw)
++    assert_response :no_content
++
++    # Automated out-of-office reply from requester to ticket reply address -> must NOT reopen or add comment!
++    post_relay(build_raw_email(
++      from: "avery@example.test",
++      to: existing_ticket.reply_address,
++      subject: "Out of office",
++      body: "I am on vacation.",
++      extra_headers: { "Auto-Submitted" => "auto-replied" }
++    ))
++    assert_response :no_content
++
++    assert_equal 1, acme.tickets.count
++    assert_equal "solved", existing_ticket.reload.status
++    assert_equal 1, existing_ticket.comments.count
++    assert_equal 0, ActionMailer::Base.deliveries.size
++
++    # Auto-Submitted: no IS explicitly human-submitted and MUST be accepted!
++    post_relay(build_raw_email(
++      from: "human@example.test",
++      to: "acme@support.example.test",
++      subject: "Real human message",
++      body: "Not automated!",
++      extra_headers: { "Auto-Submitted" => "no" }
++    ))
++    assert_response :no_content
++    assert_equal 2, acme.tickets.count
++    assert_equal 1, ActionMailer::Base.deliveries.size
++  end
++
++  test "honors HELPDESK_SUPPORT_DOMAIN for both inbound routing and outbound reply addresses" do
++    signup_and_verify!
++    owner_token = sign_in!["session"]["token"]
++    acme = Account.find_by!(subdomain: "acme")
++    ActionMailer::Base.deliveries.clear
++
++    custom_env = { "HELPDESK_SUPPORT_DOMAIN" => "mail.custom-help.test" }
++
++    # Default domain ignored when custom domain is set
++    post_relay(
++      build_raw_email(from: "avery@example.test", to: "acme@support.example.test", subject: "Wrong domain", body: "Ignored"),
++      env: custom_env
++    )
++    assert_response :no_content
++    assert_equal 0, acme.tickets.count
++
++    # Custom domain accepted
++    post_relay(
++      build_raw_email(from: "avery@example.test", to: "acme@mail.custom-help.test", subject: "Custom domain", body: "Accepted"),
++      env: custom_env
++    )
++    assert_response :no_content
++    assert_equal 1, acme.tickets.count
++    ticket = acme.tickets.first
++
++    ActionMailer::Base.deliveries.clear
++    with_env(custom_env) do
++      patch "/api/v1/tickets/#{ticket.id}",
++        params: { ticket: { status: "pending", comment: { body: "Reply on custom domain" } } },
++        headers: account_headers("acme", token: owner_token),
++        as: :json
++    end
++    assert_response :ok
++    assert_equal 1, ActionMailer::Base.deliveries.size
++    reply_address = ActionMailer::Base.deliveries.last.reply_to.first
++    assert reply_address.end_with?("@mail.custom-help.test")
++
++    # Reply sent to custom domain reply address routes back to ticket and reopens it
++    post_relay(
++      build_raw_email(from: "avery@example.test", to: reply_address, subject: "Re: Custom domain", body: "Thanks!"),
++      env: custom_env
++    )
++    assert_response :no_content
++    assert_equal "open", ticket.reload.status
++    assert_equal 3, ticket.comments.count
++  end
++
++  test "ignores mail from suspended customers, existing staff, pending staff invitations, and malformed messages" do
++    signup_and_verify!(name: "Acme", subdomain: "acme", admin_name: "Jo", email: "jo@acme.test")
++    owner_token = sign_in!["session"]["token"]
++    acme = Account.find_by!(subdomain: "acme")
++
++    suspended_customer = acme.users.create!(
++      name: "Suspended",
++      email: "suspended@example.test",
++      password: "cust-password-1",
++      role: "customer",
++      suspended: true
++    )
++    existing_ticket = acme.tickets.create!(requester: suspended_customer, subject: "Old ticket", status: Ticket::PENDING, channel: Ticket::EMAIL)
++    Comment.create!(account: acme, ticket: existing_ticket, author: suspended_customer, body: "Before suspension")
++
++    create_invitation(subdomain: "acme", token: owner_token, email: "invited@example.test", role: "agent")
++    assert_response :created
++    ActionMailer::Base.deliveries.clear
++
++    # Suspended customer opening new ticket -> ignored
++    post_relay(build_raw_email(from: "suspended@example.test", to: "acme@support.example.test", subject: "Blocked", body: "Nope"))
++    assert_response :no_content
++    assert_equal 1, acme.tickets.count
++
++    # Suspended customer replying to own ticket -> ignored
++    post_relay(build_raw_email(from: "suspended@example.test", to: existing_ticket.reply_address, subject: "Re: Old", body: "Nope"))
++    assert_response :no_content
++    assert_equal "pending", existing_ticket.reload.status
++    assert_equal 1, existing_ticket.comments.count
++
++    # Existing staff emailing plain support address -> ignored
++    post_relay(build_raw_email(from: "jo@acme.test", to: "acme@support.example.test", subject: "Staff email", body: "Nope"))
++    assert_response :no_content
++    assert_equal 1, acme.tickets.count
++
++    # Email with pending staff invitation -> ignored (does not create customer or interfere with invitation)
++    post_relay(build_raw_email(from: "invited@example.test", to: "acme@support.example.test", subject: "Invited", body: "Nope"))
++    assert_response :no_content
++    assert_equal 1, acme.tickets.count
++    assert_nil acme.users.find_by(email: "invited@example.test")
++
++    # Malformed / empty payloads -> handled cleanly without 500
++    [ "", "not an rfc822 email at all", "From: invalid\r\nTo: acme@support.example.test\r\n\r\nHi" ].each do |bad|
++      post_relay(bad)
++      assert_response :no_content
++    end
++
++    assert_equal 1, acme.tickets.count
++    assert_equal 0, ActionMailer::Base.deliveries.size
++  end
++
++  test "handles missing Message-ID, bare Message-ID, base64 body, long subject, plus-addressed customer, cross-tenant staff as customer, and multi-turn threading" do
++    signup_and_verify!(name: "Acme", subdomain: "acme", admin_name: "Jo", email: "jo@acme.test")
++    signup_and_verify!(name: "Beta", subdomain: "beta", admin_name: "Bo", email: "bo@beta.test")
++    owner_token = sign_in!(subdomain: "acme", email: "jo@acme.test")["session"]["token"]
++    acme = Account.find_by!(subdomain: "acme")
++    beta = Account.find_by!(subdomain: "beta")
++    ActionMailer::Base.deliveries.clear
++
++    # Email without Message-ID header: opens ticket; exact duplicate dedups; different body opens 2nd ticket
++    no_mid_1 = build_raw_email(from: "alice+vip@example.test", to: "acme@support.example.test", message_id: nil, subject: "No MID 1", body: "First no-mid body")
++    no_mid_2 = build_raw_email(from: "alice+vip@example.test", to: "acme@support.example.test", message_id: nil, subject: "No MID 2", body: "Second no-mid body")
++    post_relay(no_mid_1, headers: relay_headers(content_type: "message/rfc822; charset=utf-8"))
++    assert_response :no_content
++    post_relay(no_mid_1)
++    assert_response :no_content
++    post_relay(no_mid_2)
++    assert_response :no_content
++    assert_equal 2, acme.tickets.count
++
++    # Bare Message-ID vs angle-bracketed Message-ID deduplicate
++    post_relay(build_raw_email(from: "alice+vip@example.test", to: "acme@support.example.test", message_id: "bare-id@example.test", subject: "Bare MID", body: "First"))
++    assert_response :no_content
++    post_relay(build_raw_email(from: "alice+vip@example.test", to: "acme@support.example.test", message_id: "<bare-id@example.test>", subject: "Bare MID", body: "Duplicate"))
++    assert_response :no_content
++    assert_equal 3, acme.tickets.count
++
++    # Very long subject (> 255 chars) truncated safely & base64 UTF-8 body decoded
++    long_subject = "S" * 300
++    base64_body = Base64.strict_encode64("Base64 UTF-8 body: café")
++    post_relay(build_raw_email(
++      from: "alice+vip@example.test",
++      to: "acme@support.example.test",
++      subject: long_subject,
++      body: base64_body,
++      extra_headers: { "Content-Transfer-Encoding" => "base64" }
++    ))
++    assert_response :no_content
++    assert_equal 4, acme.tickets.count
++    long_ticket = acme.tickets.order(id: :asc).last
++    assert_equal 255, long_ticket.subject.length
++    assert_equal "Base64 UTF-8 body: café", long_ticket.comments.first.body
++
++    # Admin of Acme emailing Beta is treated as a regular customer in Beta
++    post_relay(build_raw_email(from: "Jo <jo@acme.test>", to: "beta@support.example.test", subject: "Need Beta support", body: "Hello Beta"))
++    assert_response :no_content
++    assert_equal 1, beta.tickets.count
++    beta_cust = beta.users.find_by!(email: "jo@acme.test")
++    assert beta_cust.customer?
++    assert_not beta_cust.verified?
++
++    # VERP bounce address is ignored
++    post_relay(build_raw_email(from: "bounces+12345@example.test", to: "acme@support.example.test", subject: "Bounce", body: "Bounced"))
++    assert_response :no_content
++    assert_equal 4, acme.tickets.count
++
++    # Multi-turn conversation with In-Reply-To & References updating across customer replies
++    ticket = acme.tickets.find_by!(subject: "Bare MID")
++    ActionMailer::Base.deliveries.clear
++
++    patch "/api/v1/tickets/#{ticket.id}",
++      params: { ticket: { status: "pending", comment: { body: "Staff turn 1" } } },
++      headers: account_headers("acme", token: owner_token),
++      as: :json
++    assert_response :ok
++    mail1 = ActionMailer::Base.deliveries.last
++    assert_equal "bare-id@example.test", mail1.in_reply_to
++    reply_address = mail1.reply_to.first
++
++    post_relay(build_raw_email(
++      from: "alice+vip@example.test",
++      to: reply_address,
++      message_id: "<turn-2@example.test>",
++      subject: "Re: Bare MID",
++      body: "Customer turn 2"
++    ))
++    assert_response :no_content
++    assert_equal "open", ticket.reload.status
++
++    patch "/api/v1/tickets/#{ticket.id}",
++      params: { ticket: { status: "solved", comment: { body: "Staff turn 2" } } },
++      headers: account_headers("acme", token: owner_token),
++      as: :json
++    assert_response :ok
++    mail2 = ActionMailer::Base.deliveries.last
++    assert_equal "turn-2@example.test", mail2.in_reply_to
++    assert_equal [ "bare-id@example.test", "turn-2@example.test" ], Array(mail2.references)
++    assert_equal [ reply_address ], mail2.reply_to
++  end
++end
+diff --git a/test/mailers/ticket_mailer_test.rb b/test/mailers/ticket_mailer_test.rb
+new file mode 100644
+index 0000000..835781e
+--- /dev/null
++++ b/test/mailers/ticket_mailer_test.rb
+@@ -0,0 +1,47 @@
++require "test_helper"
++
++class TicketMailerTest < ActionMailer::TestCase
++  test "staff_reply uses default sender and support domain with private reply-to and threading headers" do
++    account = Account.create!(name: "Acme", subdomain: "acme")
++    staff = account.users.create!(name: "Jo", email: "jo@acme.test", password: "my-first-password", role: "admin")
++    customer = account.users.create!(name: "Avery", email: "avery@example.test", password: "my-customer-password", role: "customer")
++    ticket = account.tickets.create!(requester: customer, subject: "Cannot download receipt", channel: Ticket::EMAIL)
++    Comment.create!(
++      account: account,
++      ticket: ticket,
++      author: customer,
++      body: "Original email",
++      public: true,
++      inbound_message_id: "orig-1@example.test"
++    )
++    reply = Comment.create!(account: account, ticket: ticket, author: staff, body: "Please try again now.", public: true)
++
++    with_env("HELPDESK_MAIL_FROM" => nil, "HELPDESK_SUPPORT_DOMAIN" => nil) do
++      mail = TicketMailer.staff_reply(ticket: ticket, comment: reply)
++
++      assert_equal [ "support@example.test" ], mail.from
++      assert_equal [ "avery@example.test" ], mail.to
++      assert_equal [ "acme+#{ticket.reply_token}@support.example.test" ], mail.reply_to
++      assert_equal "Re: Cannot download receipt", mail.subject
++      assert_equal "orig-1@example.test", mail.in_reply_to
++      assert_equal "orig-1@example.test", mail.references
++      assert_includes mail.body.decoded, "Please try again now."
++    end
++  end
++
++  test "staff_reply honors HELPDESK_MAIL_FROM and HELPDESK_SUPPORT_DOMAIN and avoids double Re prefix" do
++    account = Account.create!(name: "Acme", subdomain: "acme")
++    staff = account.users.create!(name: "Jo", email: "jo@acme.test", password: "my-first-password", role: "admin")
++    customer = account.users.create!(name: "Avery", email: "avery@example.test", password: "my-customer-password", role: "customer")
++    ticket = account.tickets.create!(requester: customer, subject: "Re: Existing subject", channel: Ticket::EMAIL)
++    reply = Comment.create!(account: account, ticket: ticket, author: staff, body: "Follow up.", public: true)
++
++    with_env("HELPDESK_MAIL_FROM" => "helpdesk@acme.test", "HELPDESK_SUPPORT_DOMAIN" => "mail.helpdesk.test") do
++      mail = TicketMailer.staff_reply(ticket: ticket, comment: reply)
++
++      assert_equal [ "helpdesk@acme.test" ], mail.from
++      assert_equal [ "acme+#{ticket.reply_token}@mail.helpdesk.test" ], mail.reply_to
++      assert_equal "Re: Existing subject", mail.subject
++    end
++  end
++end
+diff --git a/test/models/ticket_test.rb b/test/models/ticket_test.rb
+index 825b523..42e3ea1 100644
+--- a/test/models/ticket_test.rb
++++ b/test/models/ticket_test.rb
+@@ -142,4 +142,35 @@ class TicketTest < ActiveSupport::TestCase
+     assert_equal [], acme.tickets.search_text("secret").pluck(:id)
+     assert_equal [], acme.tickets.search_text("foo\x00bar").pluck(:id)
+   end
++
++  test "assigns unique private reply_token, defaults channel to portal, and formats support and reply addresses" do
++    acme = Account.create!(name: "Acme", subdomain: "acme")
++    customer = acme.users.create!(name: "Avery", email: "avery@example.test", password: "my-customer-password", role: "customer")
++
++    t1 = acme.tickets.create!(requester: customer, subject: "Portal ticket")
++    t2 = acme.tickets.create!(requester: customer, subject: "Email ticket", channel: Ticket::EMAIL)
++
++    assert_equal Ticket::PORTAL, t1.channel
++    assert_not t1.email_origin?
++    assert_equal Ticket::EMAIL, t2.channel
++    assert t2.email_origin?
++
++    assert t1.reply_token.present?
++    assert t2.reply_token.present?
++    assert_not_equal t1.reply_token, t2.reply_token
++
++    with_env("HELPDESK_SUPPORT_DOMAIN" => nil) do
++      assert_equal "acme@support.example.test", acme.support_address
++      assert_equal "acme+#{t2.reply_token}@support.example.test", t2.reply_address
++    end
++
++    with_env("HELPDESK_SUPPORT_DOMAIN" => "mail.acme-help.test") do
++      assert_equal "acme@mail.acme-help.test", acme.support_address
++      assert_equal "acme+#{t2.reply_token}@mail.acme-help.test", t2.reply_address
++    end
++
++    invalid_channel = acme.tickets.build(requester: customer, subject: "Bad channel", channel: "sms")
++    assert_not invalid_channel.valid?
++    assert invalid_channel.errors[:channel].any?
++  end
+ end

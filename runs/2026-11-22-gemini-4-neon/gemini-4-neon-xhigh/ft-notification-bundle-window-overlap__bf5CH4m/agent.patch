@@ -1,0 +1,1688 @@
+diff --git a/app/controllers/notifications/settings_controller.rb b/app/controllers/notifications/settings_controller.rb
+index 4af896a..f17aebb 100644
+--- a/app/controllers/notifications/settings_controller.rb
++++ b/app/controllers/notifications/settings_controller.rb
+@@ -1,5 +1,40 @@
+ class Notifications::SettingsController < ApplicationController
++  wrap_parameters :user_settings, include: %i[ bundle_email_frequency ]
++
++  before_action :set_settings
++
+   def show
+     @boards = Current.user.boards.alphabetically
++
++    respond_to do |format|
++      format.html
++      format.json
++    end
+   end
++
++  def update
++    @settings.update!(settings_params)
++
++    respond_to do |format|
++      format.html { redirect_to notifications_settings_path, notice: "Notification settings updated" }
++      format.json { head :no_content }
++    end
++  rescue ActiveRecord::RecordInvalid
++    respond_to do |format|
++      format.html do
++        @boards = Current.user.boards.alphabetically
++        render :show, status: :unprocessable_entity
++      end
++      format.json { head :unprocessable_entity }
++    end
++  end
++
++  private
++    def set_settings
++      @settings = Current.user.settings || Current.user.create_settings!
++    end
++
++    def settings_params
++      params.expect(user_settings: [ :bundle_email_frequency ])
++    end
+ end
+diff --git a/app/jobs/notification/bundle/deliver_all_job.rb b/app/jobs/notification/bundle/deliver_all_job.rb
+new file mode 100644
+index 0000000..c8b7a3c
+--- /dev/null
++++ b/app/jobs/notification/bundle/deliver_all_job.rb
+@@ -0,0 +1,5 @@
++class Notification::Bundle::DeliverAllJob < ApplicationJob
++  def perform
++    Notification::Bundle.deliver_all_later
++  end
++end
+diff --git a/app/jobs/notification/bundle/deliver_job.rb b/app/jobs/notification/bundle/deliver_job.rb
+new file mode 100644
+index 0000000..121d1e6
+--- /dev/null
++++ b/app/jobs/notification/bundle/deliver_job.rb
+@@ -0,0 +1,7 @@
++class Notification::Bundle::DeliverJob < ApplicationJob
++  discard_on ActiveJob::DeserializationError
++
++  def perform(bundle)
++    bundle.deliver
++  end
++end
+diff --git a/app/mailers/notification_mailer.rb b/app/mailers/notification_mailer.rb
+new file mode 100644
+index 0000000..34c7780
+--- /dev/null
++++ b/app/mailers/notification_mailer.rb
+@@ -0,0 +1,30 @@
++class NotificationMailer < ApplicationMailer
++  helper NotificationsHelper, ExcerptHelper
++
++  def bundle(bundle)
++    @bundle = bundle
++    @user = bundle.user
++    @account = bundle.account
++    @notifications = bundle.notifications.unread.preloaded.ordered
++
++    return if @notifications.empty? || @user.identity.blank?
++
++    @grouped_notifications = @notifications.group_by { |notification| notification.card.board }
++
++    Current.with_account(@account) do
++      mail(
++        to: @user.identity.email_address,
++        subject: subject_for(@notifications)
++      )
++    end
++  end
++
++  private
++    def subject_for(notifications)
++      if notifications.one?
++        "#{@account.name}: #{notifications.first.payload.title}"
++      else
++        "#{@account.name}: #{notifications.size} new notifications"
++      end
++    end
++end
+diff --git a/app/models/account/data_transfer/manifest.rb b/app/models/account/data_transfer/manifest.rb
+index c3a9301..1d9df9d 100644
+--- a/app/models/account/data_transfer/manifest.rb
++++ b/app/models/account/data_transfer/manifest.rb
+@@ -53,6 +53,7 @@ class Account::DataTransfer::Manifest
+           ::Filter,
+           ::Webhook::DelinquencyTracker,
+           ::Event,
++          ::Notification::Bundle,
+           ::Notification,
+           ::Webhook::Delivery
+         ),
+diff --git a/app/models/notification.rb b/app/models/notification.rb
+index 1aac7ef..37cd468 100644
+--- a/app/models/notification.rb
++++ b/app/models/notification.rb
+@@ -1,5 +1,5 @@
+ class Notification < ApplicationRecord
+-  include Notification::Pushable
++  include Notification::Bundlable, Notification::Pushable
+ 
+   belongs_to :account, default: -> { user.account }
+   belongs_to :user
+diff --git a/app/models/notification/bundlable.rb b/app/models/notification/bundlable.rb
+new file mode 100644
+index 0000000..bd6a104
+--- /dev/null
++++ b/app/models/notification/bundlable.rb
+@@ -0,0 +1,28 @@
++module Notification::Bundlable
++  extend ActiveSupport::Concern
++
++  included do
++    belongs_to :bundle, class_name: "Notification::Bundle", optional: true
++
++    after_save_commit :bundle_notification, if: :should_bundle_after_save?
++  end
++
++  def bundle_notification
++    return unless bundleable?
++
++    Notification::Bundle.bundle(self)
++  end
++
++  def bundle_timestamp
++    previously_new_record? ? created_at : updated_at
++  end
++
++  private
++    def should_bundle_after_save?
++      (source_id_previously_changed? || source_type_previously_changed?) && !bundle_id_previously_changed?
++    end
++
++    def bundleable?
++      !creator&.system? && user.active? && account.active? && user.identity.present? && user.bundling_emails?
++    end
++end
+diff --git a/app/models/notification/bundle.rb b/app/models/notification/bundle.rb
+new file mode 100644
+index 0000000..3cf9078
+--- /dev/null
++++ b/app/models/notification/bundle.rb
+@@ -0,0 +1,153 @@
++class Notification::Bundle < ApplicationRecord
++  belongs_to :account, default: -> { user.account }
++  belongs_to :user
++  has_many :notifications, foreign_key: :bundle_id, dependent: :nullify
++
++  enum :status, %w[ pending processing delivered ].index_by(&:itself), default: :pending
++
++  validates :starts_at, :ends_at, presence: true
++  validate :ends_at_after_starts_at
++  validate :does_not_overlap
++
++  before_save :lock_user_and_verify_no_overlap, if: :window_boundaries_changed?
++
++  scope :due, -> { pending.where(ends_at: ..Time.current) }
++  scope :overlapping, ->(starts_at, ends_at) {
++    where(arel_table[:starts_at].lt(ends_at)).where(arel_table[:ends_at].gt(starts_at))
++  }
++
++  class << self
++    def bundle(notification)
++      user = notification.user
++      timestamp = notification.bundle_timestamp
++
++      transaction do
++        User.where(id: user.id).lock.pick(:id)
++
++        period = User::Settings.find_by(user_id: user.id)&.bundling_period
++        return unless period
++
++        bundle = find_or_create_window_for(user, timestamp: timestamp, period: period)
++
++        if notification.bundle_id != bundle.id
++          notification.update_column(:bundle_id, bundle.id)
++          notification.association(:bundle).target = bundle
++        end
++
++        bundle
++      end
++    end
++
++    def deliver_all_later
++      due.find_each do |bundle|
++        Current.with_account(bundle.account) do
++          bundle.deliver_later
++        end
++      end
++    end
++
++    def deliver_all
++      due.find_each(&:deliver)
++    end
++
++    private
++      def find_or_create_window_for(user, timestamp:, period:)
++        existing_pending = user.notification_bundles
++          .pending
++          .where(arel_table[:ends_at].gt(timestamp))
++          .order(:starts_at)
++          .first
++
++        if existing_pending
++          existing_pending
++        else
++          starts_at = next_window_start_for(user, timestamp)
++          user.notification_bundles.create!(
++            account: user.account,
++            starts_at: starts_at,
++            ends_at: starts_at + period
++          )
++        end
++      end
++
++      def next_window_start_for(user, timestamp)
++        latest_end = user.notification_bundles.maximum(:ends_at)
++
++        if latest_end && latest_end > timestamp
++          latest_end
++        else
++          timestamp
++        end
++      end
++  end
++
++  def deliver_later
++    Notification::Bundle::DeliverJob.perform_later(self)
++  end
++
++  def deliver
++    return unless claim_for_delivery
++
++    Current.with_account(account) do
++      transaction do
++        if deliverable? && notifications.unread.exists?
++          NotificationMailer.bundle(self).deliver_later
++        end
++
++        delivered!
++      end
++    end
++  rescue
++    self.class.where(id: id, status: :processing).update_all(status: :pending, updated_at: Time.current)
++    self.status = "pending" if processing?
++    raise
++  end
++
++  def due?
++    pending? && ends_at <= Time.current
++  end
++
++  private
++    def ends_at_after_starts_at
++      if starts_at.present? && ends_at.present? && ends_at <= starts_at
++        errors.add(:ends_at, "must be after starts_at")
++      end
++    end
++
++    def does_not_overlap
++      if overlapping_bundles_exist?
++        errors.add(:base, "Window overlaps an existing notification bundle")
++      end
++    end
++
++    def window_boundaries_changed?
++      new_record? || starts_at_changed? || ends_at_changed?
++    end
++
++    def lock_user_and_verify_no_overlap
++      User.where(id: user_id).lock.pick(:id) if user_id.present?
++
++      if overlapping_bundles_exist?
++        errors.add(:base, "Window overlaps an existing notification bundle")
++        throw(:abort)
++      end
++    end
++
++    def overlapping_bundles_exist?
++      return false unless user_id.present? && starts_at.present? && ends_at.present? && ends_at > starts_at
++
++      scope = self.class.where(user_id: user_id).overlapping(starts_at, ends_at)
++      scope = scope.where.not(id: id) if persisted?
++      scope.exists?
++    end
++
++    def claim_for_delivery
++      claimed = self.class.where(id: id, status: :pending).update_all(status: :processing, updated_at: Time.current) == 1
++      reload if claimed
++      claimed
++    end
++
++    def deliverable?
++      user.active? && account.active? && user.identity.present? && user.bundling_emails?
++    end
++end
+diff --git a/app/models/user.rb b/app/models/user.rb
+index bd4b1d5..bbc5e26 100644
+--- a/app/models/user.rb
++++ b/app/models/user.rb
+@@ -10,6 +10,7 @@ class User < ApplicationRecord
+ 
+   has_many :comments, inverse_of: :creator, dependent: :destroy
+   has_many :notifications, dependent: :destroy
++  has_many :notification_bundles, class_name: "Notification::Bundle", dependent: :destroy
+ 
+   has_many :filters, foreign_key: :creator_id, inverse_of: :creator, dependent: :destroy
+   has_many :closures, dependent: :nullify
+diff --git a/app/models/user/configurable.rb b/app/models/user/configurable.rb
+index c9c5adf..3ab5096 100644
+--- a/app/models/user/configurable.rb
++++ b/app/models/user/configurable.rb
+@@ -7,7 +7,7 @@ module User::Configurable
+ 
+     after_create :create_settings, unless: :system?
+ 
+-    delegate :timezone, to: :settings, allow_nil: true
++    delegate :timezone, :bundle_email_frequency, :bundling_emails?, :bundling_period, to: :settings, allow_nil: true
+   end
+ 
+   def in_time_zone(&block)
+diff --git a/app/models/user/settings.rb b/app/models/user/settings.rb
+index d83ffda..d628497 100644
+--- a/app/models/user/settings.rb
++++ b/app/models/user/settings.rb
+@@ -1,7 +1,18 @@
+ class User::Settings < ApplicationRecord
++  BUNDLING_PERIODS = {
++    "every_few_hours" => 4.hours,
++    "daily" => 1.day,
++    "weekly" => 1.week
++  }.freeze
++
+   belongs_to :account, default: -> { user.account }
+   belongs_to :user
+ 
++  enum :bundle_email_frequency, %w[ never every_few_hours daily weekly ].index_by(&:itself),
++    default: :every_few_hours, prefix: :bundle_email, validate: true
++
++  after_update_commit :handle_bundle_email_frequency_change, if: :saved_change_to_bundle_email_frequency?
++
+   def timezone
+     if timezone_name.present?
+       ActiveSupport::TimeZone[timezone_name] || default_timezone
+@@ -10,8 +21,30 @@ class User::Settings < ApplicationRecord
+     end
+   end
+ 
++  def bundling_emails?
++    !bundle_email_never?
++  end
++
++  def bundling_period
++    BUNDLING_PERIODS[bundle_email_frequency]
++  end
++
+   private
+     def default_timezone
+       ActiveSupport::TimeZone["UTC"]
+     end
++
++    def handle_bundle_email_frequency_change
++      transaction do
++        User.where(id: user_id).lock.pick(:id)
++
++        if bundle_email_never?
++          user.notification_bundles.pending.destroy_all
++        else
++          user.notification_bundles.pending.where(Notification::Bundle.arel_table[:ends_at].gt(Time.current)).find_each do |bundle|
++            bundle.update(ends_at: bundle.starts_at + bundling_period)
++          end
++        end
++      end
++    end
+ end
+diff --git a/app/views/mailers/notification_mailer/_notification.html.erb b/app/views/mailers/notification_mailer/_notification.html.erb
+new file mode 100644
+index 0000000..2bfa237
+--- /dev/null
++++ b/app/views/mailers/notification_mailer/_notification.html.erb
+@@ -0,0 +1,28 @@
++<% payload = notification.payload %>
++<table class="notification">
++  <tr>
++    <% if notification.creator %>
++      <td class="avatar__container">
++        <%= mail_avatar_tag(notification.creator) %>
++      </td>
++    <% end %>
++    <td>
++      <p class="card__title">
++        <% if notification.source.is_a?(Mention) %>
++          <span class="notificaton__mention"><%= link_to payload.title, payload.url %></span>
++        <% else %>
++          <%= link_to payload.title, payload.url %>
++        <% end %>
++      </p>
++      <p class="notification__details"><%= payload.body %></p>
++      <% if notification.creator %>
++        <p class="notification__author">
++          <%= notification.creator.name %>
++          <% if notification.unread_count > 1 %>
++            &middot; <%= pluralize(notification.unread_count, "update") %>
++          <% end %>
++        </p>
++      <% end %>
++    </td>
++  </tr>
++</table>
+diff --git a/app/views/mailers/notification_mailer/bundle.html.erb b/app/views/mailers/notification_mailer/bundle.html.erb
+new file mode 100644
+index 0000000..5e05c87
+--- /dev/null
++++ b/app/views/mailers/notification_mailer/bundle.html.erb
+@@ -0,0 +1,31 @@
++<tr>
++  <td>
++    <h1 class="title">
++      <% if @notifications.one? %>
++        You have 1 new notification
++      <% else %>
++        You have <%= @notifications.size %> new notifications
++      <% end %>
++    </h1>
++    <p class="subtitle">Here’s what you missed in <%= @account.name %>.</p>
++
++    <% @grouped_notifications.each_with_index do |(board, notifications), index| %>
++      <% if index > 0 %>
++        <hr class="notification__board-separator">
++      <% end %>
++
++      <h2 class="notification__board">
++        <%= link_to board.name, board_url(board) %>
++      </h2>
++
++      <% notifications.each do |notification| %>
++        <%= render "notification_mailer/notification", notification: notification %>
++      <% end %>
++    <% end %>
++
++    <p class="footer">
++      You’re receiving this email because you have email notifications enabled.
++      <%= link_to "Change your notification settings", notifications_settings_url %>.
++    </p>
++  </td>
++</tr>
+diff --git a/app/views/mailers/notification_mailer/bundle.text.erb b/app/views/mailers/notification_mailer/bundle.text.erb
+new file mode 100644
+index 0000000..0dc89f4
+--- /dev/null
++++ b/app/views/mailers/notification_mailer/bundle.text.erb
+@@ -0,0 +1,18 @@
++<% if @notifications.one? %>
++You have 1 new notification in <%= @account.name %>.
++<% else %>
++You have <%= @notifications.size %> new notifications in <%= @account.name %>.
++<% end %>
++
++<% @grouped_notifications.each do |board, notifications| %>
++<%= board.name %> (<%= board_url(board) %>)
++<%= "-" * board.name.length %>
++<% notifications.each do |notification| %>
++<% payload = notification.payload %>
++* <%= payload.title %>
++  <%= payload.body %>
++  <%= payload.url %>
++<% end %>
++
++<% end %>
++Change your notification settings: <%= notifications_settings_url %>
+diff --git a/app/views/notifications/settings/_email.html.erb b/app/views/notifications/settings/_email.html.erb
+new file mode 100644
+index 0000000..f9b43b5
+--- /dev/null
++++ b/app/views/notifications/settings/_email.html.erb
+@@ -0,0 +1,22 @@
++<section class="settings__section">
++  <header>
++    <h2 class="divider">Email notifications</h2>
++    <div>Get email digests summarizing your unread notifications.</div>
++  </header>
++
++  <%= form_with model: settings, url: notifications_settings_path, method: :patch, data: { controller: "form" } do |form| %>
++    <div class="flex align-center gap">
++      <%= form.label :bundle_email_frequency, "Email frequency", class: "for-screen-reader" %>
++      <%= form.select :bundle_email_frequency,
++            options_for_select({
++              "Never" => "never",
++              "Every few hours" => "every_few_hours",
++              "Daily" => "daily",
++              "Weekly" => "weekly"
++            }, settings.bundle_email_frequency),
++            {},
++            class: "input input--select",
++            data: { action: "change->form#submit" } %>
++    </div>
++  <% end %>
++</section>
+diff --git a/app/views/notifications/settings/show.html.erb b/app/views/notifications/settings/show.html.erb
+index 53cf509..cc557a1 100644
+--- a/app/views/notifications/settings/show.html.erb
++++ b/app/views/notifications/settings/show.html.erb
+@@ -15,6 +15,7 @@
+   </div>
+ 
+   <div class="settings__panel panel shadow">
++    <%= render "notifications/settings/email", settings: @settings %>
+     <%= render "notifications/settings/push_notifications" %>
+     <%= render "notifications/settings/native_devices" if Fizzy.saas? %>
+   </div>
+diff --git a/app/views/notifications/settings/show.json.jbuilder b/app/views/notifications/settings/show.json.jbuilder
+new file mode 100644
+index 0000000..02a1e34
+--- /dev/null
++++ b/app/views/notifications/settings/show.json.jbuilder
+@@ -0,0 +1 @@
++json.bundle_email_frequency @settings.bundle_email_frequency
+diff --git a/config/recurring.yml b/config/recurring.yml
+index d515d38..1c6a59a 100644
+--- a/config/recurring.yml
++++ b/config/recurring.yml
+@@ -1,6 +1,11 @@
+ <% require_relative "../lib/fizzy" %>
+ 
+ production: &production
++  # Notifications
++  deliver_bundled_notifications:
++    class: Notification::Bundle::DeliverAllJob
++    schedule: every 15 minutes
++
+   # Application cleanup
+   auto_postpone_all_due:
+     command: "Card.auto_postpone_all_due"
+diff --git a/db/migrate/20261119211500_add_bundle_email_frequency_to_user_settings.rb b/db/migrate/20261119211500_add_bundle_email_frequency_to_user_settings.rb
+new file mode 100644
+index 0000000..964f21c
+--- /dev/null
++++ b/db/migrate/20261119211500_add_bundle_email_frequency_to_user_settings.rb
+@@ -0,0 +1,5 @@
++class AddBundleEmailFrequencyToUserSettings < ActiveRecord::Migration[8.2]
++  def change
++    add_column :user_settings, :bundle_email_frequency, :string, default: "every_few_hours", null: false
++  end
++end
+diff --git a/db/migrate/20261119211501_create_notification_bundles.rb b/db/migrate/20261119211501_create_notification_bundles.rb
+new file mode 100644
+index 0000000..98b4784
+--- /dev/null
++++ b/db/migrate/20261119211501_create_notification_bundles.rb
+@@ -0,0 +1,21 @@
++class CreateNotificationBundles < ActiveRecord::Migration[8.2]
++  def change
++    create_table :notification_bundles, id: :uuid do |t|
++      t.uuid :account_id, null: false, index: true
++      t.uuid :user_id, null: false
++      t.datetime :starts_at, null: false
++      t.datetime :ends_at, null: false
++      t.string :status, default: "pending", null: false
++
++      t.timestamps
++
++      t.index [ :user_id, :starts_at ], unique: true
++      t.index [ :user_id, :ends_at ], unique: true
++      t.index [ :user_id, :status ]
++      t.index [ :status, :ends_at ]
++    end
++
++    add_column :notifications, :bundle_id, :uuid
++    add_index :notifications, :bundle_id
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 50950f4..4b75b5b 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
++ActiveRecord::Schema[8.2].define(version: 2026_11_19_211501) do
+   create_table "accesses", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+     t.datetime "accessed_at"
+     t.uuid "account_id", null: false
+@@ -387,9 +387,24 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.index ["source_type", "source_id"], name: "index_mentions_on_source"
+   end
+ 
++  create_table "notification_bundles", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
++    t.uuid "account_id", null: false
++    t.datetime "created_at", null: false
++    t.datetime "ends_at", null: false
++    t.datetime "starts_at", null: false
++    t.string "status", default: "pending", null: false
++    t.datetime "updated_at", null: false
++    t.uuid "user_id", null: false
++    t.index ["account_id"], name: "index_notification_bundles_on_account_id"
++    t.index ["status", "ends_at"], name: "index_notification_bundles_on_status_and_ends_at"
++    t.index ["user_id", "ends_at"], name: "index_notification_bundles_on_user_id_and_ends_at", unique: true
++    t.index ["user_id", "starts_at"], name: "index_notification_bundles_on_user_id_and_starts_at", unique: true
++    t.index ["user_id", "status"], name: "index_notification_bundles_on_user_id_and_status"
++  end
+ 
+   create_table "notifications", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+     t.uuid "account_id", null: false
++    t.uuid "bundle_id"
+     t.uuid "card_id", null: false
+     t.datetime "created_at", null: false
+     t.uuid "creator_id"
+@@ -400,6 +415,7 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.datetime "updated_at", null: false
+     t.uuid "user_id", null: false
+     t.index ["account_id"], name: "index_notifications_on_account_id"
++    t.index ["bundle_id"], name: "index_notifications_on_bundle_id"
+     t.index ["creator_id"], name: "index_notifications_on_creator_id"
+     t.index ["source_type", "source_id"], name: "index_notifications_on_source"
+     t.index ["user_id", "card_id"], name: "index_notifications_on_user_id_and_card_id", unique: true
+@@ -768,6 +784,7 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+ 
+   create_table "user_settings", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+     t.uuid "account_id", null: false
++    t.string "bundle_email_frequency", default: "every_few_hours", null: false
+     t.datetime "created_at", null: false
+     t.string "timezone_name"
+     t.datetime "updated_at", null: false
+diff --git a/db/schema_sqlite.rb b/db/schema_sqlite.rb
+index 63e19f7..654e396 100644
+--- a/db/schema_sqlite.rb
++++ b/db/schema_sqlite.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
++ActiveRecord::Schema[8.2].define(version: 2026_11_19_211501) do
+   create_table "accesses", id: :uuid, force: :cascade do |t|
+     t.datetime "accessed_at"
+     t.uuid "account_id", null: false
+@@ -387,6 +387,21 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.index ["source_type", "source_id"], name: "index_mentions_on_source"
+   end
+ 
++  create_table "notification_bundles", id: :uuid, force: :cascade do |t|
++    t.uuid "account_id", null: false
++    t.uuid "user_id", null: false
++    t.datetime "starts_at", null: false
++    t.datetime "ends_at", null: false
++    t.string "status", limit: 255, default: "pending", null: false
++    t.datetime "created_at", null: false
++    t.datetime "updated_at", null: false
++    t.index ["account_id"], name: "index_notification_bundles_on_account_id"
++    t.index ["status", "ends_at"], name: "index_notification_bundles_on_status_and_ends_at"
++    t.index ["user_id", "ends_at"], name: "index_notification_bundles_on_user_id_and_ends_at", unique: true
++    t.index ["user_id", "starts_at"], name: "index_notification_bundles_on_user_id_and_starts_at", unique: true
++    t.index ["user_id", "status"], name: "index_notification_bundles_on_user_id_and_status"
++  end
++
+   create_table "notifications", id: :uuid, force: :cascade do |t|
+     t.uuid "account_id", null: false
+     t.uuid "card_id", null: false
+@@ -398,7 +413,9 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.integer "unread_count", default: 0, null: false
+     t.datetime "updated_at", null: false
+     t.uuid "user_id", null: false
++    t.uuid "bundle_id"
+     t.index ["account_id"], name: "index_notifications_on_account_id"
++    t.index ["bundle_id"], name: "index_notifications_on_bundle_id"
+     t.index ["creator_id"], name: "index_notifications_on_creator_id"
+     t.index ["source_type", "source_id"], name: "index_notifications_on_source"
+     t.index ["user_id", "card_id"], name: "index_notifications_on_user_id_and_card_id", unique: true
+@@ -544,6 +561,7 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.string "timezone_name", limit: 255
+     t.datetime "updated_at", null: false
+     t.uuid "user_id", null: false
++    t.string "bundle_email_frequency", default: "every_few_hours", null: false
+     t.index ["account_id"], name: "index_user_settings_on_account_id"
+     t.index ["user_id"], name: "index_user_settings_on_user_id"
+   end
+diff --git a/test/controllers/notifications/settings_controller_test.rb b/test/controllers/notifications/settings_controller_test.rb
+index 1eeceba..120b6a8 100644
+--- a/test/controllers/notifications/settings_controller_test.rb
++++ b/test/controllers/notifications/settings_controller_test.rb
+@@ -11,5 +11,39 @@ class Notifications::SettingsControllerTest < ActionDispatch::IntegrationTest
+     get notifications_settings_path
+ 
+     assert_response :success
++    assert_select "select[name='user_settings[bundle_email_frequency]']"
++  end
++
++  test "show as JSON" do
++    get notifications_settings_path, as: :json
++
++    assert_response :success
++    assert_equal @user.settings.bundle_email_frequency, @response.parsed_body["bundle_email_frequency"]
++  end
++
++  test "update bundle_email_frequency via HTML" do
++    %w[ never every_few_hours daily weekly ].each do |frequency|
++      patch notifications_settings_path, params: { user_settings: { bundle_email_frequency: frequency } }
++
++      assert_redirected_to notifications_settings_path
++      assert_equal frequency, @user.settings.reload.bundle_email_frequency
++    end
++  end
++
++  test "update bundle_email_frequency via JSON" do
++    patch notifications_settings_path, params: { bundle_email_frequency: "weekly" }, as: :json
++
++    assert_response :no_content
++    assert_equal "weekly", @user.settings.reload.bundle_email_frequency
++  end
++
++  test "update with invalid bundle_email_frequency returns unprocessable entity" do
++    patch notifications_settings_path, params: { user_settings: { bundle_email_frequency: "invalid" } }
++    assert_response :unprocessable_entity
++    assert_equal "every_few_hours", @user.settings.reload.bundle_email_frequency
++
++    patch notifications_settings_path, params: { bundle_email_frequency: "invalid" }, as: :json
++    assert_response :unprocessable_entity
++    assert_equal "every_few_hours", @user.settings.reload.bundle_email_frequency
+   end
+ end
+diff --git a/test/mailers/notification_mailer_test.rb b/test/mailers/notification_mailer_test.rb
+new file mode 100644
+index 0000000..5603a02
+--- /dev/null
++++ b/test/mailers/notification_mailer_test.rb
+@@ -0,0 +1,120 @@
++require "test_helper"
++
++class NotificationMailerTest < ActionMailer::TestCase
++  setup do
++    @user = users(:kevin)
++    @account = @user.account
++  end
++
++  test "bundle renders single notification email with account-scoped URLs" do
++    bundle = @user.notification_bundles.create!(
++      starts_at: 4.hours.ago,
++      ends_at: Time.current
++    )
++    notification = notifications(:logo_assignment_kevin)
++    notification.update_columns(bundle_id: bundle.id, read_at: nil)
++
++    email = NotificationMailer.bundle(bundle)
++
++    assert_emails 1 do
++      email.deliver_now
++    end
++
++    assert_equal [ @user.identity.email_address ], email.to
++    assert_equal "#{@account.name}: #{notification.payload.title}", email.subject
++
++    html_body = email.html_part.body.decoded
++    text_body = email.text_part.body.decoded
++
++    assert_includes html_body, "You have 1 new notification"
++    assert_includes html_body, cards(:logo).board.name
++    assert_includes html_body, ERB::Util.html_escape(cards(:logo).title)
++    assert_includes html_body, "#{@account.slug}/notifications/settings"
++    assert_includes html_body, "#{@account.slug}/cards/#{cards(:logo).number}"
++
++    assert_includes text_body, "You have 1 new notification in #{@account.name}"
++    assert_includes text_body, cards(:logo).title
++    assert_includes text_body, "#{@account.slug}/notifications/settings"
++  end
++
++  test "bundle groups multiple notifications by board and excludes read notifications" do
++    bundle = @user.notification_bundles.create!(
++      starts_at: 4.hours.ago,
++      ends_at: Time.current
++    )
++
++    private_card = Current.set(user: users(:david)) do
++      Card.create!(board: boards(:private), creator: users(:david), title: "Secret task", status: :published)
++    end
++    private_event = Event.create!(board: boards(:private), creator: users(:david), eventable: private_card, action: "card_published")
++    private_notification = Notification.create!(user: @user, source: private_event, creator: users(:david), bundle: bundle)
++
++    unread_notification = notifications(:logo_assignment_kevin)
++    unread_notification.update_columns(bundle_id: bundle.id, read_at: nil)
++
++    read_notification = notifications(:layout_commented_kevin)
++    read_notification.update_columns(bundle_id: bundle.id, read_at: 1.hour.ago)
++
++    email = NotificationMailer.bundle(bundle)
++
++    assert_emails 1 do
++      email.deliver_now
++    end
++
++    assert_equal "#{@account.name}: 2 new notifications", email.subject
++
++    html_body = email.html_part.body.decoded
++    assert_includes html_body, "You have 2 new notifications"
++    assert_includes html_body, boards(:writebook).name
++    assert_includes html_body, boards(:private).name
++    assert_includes html_body, ERB::Util.html_escape(cards(:logo).title)
++    assert_includes html_body, "Secret task"
++    assert_not_includes html_body, cards(:layout).title
++    assert_includes html_body, "notification__board-separator"
++    assert_equal bundle, private_notification.bundle
++  end
++
++  test "bundle renders mention notifications" do
++    david = users(:david)
++    bundle = david.notification_bundles.create!(
++      starts_at: 4.hours.ago,
++      ends_at: Time.current
++    )
++    mention_notification = notifications(:logo_mentioned_david)
++    mention_notification.update_columns(bundle_id: bundle.id, read_at: nil)
++
++    email = NotificationMailer.bundle(bundle)
++
++    assert_emails 1 do
++      email.deliver_now
++    end
++
++    assert_equal [ david.identity.email_address ], email.to
++    assert_includes email.html_part.body.decoded, "JZ mentioned you"
++    assert_includes email.html_part.body.decoded, "notificaton__mention"
++    assert_includes email.text_part.body.decoded, "JZ mentioned you"
++  end
++
++  test "bundle does not send email when there are no unread notifications" do
++    bundle = @user.notification_bundles.create!(
++      starts_at: 4.hours.ago,
++      ends_at: Time.current
++    )
++
++    assert_no_emails do
++      NotificationMailer.bundle(bundle).deliver_now
++    end
++  end
++
++  test "bundle includes account slug even when Current.account is nil" do
++    bundle = @user.notification_bundles.create!(
++      starts_at: 4.hours.ago,
++      ends_at: Time.current
++    )
++    notifications(:logo_assignment_kevin).update_columns(bundle_id: bundle.id, read_at: nil)
++
++    email = Current.without_account { NotificationMailer.bundle(bundle) }
++
++    assert_includes email.html_part.body.decoded, "#{@account.slug}/notifications/settings"
++  end
++end
+diff --git a/test/mailers/previews/notification_mailer_preview.rb b/test/mailers/previews/notification_mailer_preview.rb
+new file mode 100644
+index 0000000..ae6221b
+--- /dev/null
++++ b/test/mailers/previews/notification_mailer_preview.rb
+@@ -0,0 +1,12 @@
++class NotificationMailerPreview < ActionMailer::Preview
++  def bundle
++    bundle = Notification::Bundle.last || Notification::Bundle.new(
++      account: Account.first,
++      user: User.active.first,
++      starts_at: 4.hours.ago,
++      ends_at: Time.current
++    )
++
++    NotificationMailer.bundle(bundle)
++  end
++end
+diff --git a/test/models/account/incineratable_test.rb b/test/models/account/incineratable_test.rb
+index f0222b4..0b8e641 100644
+--- a/test/models/account/incineratable_test.rb
++++ b/test/models/account/incineratable_test.rb
+@@ -105,6 +105,7 @@ class Account::IncineratableTest < ActiveSupport::TestCase
+     assert Card::NotNow.where(account_id: account_id).exists?
+     assert Card::ActivitySpike.where(account_id: account_id).exists?
+     assert Notification.where(account_id: account_id).exists?
++    assert Notification::Bundle.where(account_id: account_id).exists?
+     assert Filter.where(account_id: account_id).exists?
+     assert User::Settings.where(user_id: user.id).exists?
+     assert ActiveStorage::Attachment.where(account_id: account_id).exists?
+@@ -158,6 +159,7 @@ class Account::IncineratableTest < ActiveSupport::TestCase
+ 
+     # Via User
+     assert_empty Notification.where(account_id: account_id)
++    assert_empty Notification::Bundle.where(account_id: account_id)
+     assert_empty Filter.where(account_id: account_id)
+     assert_empty User::Settings.where(user_id: user_ids)
+ 
+diff --git a/test/models/notification/bundle_concurrency_test.rb b/test/models/notification/bundle_concurrency_test.rb
+new file mode 100644
+index 0000000..98a107c
+--- /dev/null
++++ b/test/models/notification/bundle_concurrency_test.rb
+@@ -0,0 +1,107 @@
++require "test_helper"
++
++class Notification::BundleConcurrencyTest < ActiveSupport::TestCase
++  self.use_transactional_tests = false
++
++  setup do
++    @account = accounts("37s")
++    @identity = Identity.create!(email_address: "concurrent-#{SecureRandom.hex(6)}@example.com")
++    @user = User.create!(account: @account, identity: @identity, name: "Concurrent User")
++    @user.settings.update!(bundle_email_frequency: :every_few_hours)
++    @board = boards(:writebook)
++    @cards = Current.set(user: users(:kevin)) do
++      4.times.map do |i|
++        Card.create!(board: @board, creator: users(:kevin), title: "Concurrent card #{i}", status: :published)
++      end
++    end
++    @events = @cards.map do |card|
++      Event.create!(board: @board, creator: users(:kevin), eventable: card, action: "card_published")
++    end
++  end
++
++  teardown do
++    if @user
++      Notification::Bundle.where(user_id: @user.id).delete_all
++      Notification.where(user_id: @user.id).delete_all
++      User::Settings.where(user_id: @user.id).delete_all
++      User.where(id: @user.id).delete_all
++    end
++    Identity.where(id: @identity.id).delete_all if @identity
++    @events&.each { |e| Event.where(id: e.id).delete_all }
++    @cards&.each { |c| Event.where(eventable: c).delete_all; Card.where(id: c.id).delete_all }
++  end
++
++  test "concurrent notifications for the same user never create overlapping bundles" do
++    barrier = Queue.new
++    ready = Queue.new
++    errors = Queue.new
++
++    threads = @events.map do |event|
++      Thread.new do
++        ActiveRecord::Base.connection_pool.with_connection do
++          Current.with_account(@account) do
++            ready << true
++            barrier.pop
++            Notification.create!(user: @user, source: event, creator: users(:kevin))
++          end
++        end
++      rescue => e
++        errors << e
++      end
++    end
++
++    @events.size.times { ready.pop }
++    @events.size.times { barrier << true }
++    threads.each(&:join)
++
++    collected_errors = []
++    collected_errors << errors.pop until errors.empty?
++    assert_empty collected_errors, "Unexpected errors: #{collected_errors.map(&:inspect)}"
++
++    bundles = @user.notification_bundles.order(:starts_at).to_a
++    assert_equal 1, bundles.size, "Expected 1 bundle, got #{bundles.size}"
++    assert_equal @events.size, bundles.first.notifications.count
++
++    bundles.each_cons(2) do |a, b|
++      assert_operator a.ends_at, :<=, b.starts_at
++    end
++  end
++
++  test "concurrent direct bundle creates with overlapping ranges allow only one" do
++    base = Time.utc(2025, 1, 15, 10, 0, 0)
++    ranges = [
++      [ base, base + 4.hours ],
++      [ base + 1.hour, base + 5.hours ],
++      [ base + 2.hours, base + 6.hours ]
++    ]
++
++    barrier = Queue.new
++    ready = Queue.new
++    results = Queue.new
++
++    threads = ranges.map do |starts_at, ends_at|
++      Thread.new do
++        ActiveRecord::Base.connection_pool.with_connection do
++          Current.with_account(@account) do
++            ready << true
++            barrier.pop
++            bundle = @user.notification_bundles.create(starts_at: starts_at, ends_at: ends_at)
++            results << bundle.persisted?
++          end
++        end
++      rescue ActiveRecord::RecordNotUnique
++        results << false
++      end
++    end
++
++    ranges.size.times { ready.pop }
++    ranges.size.times { barrier << true }
++    threads.each(&:join)
++
++    persisted_count = 0
++    persisted_count += 1 if results.pop until results.empty?
++
++    assert_equal 1, persisted_count
++    assert_equal 1, @user.notification_bundles.count
++  end
++end
+diff --git a/test/models/notification/bundle_test.rb b/test/models/notification/bundle_test.rb
+new file mode 100644
+index 0000000..151783c
+--- /dev/null
++++ b/test/models/notification/bundle_test.rb
+@@ -0,0 +1,548 @@
++require "test_helper"
++
++class Notification::BundleTest < ActiveSupport::TestCase
++  include ActionMailer::TestHelper
++
++  setup do
++    @user = users(:david)
++    @user.settings.update!(bundle_email_frequency: :every_few_hours)
++  end
++
++  test "clock starts when the first notification lands for every_few_hours" do
++    start_time = Time.utc(2025, 1, 15, 10, 17, 0)
++    travel_to start_time
++
++    notification = create_notification_for(@user, events(:layout_published))
++
++    assert_equal 1, @user.notification_bundles.count
++    bundle = notification.bundle
++    assert_equal start_time, bundle.starts_at
++    assert_equal start_time + 4.hours, bundle.ends_at
++    assert bundle.pending?
++  end
++
++  test "clock starts when the first notification lands for daily" do
++    @user.settings.update!(bundle_email_frequency: :daily)
++    start_time = Time.utc(2025, 1, 15, 10, 17, 0)
++    travel_to start_time
++
++    notification = create_notification_for(@user, events(:layout_published))
++    bundle = notification.bundle
++
++    assert_equal start_time, bundle.starts_at
++    assert_equal start_time + 1.day, bundle.ends_at
++  end
++
++  test "clock starts when the first notification lands for weekly" do
++    @user.settings.update!(bundle_email_frequency: :weekly)
++    start_time = Time.utc(2025, 1, 15, 10, 17, 0)
++    travel_to start_time
++
++    notification = create_notification_for(@user, events(:layout_published))
++    bundle = notification.bundle
++
++    assert_equal start_time, bundle.starts_at
++    assert_equal start_time + 1.week, bundle.ends_at
++  end
++
++  test "never frequency creates no bundle and sends no email" do
++    @user.settings.update!(bundle_email_frequency: :never)
++    travel_to Time.utc(2025, 1, 15, 10, 0, 0)
++
++    notification = create_notification_for(@user, events(:layout_published))
++
++    assert_nil notification.bundle
++    assert_empty @user.notification_bundles
++  end
++
++  test "multiple notifications within the same window batch into one bundle and send one email" do
++    start_time = Time.utc(2025, 1, 15, 10, 0, 0)
++
++    travel_to start_time
++    n1 = create_notification_for(@user, events(:layout_published))
++
++    travel_to start_time + 1.hour
++    n2 = create_notification_for(@user, events(:text_published))
++    assert_equal n1.bundle, n2.bundle
++
++    travel_to start_time + 3.hours + 59.minutes
++    n3 = create_notification_for(@user, events(:shipping_published))
++    assert_equal n1.bundle, n3.bundle
++
++    assert_equal 1, @user.notification_bundles.count
++    bundle = @user.notification_bundles.first
++    assert_equal 3, bundle.notifications.count
++
++    assert_no_emails do
++      perform_enqueued_jobs do
++        Notification::Bundle.deliver_all_later
++      end
++    end
++    assert bundle.reload.pending?
++
++    travel_to start_time + 4.hours
++    assert_emails 1 do
++      perform_enqueued_jobs do
++        Notification::Bundle.deliver_all_later
++      end
++    end
++    assert bundle.reload.delivered?
++
++    email = ActionMailer::Base.deliveries.last
++    assert_equal [ @user.identity.email_address ], email.to
++    assert_includes email.text_part.body.decoded, cards(:layout).title
++    assert_includes email.text_part.body.decoded, cards(:text).title
++    assert_includes email.text_part.body.decoded, cards(:shipping).title
++  end
++
++  test "notification arriving at exact ends_at boundary opens the next adjacent window" do
++    start_time = Time.utc(2025, 1, 15, 10, 0, 0)
++
++    travel_to start_time
++    n1 = create_notification_for(@user, events(:layout_published))
++    bundle1 = n1.bundle
++
++    travel_to start_time + 4.hours
++    n2 = create_notification_for(@user, events(:text_published))
++    bundle2 = n2.bundle
++
++    assert_not_equal bundle1, bundle2
++    assert_equal start_time, bundle1.starts_at
++    assert_equal start_time + 4.hours, bundle1.ends_at
++    assert_equal start_time + 4.hours, bundle2.starts_at
++    assert_equal start_time + 8.hours, bundle2.ends_at
++  end
++
++  test "late notification arriving with timestamp before open window belongs in the already-open window" do
++    start_time = Time.utc(2025, 1, 15, 10, 0, 0)
++
++    travel_to start_time
++    n1 = create_notification_for(@user, events(:layout_published))
++    bundle = n1.bundle
++
++    # Late notification whose timestamp is 15 minutes BEFORE the window opened
++    late_notification = create_notification_for(
++      @user,
++      events(:text_published),
++      created_at: start_time - 15.minutes,
++      updated_at: start_time - 15.minutes
++    )
++
++    assert_equal 1, @user.notification_bundles.count
++    assert_equal bundle, late_notification.bundle
++    assert_equal start_time, bundle.reload.starts_at
++    assert_equal start_time + 4.hours, bundle.ends_at
++
++    travel_to start_time + 4.hours
++    assert_emails 1 do
++      perform_enqueued_jobs do
++        Notification::Bundle.deliver_all_later
++      end
++    end
++
++    email = ActionMailer::Base.deliveries.last
++    assert_includes email.text_part.body.decoded, cards(:layout).title
++    assert_includes email.text_part.body.decoded, cards(:text).title
++  end
++
++  test "late notification from an already-delivered window joins the newly opened window without overlap" do
++    start_time = Time.utc(2025, 1, 15, 10, 0, 0)
++
++    travel_to start_time
++    n1 = create_notification_for(@user, events(:layout_published))
++    bundle1 = n1.bundle
++
++    travel_to start_time + 4.hours
++    perform_enqueued_jobs { Notification::Bundle.deliver_all_later }
++    assert bundle1.reload.delivered?
++
++    travel_to start_time + 4.hours + 30.minutes
++    n2 = create_notification_for(@user, events(:text_published))
++    bundle2 = n2.bundle
++
++    # Late notification timestamped during bundle1 (13:50), arriving after bundle2 opened (14:30)
++    late = create_notification_for(
++      @user,
++      events(:shipping_published),
++      created_at: start_time + 3.hours + 50.minutes,
++      updated_at: start_time + 3.hours + 50.minutes
++    )
++
++    assert_equal 2, @user.notification_bundles.count
++    assert_equal bundle2, late.bundle
++    assert_equal [ n2.id, late.id ].sort, bundle2.notifications.pluck(:id).sort
++  end
++
++  test "late notification from an already-delivered window when no window is open starts at previous ends_at without overlap" do
++    start_time = Time.utc(2025, 1, 15, 10, 0, 0)
++
++    travel_to start_time
++    n1 = create_notification_for(@user, events(:layout_published))
++    bundle1 = n1.bundle
++
++    travel_to start_time + 4.hours
++    perform_enqueued_jobs { Notification::Bundle.deliver_all_later }
++    assert bundle1.reload.delivered?
++
++    travel_to start_time + 4.hours + 5.minutes
++    # Late notification timestamped at 13:50 (inside delivered bundle1 [10:00, 14:00))
++    late = create_notification_for(
++      @user,
++      events(:text_published),
++      created_at: start_time + 3.hours + 50.minutes,
++      updated_at: start_time + 3.hours + 50.minutes
++    )
++
++    bundle2 = late.bundle
++    assert_not_equal bundle1, bundle2
++    assert_equal bundle1.ends_at, bundle2.starts_at
++    assert_equal bundle1.ends_at + 4.hours, bundle2.ends_at
++    assert_equal 2, @user.notification_bundles.count
++  end
++
++  test "late notification joins an ended-but-still-pending window if timestamp falls before its ends_at" do
++    start_time = Time.utc(2025, 1, 15, 10, 0, 0)
++
++    travel_to start_time
++    n1 = create_notification_for(@user, events(:layout_published))
++    bundle1 = n1.bundle
++
++    # At 14:05, bundle1 [10:00, 14:00) has ended but hasn't been delivered yet
++    travel_to start_time + 4.hours + 5.minutes
++    late = create_notification_for(
++      @user,
++      events(:text_published),
++      created_at: start_time + 3.hours + 55.minutes,
++      updated_at: start_time + 3.hours + 55.minutes
++    )
++
++    assert_equal bundle1, late.bundle
++    assert_equal 1, @user.notification_bundles.count
++  end
++
++  test "new notification after ended-but-still-pending window opens a non-overlapping second pending window" do
++    start_time = Time.utc(2025, 1, 15, 10, 0, 0)
++
++    travel_to start_time
++    n1 = create_notification_for(@user, events(:layout_published))
++    bundle1 = n1.bundle
++
++    # At 14:05, bundle1 hasn't been delivered yet; a new notification arrives at 14:05
++    travel_to start_time + 4.hours + 5.minutes
++    n2 = create_notification_for(@user, events(:text_published))
++    bundle2 = n2.bundle
++
++    assert_not_equal bundle1, bundle2
++    assert_equal start_time + 4.hours + 5.minutes, bundle2.starts_at
++    assert_equal start_time + 8.hours + 5.minutes, bundle2.ends_at
++
++    # Delivering due bundles delivers only bundle1; bundle2 stays pending
++    assert_emails 1 do
++      perform_enqueued_jobs do
++        Notification::Bundle.deliver_all_later
++      end
++    end
++
++    assert bundle1.reload.delivered?
++    assert bundle2.reload.pending?
++  end
++
++  test "updating an existing card notification in a later window moves it into the new window without re-emailing other cards" do
++    start_time = Time.utc(2025, 1, 15, 10, 0, 0)
++
++    travel_to start_time
++    n1 = create_notification_for(@user, events(:layout_published))
++    n2 = create_notification_for(@user, events(:text_published))
++    bundle1 = n1.bundle
++
++    travel_to start_time + 4.hours
++    assert_emails 1 do
++      perform_enqueued_jobs { Notification::Bundle.deliver_all_later }
++    end
++    assert bundle1.reload.delivered?
++
++    # New comment by Kevin on layout card 5 hours later (updates existing notification n1 in place)
++    cards(:layout).watch_by(@user)
++    travel_to start_time + 5.hours
++    comment = Current.set(user: users(:kevin)) do
++      cards(:layout).comments.create!(creator: users(:kevin), body: "Another update on layout")
++    end
++    comment_event = boards(:writebook).events.create!(action: "comment_created", creator: users(:kevin), eventable: comment)
++    Notifier.for(comment_event).notify
++    n1.reload
++
++    bundle2 = n1.bundle
++    assert_not_equal bundle1, bundle2
++    assert_equal bundle1, n2.reload.bundle
++    assert_equal [ n1.id ], bundle2.notifications.pluck(:id)
++
++    travel_to start_time + 9.hours
++    assert_emails 1 do
++      perform_enqueued_jobs { Notification::Bundle.deliver_all_later }
++    end
++
++    email = ActionMailer::Base.deliveries.last
++    assert_includes email.text_part.body.decoded, cards(:layout).title
++    assert_not_includes email.text_part.body.decoded, cards(:text).title
++  end
++
++  test "validates ends_at is after starts_at" do
++    now = Time.utc(2025, 1, 15, 10, 0, 0)
++
++    same_time = @user.notification_bundles.build(starts_at: now, ends_at: now)
++    assert_not same_time.valid?
++    assert_includes same_time.errors[:ends_at], "must be after starts_at"
++
++    reversed = @user.notification_bundles.build(starts_at: now, ends_at: now - 1.hour)
++    assert_not reversed.valid?
++    assert_includes reversed.errors[:ends_at], "must be after starts_at"
++  end
++
++  test "prevents overlapping windows for the same user in all overlap configurations" do
++    base = Time.utc(2025, 1, 15, 10, 0, 0)
++    @user.notification_bundles.create!(starts_at: base, ends_at: base + 4.hours)
++
++    overlapping_ranges = [
++      [ base, base + 4.hours ],               # exact duplicate
++      [ base + 2.hours, base + 6.hours ],     # partial right overlap
++      [ base - 2.hours, base + 2.hours ],     # partial left overlap
++      [ base + 1.hour, base + 3.hours ],      # strictly contained inside
++      [ base - 1.hour, base + 5.hours ],      # strictly containing existing
++      [ base + 3.hours + 59.minutes, base + 8.hours ], # 1 minute overlap
++      [ base - 4.hours, base + 1.second ]     # 1 second overlap
++    ]
++
++    overlapping_ranges.each do |s, e|
++      bundle = @user.notification_bundles.build(starts_at: s, ends_at: e)
++      assert_not bundle.valid?, "Expected [#{s}, #{e}) to be rejected as overlapping"
++      assert_includes bundle.errors[:base], "Window overlaps an existing notification bundle"
++    end
++
++    # Adjacent windows do NOT overlap and must be valid
++    adjacent_before = @user.notification_bundles.build(starts_at: base - 4.hours, ends_at: base)
++    assert adjacent_before.valid?
++
++    adjacent_after = @user.notification_bundles.build(starts_at: base + 4.hours, ends_at: base + 8.hours)
++    assert adjacent_after.valid?
++  end
++
++  test "different users can have identical time windows independently" do
++    base = Time.utc(2025, 1, 15, 10, 0, 0)
++    kevin = users(:kevin)
++    kevin.settings.update!(bundle_email_frequency: :daily)
++
++    travel_to base
++    david_notification = create_notification_for(@user, events(:layout_published))
++    kevin_notification = create_notification_for(kevin, events(:text_published))
++
++    assert_equal base, david_notification.bundle.starts_at
++    assert_equal base + 4.hours, david_notification.bundle.ends_at
++
++    assert_equal base, kevin_notification.bundle.starts_at
++    assert_equal base + 1.day, kevin_notification.bundle.ends_at
++  end
++
++  test "deliver is idempotent and sends at most one email per bundle" do
++    start_time = Time.utc(2025, 1, 15, 10, 0, 0)
++
++    travel_to start_time
++    notification = create_notification_for(@user, events(:layout_published))
++    bundle = notification.bundle
++
++    travel_to start_time + 4.hours
++    assert_emails 1 do
++      perform_enqueued_jobs do
++        bundle.deliver
++        bundle.deliver
++      end
++    end
++    assert bundle.reload.delivered?
++  end
++
++  test "deliver sends no email when all notifications in the bundle have been read" do
++    start_time = Time.utc(2025, 1, 15, 10, 0, 0)
++
++    travel_to start_time
++    notification = create_notification_for(@user, events(:layout_published))
++    bundle = notification.bundle
++
++    notification.read
++
++    travel_to start_time + 4.hours
++    assert_no_emails do
++      perform_enqueued_jobs do
++        bundle.deliver
++      end
++    end
++    assert bundle.reload.delivered?
++  end
++
++  test "deliver sends no email when user is deactivated" do
++    start_time = Time.utc(2025, 1, 15, 10, 0, 0)
++
++    travel_to start_time
++    notification = create_notification_for(@user, events(:layout_published))
++    bundle = notification.bundle
++
++    @user.deactivate
++
++    travel_to start_time + 4.hours
++    assert_no_emails do
++      perform_enqueued_jobs do
++        bundle.deliver
++      end
++    end
++    assert bundle.reload.delivered?
++  end
++
++  test "deliver sends no email when account is cancelled" do
++    start_time = Time.utc(2025, 1, 15, 10, 0, 0)
++
++    travel_to start_time
++    notification = create_notification_for(@user, events(:layout_published))
++    bundle = notification.bundle
++
++    @user.account.cancel(initiated_by: @user)
++    perform_enqueued_jobs # flush cancellation email
++
++    travel_to start_time + 4.hours
++    assert_no_emails do
++      perform_enqueued_jobs do
++        bundle.deliver
++      end
++    end
++    assert bundle.reload.delivered?
++  end
++
++  test "deliver resets bundle to pending if an error occurs before completion" do
++    start_time = Time.utc(2025, 1, 15, 10, 0, 0)
++
++    travel_to start_time
++    notification = create_notification_for(@user, events(:layout_published))
++    bundle = notification.bundle
++
++    NotificationMailer.stubs(:bundle).raises(RuntimeError, "boom")
++
++    assert_raises(RuntimeError) do
++      bundle.deliver
++    end
++
++    assert bundle.reload.pending?
++  end
++
++  test "skips bundling for system creator and users without settings" do
++    travel_to Time.utc(2025, 1, 15, 10, 0, 0)
++
++    system_notification = Notification.create!(
++      user: @user,
++      source: events(:layout_published),
++      creator: users(:system)
++    )
++    assert_nil system_notification.bundle
++    assert_empty @user.notification_bundles
++
++    jason = users(:jason) # fixture user without settings
++    assert_nil jason.settings
++    jason_notification = create_notification_for(jason, events(:text_published))
++    assert_nil jason_notification.bundle
++    assert_empty jason.notification_bundles
++  end
++
++  test "deliver_all_later preserves account context across multiple accounts" do
++    start_time = Time.utc(2025, 1, 15, 10, 0, 0)
++    initech = accounts(:initech)
++    mike = users(:mike)
++    mike.create_settings!(bundle_email_frequency: :every_few_hours)
++    initech_event = Event.create!(
++      account: initech,
++      board: boards(:miltons_wish_list),
++      creator: mike,
++      eventable: cards(:radio),
++      action: "card_published"
++    )
++
++    travel_to start_time
++    create_notification_for(@user, events(:layout_published))
++
++    Current.with_account(initech) do
++      Notification.create!(user: mike, source: initech_event, creator: mike)
++    end
++
++    travel_to start_time + 4.hours
++    assert_emails 2 do
++      perform_enqueued_jobs do
++        Current.without_account do
++          Notification::Bundle.deliver_all_later
++        end
++      end
++    end
++
++    david_email = ActionMailer::Base.deliveries.find { |m| m.to == [ @user.identity.email_address ] }
++    mike_email = ActionMailer::Base.deliveries.find { |m| m.to == [ mike.identity.email_address ] }
++
++    assert_includes david_email.text_part.body.decoded, @user.account.slug
++    assert_includes mike_email.text_part.body.decoded, initech.slug
++  end
++
++  test "read and unread toggles do not re-bundle or open new bundles" do
++    start_time = Time.utc(2025, 1, 15, 10, 0, 0)
++
++    travel_to start_time
++    notification = create_notification_for(@user, events(:layout_published))
++    bundle = notification.bundle
++
++    travel_to start_time + 4.hours
++    perform_enqueued_jobs { Notification::Bundle.deliver_all_later }
++    assert bundle.reload.delivered?
++
++    travel_to start_time + 5.hours
++    notification.read
++    notification.unread
++    assert_equal 1, @user.notification_bundles.count
++    assert_equal bundle, notification.reload.bundle
++  end
++
++test "end-to-end flow from event through DeliverAllJob delivers one digest email per window" do
++  start_time = Time.utc(2025, 1, 15, 10, 0, 0)
++  cards(:layout).watch_by(@user)
++  cards(:text).watch_by(@user)
++
++  travel_to start_time
++  perform_enqueued_jobs do
++    Current.set(user: users(:kevin)) do
++      cards(:layout).comments.create!(creator: users(:kevin), body: "First comment")
++    end
++  end
++
++  travel_to start_time + 2.hours
++  perform_enqueued_jobs do
++    Current.set(user: users(:kevin)) do
++      cards(:text).comments.create!(creator: users(:kevin), body: "Second comment")
++    end
++  end
++
++  assert_equal 1, @user.notification_bundles.count
++
++  travel_to start_time + 4.hours
++  assert_emails 1 do
++    perform_enqueued_jobs do
++      Notification::Bundle::DeliverAllJob.perform_later
++    end
++  end
++
++  email = ActionMailer::Base.deliveries.last
++  assert_equal [ @user.identity.email_address ], email.to
++  assert_includes email.text_part.body.decoded, "First comment"
++  assert_includes email.text_part.body.decoded, "Second comment"
++end
++
++  private
++    def create_notification_for(user, source, **attributes)
++      Notification.create!(
++        user: user,
++        source: source,
++        creator: users(:kevin),
++        **attributes
++      )
++    end
++end
+diff --git a/test/models/user/settings_test.rb b/test/models/user/settings_test.rb
+new file mode 100644
+index 0000000..1a7ad10
+--- /dev/null
++++ b/test/models/user/settings_test.rb
+@@ -0,0 +1,104 @@
++require "test_helper"
++
++class User::SettingsTest < ActiveSupport::TestCase
++  setup do
++    @user = users(:david)
++    @settings = @user.settings
++  end
++
++  test "bundle_email_frequency defaults to every_few_hours" do
++    user = User.create!(account: accounts("37s"), name: "New User")
++    assert_equal "every_few_hours", user.settings.bundle_email_frequency
++    assert user.settings.bundle_email_every_few_hours?
++    assert user.settings.bundling_emails?
++    assert_equal 4.hours, user.settings.bundling_period
++  end
++
++  test "supports all four bundle_email_frequency options" do
++    @settings.update!(bundle_email_frequency: :never)
++    assert_equal "never", @settings.bundle_email_frequency
++    assert_not @settings.bundling_emails?
++    assert_nil @settings.bundling_period
++
++    @settings.update!(bundle_email_frequency: :every_few_hours)
++    assert_equal "every_few_hours", @settings.bundle_email_frequency
++    assert @settings.bundling_emails?
++    assert_equal 4.hours, @settings.bundling_period
++
++    @settings.update!(bundle_email_frequency: :daily)
++    assert_equal "daily", @settings.bundle_email_frequency
++    assert @settings.bundling_emails?
++    assert_equal 1.day, @settings.bundling_period
++
++    @settings.update!(bundle_email_frequency: :weekly)
++    assert_equal "weekly", @settings.bundle_email_frequency
++    assert @settings.bundling_emails?
++    assert_equal 1.week, @settings.bundling_period
++  end
++
++  test "rejects invalid bundle_email_frequency values" do
++    @settings.bundle_email_frequency = "hourly"
++    assert_not @settings.valid?
++    assert_includes @settings.errors[:bundle_email_frequency], "is not included in the list"
++  end
++
++  test "switching frequency to never destroys pending bundles and nullifies notification bundle_id" do
++    travel_to Time.utc(2025, 1, 15, 10, 0, 0) do
++      notification = Notification.create!(user: @user, source: events(:layout_published), creator: users(:kevin))
++      bundle = notification.bundle
++      assert_not_nil bundle
++      assert bundle.pending?
++
++      @settings.update!(bundle_email_frequency: :never)
++
++      assert_not Notification::Bundle.exists?(bundle.id)
++      assert_nil notification.reload.bundle_id
++    end
++  end
++
++  test "switching frequency to never preserves already delivered bundles" do
++    travel_to Time.utc(2025, 1, 15, 10, 0, 0) do
++      delivered_bundle = @user.notification_bundles.create!(
++        starts_at: 8.hours.ago,
++        ends_at: 4.hours.ago,
++        status: :delivered
++      )
++      pending_bundle = @user.notification_bundles.create!(
++        starts_at: Time.current,
++        ends_at: 4.hours.from_now,
++        status: :pending
++      )
++
++      @settings.update!(bundle_email_frequency: :never)
++
++      assert Notification::Bundle.exists?(delivered_bundle.id)
++      assert_not Notification::Bundle.exists?(pending_bundle.id)
++    end
++  end
++
++  test "changing frequency adjusts ends_at of open pending bundle without touching ended or delivered bundles" do
++    travel_to Time.utc(2025, 1, 15, 10, 0, 0) do
++      delivered_bundle = @user.notification_bundles.create!(
++        starts_at: 10.hours.ago,
++        ends_at: 6.hours.ago,
++        status: :delivered
++      )
++      ended_pending_bundle = @user.notification_bundles.create!(
++        starts_at: 5.hours.ago,
++        ends_at: 1.hour.ago,
++        status: :pending
++      )
++      open_bundle = @user.notification_bundles.create!(
++        starts_at: Time.current,
++        ends_at: 4.hours.from_now,
++        status: :pending
++      )
++
++      @settings.update!(bundle_email_frequency: :daily)
++
++      assert_equal Time.utc(2025, 1, 15, 4, 0, 0), delivered_bundle.reload.ends_at
++      assert_equal Time.utc(2025, 1, 15, 9, 0, 0), ended_pending_bundle.reload.ends_at
++      assert_equal Time.utc(2025, 1, 16, 10, 0, 0), open_bundle.reload.ends_at
++    end
++  end
++end

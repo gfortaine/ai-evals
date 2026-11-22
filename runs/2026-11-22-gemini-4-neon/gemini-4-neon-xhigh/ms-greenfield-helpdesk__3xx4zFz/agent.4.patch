@@ -1,0 +1,974 @@
+diff --git a/app/controllers/api/v1/requests_controller.rb b/app/controllers/api/v1/requests_controller.rb
+index 395d5b1..88614f3 100644
+--- a/app/controllers/api/v1/requests_controller.rb
++++ b/app/controllers/api/v1/requests_controller.rb
+@@ -5,8 +5,11 @@ module Api
+       before_action :require_active_account!
+ 
+       def index
+-        scope = customer_requests_scope.public_recently_active
+-        payload = paginate_collection(scope, key: :requests) { |ticket| serialize_request(ticket) }
++        base_scope = customer_requests_scope.public_recently_active
++        result = TicketFilter.new(scope: base_scope, params: params, mode: :customer).call
++        return render_validation_errors(result.errors) unless result.success?
++
++        payload = paginate_collection(result.scope, key: :requests) { |ticket| serialize_request(ticket) }
+         render json: payload, status: :ok
+       end
+ 
+diff --git a/app/controllers/api/v1/tickets_controller.rb b/app/controllers/api/v1/tickets_controller.rb
+index f05ae03..87d5728 100644
+--- a/app/controllers/api/v1/tickets_controller.rb
++++ b/app/controllers/api/v1/tickets_controller.rb
+@@ -6,8 +6,11 @@ module Api
+       before_action :require_staff!
+ 
+       def index
+-        scope = current_account.tickets.recently_active.includes(:requester, :assignee)
+-        payload = paginate_collection(scope, key: :tickets) { |ticket| serialize_ticket(ticket) }
++        base_scope = current_account.tickets.recently_active.includes(:requester, :assignee)
++        result = TicketFilter.new(scope: base_scope, params: params, mode: :staff).call
++        return render_validation_errors(result.errors) unless result.success?
++
++        payload = paginate_collection(result.scope, key: :tickets) { |ticket| serialize_ticket(ticket) }
+         render json: payload, status: :ok
+       end
+ 
+@@ -24,6 +27,9 @@ module Api
+         status_provided = ticket_envelope.key?(:status)
+         status_value = status_provided ? ticket_envelope.permit(:status)[:status] : nil
+ 
++        priority_provided = ticket_envelope.key?(:priority)
++        priority_value = priority_provided ? ticket_envelope.permit(:priority)[:priority] : nil
++
+         assignee_id_provided = ticket_envelope.key?(:assignee_id)
+         assignee_id_value = assignee_id_provided ? ticket_envelope[:assignee_id] : nil
+ 
+@@ -42,6 +48,8 @@ module Api
+           comment_public: comment_public,
+           status_provided: status_provided,
+           status: status_value,
++          priority_provided: priority_provided,
++          priority: priority_value,
+           assignee_id_provided: assignee_id_provided,
+           assignee_id: assignee_id_value
+         ).call
+diff --git a/app/controllers/concerns/api_v1_serializers.rb b/app/controllers/concerns/api_v1_serializers.rb
+index 7a92d70..3694f86 100644
+--- a/app/controllers/concerns/api_v1_serializers.rb
++++ b/app/controllers/concerns/api_v1_serializers.rb
+@@ -110,6 +110,7 @@ module ApiV1Serializers
+       id: ticket.id,
+       subject: ticket.subject,
+       status: ticket.status,
++      priority: ticket.priority,
+       requester_id: ticket.requester_id,
+       requester: {
+         id: requester.id,
+diff --git a/app/models/ticket.rb b/app/models/ticket.rb
+index 5748f7c..3381e1f 100644
+--- a/app/models/ticket.rb
++++ b/app/models/ticket.rb
+@@ -1,5 +1,6 @@
+ class Ticket < ApplicationRecord
+   STATUSES = %w[open pending solved].freeze
++  PRIORITIES = %w[normal high].freeze
+ 
+   belongs_to :account
+   belongs_to :requester, class_name: "User", inverse_of: :requested_tickets
+@@ -10,6 +11,7 @@ class Ticket < ApplicationRecord
+ 
+   validates :subject, presence: true, length: { maximum: 255 }
+   validates :status, presence: true, inclusion: { in: STATUSES }
++  validates :priority, presence: true, inclusion: { in: PRIORITIES }
+   validate :requester_belongs_to_account
+   validate :assignee_must_be_active_staff_in_account, if: -> { assignee_id.present? && (new_record? || will_save_change_to_assignee_id?) }
+ 
+@@ -19,6 +21,30 @@ class Ticket < ApplicationRecord
+   scope :recently_active, -> { order(updated_at: :desc, id: :desc) }
+   scope :public_recently_active, -> { order(public_updated_at: :desc, id: :desc) }
+   scope :for_requester, ->(user) { where(requester_id: user.id) }
++  scope :with_status, ->(status) { where(status: status) }
++  scope :with_priority, ->(priority) { where(priority: priority) }
++  scope :unassigned, -> { where(assignee_id: nil) }
++  scope :assigned_to, ->(user_id) { where(assignee_id: user_id) }
++  scope :requested_by, ->(user_id) { where(requester_id: user_id) }
++  scope :search_text, ->(query) {
++    return none if !query.is_a?(String) || query.include?("\x00") || !query.valid_encoding?
++
++    pattern = "%#{sanitize_sql_like(query)}%"
++    where(
++      <<~SQL.squish,
++        tickets.subject ILIKE :pattern ESCAPE '\\'
++        OR EXISTS (
++          SELECT 1
++          FROM ticket_comments
++          WHERE ticket_comments.ticket_id = tickets.id
++            AND ticket_comments.account_id = tickets.account_id
++            AND ticket_comments.public = TRUE
++            AND ticket_comments.body ILIKE :pattern ESCAPE '\\'
++        )
++      SQL
++      pattern: pattern
++    )
++  }
+ 
+   def open?
+     status == "open"
+@@ -32,6 +58,14 @@ class Ticket < ApplicationRecord
+     status == "solved"
+   end
+ 
++  def normal_priority?
++    priority == "normal"
++  end
++
++  def high_priority?
++    priority == "high"
++  end
++
+   private
+ 
+   def set_initial_public_updated_at
+diff --git a/app/services/ticket_filter.rb b/app/services/ticket_filter.rb
+new file mode 100644
+index 0000000..fc89cb8
+--- /dev/null
++++ b/app/services/ticket_filter.rb
+@@ -0,0 +1,116 @@
++class TicketFilter
++  MAX_BIGINT = (1 << 63) - 1
++  POSITIVE_INTEGER_FORMAT = /\A[1-9]\d*\z/
++
++  Result = Struct.new(:success?, :scope, :errors, keyword_init: true)
++
++  def initialize(scope:, params:, mode:)
++    @scope = scope
++    @params = params
++    @mode = mode
++  end
++
++  def call
++    scope = @scope
++    errors = {}
++
++    case @mode
++    when :staff
++      scope = apply_status(scope, errors)
++      scope = apply_priority(scope, errors)
++      scope = apply_assignee(scope, errors)
++      scope = apply_requester(scope, errors)
++      scope = apply_search(scope, errors)
++    when :customer
++      scope = apply_status(scope, errors)
++    else
++      raise ArgumentError, "Unknown filter mode: #{@mode.inspect}"
++    end
++
++    if errors.any?
++      Result.new(success?: false, scope: @scope.none, errors: errors)
++    else
++      Result.new(success?: true, scope: scope, errors: {})
++    end
++  end
++
++  private
++
++  def apply_status(scope, errors)
++    raw = @params[:status]
++    return scope unless raw.present?
++
++    status = raw.is_a?(String) ? raw.strip.downcase : nil
++    if Ticket::STATUSES.include?(status)
++      scope.with_status(status)
++    else
++      errors["status"] = [ "Status must be one of: #{Ticket::STATUSES.join(', ')}" ]
++      scope
++    end
++  end
++
++  def apply_priority(scope, errors)
++    raw = @params[:priority]
++    return scope unless raw.present?
++
++    priority = raw.is_a?(String) ? raw.strip.downcase : nil
++    if Ticket::PRIORITIES.include?(priority)
++      scope.with_priority(priority)
++    else
++      errors["priority"] = [ "Priority must be one of: #{Ticket::PRIORITIES.join(', ')}" ]
++      scope
++    end
++  end
++
++  def apply_assignee(scope, errors)
++    raw = @params[:assignee_id]
++    return scope unless raw.present?
++
++    value = raw.is_a?(String) ? raw.strip.downcase : nil
++    if value == "unassigned"
++      scope.unassigned
++    elsif (id = parse_positive_bigint(value))
++      scope.assigned_to(id)
++    else
++      errors["assignee_id"] = [ "Assignee must be a valid user ID or unassigned" ]
++      scope
++    end
++  end
++
++  def apply_requester(scope, errors)
++    raw = @params[:requester_id]
++    return scope unless raw.present?
++
++    value = raw.is_a?(String) ? raw.strip : nil
++    if (id = parse_positive_bigint(value))
++      scope.requested_by(id)
++    else
++      errors["requester_id"] = [ "Requester must be a valid user ID" ]
++      scope
++    end
++  end
++
++  def apply_search(scope, errors)
++    raw = @params[:q]
++    return scope unless raw.present?
++
++    unless raw.is_a?(String)
++      errors["q"] = [ "Query must be a string" ]
++      return scope
++    end
++
++    query = raw.strip
++    return scope if query.blank?
++
++    scope.search_text(query)
++  end
++
++  def parse_positive_bigint(value)
++    return nil unless value.is_a?(String) && POSITIVE_INTEGER_FORMAT.match?(value)
++
++    parsed = Integer(value, 10)
++    parsed <= MAX_BIGINT ? parsed : nil
++  rescue ArgumentError
++    nil
++  end
++end
+diff --git a/app/services/ticket_updater.rb b/app/services/ticket_updater.rb
+index 5dd54e6..5559b49 100644
+--- a/app/services/ticket_updater.rb
++++ b/app/services/ticket_updater.rb
+@@ -11,6 +11,8 @@ class TicketUpdater
+     comment_public: true,
+     status_provided: false,
+     status: nil,
++    priority_provided: false,
++    priority: nil,
+     assignee_id_provided: false,
+     assignee_id: nil,
+     solved_provided: false,
+@@ -24,6 +26,8 @@ class TicketUpdater
+     @comment_public = comment_public
+     @status_provided = status_provided
+     @status = status
++    @priority_provided = priority_provided
++    @priority = priority
+     @assignee_id_provided = assignee_id_provided
+     @assignee_id = assignee_id
+     @solved_provided = solved_provided
+@@ -75,11 +79,12 @@ class TicketUpdater
+   def validate_and_apply_staff_changes
+     errors = {}
+ 
+-    unless @comment_provided || @status_provided || @assignee_id_provided
+-      return { base: [ "Provide a comment, status, or assignee_id to update" ] }
++    unless @comment_provided || @status_provided || @priority_provided || @assignee_id_provided
++      return { base: [ "Provide a comment, status, priority, or assignee_id to update" ] }
+     end
+ 
+     @ticket.status = @status if @status_provided
++    @ticket.priority = @priority if @priority_provided
+ 
+     if @assignee_id_provided
+       if @assignee_id.nil?
+diff --git a/db/migrate/20261122000004_add_priority_to_tickets.rb b/db/migrate/20261122000004_add_priority_to_tickets.rb
+new file mode 100644
+index 0000000..bbb3cf1
+--- /dev/null
++++ b/db/migrate/20261122000004_add_priority_to_tickets.rb
+@@ -0,0 +1,6 @@
++class AddPriorityToTickets < ActiveRecord::Migration[8.1]
++  def change
++    add_column :tickets, :priority, :string, null: false, default: "normal"
++    add_index :tickets, [ :account_id, :priority ]
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 44d1b6b..9c338be 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.1].define(version: 2026_11_22_000003) do
++ActiveRecord::Schema[8.1].define(version: 2026_11_22_000004) do
+   # These are extensions that must be enabled in order to support this database
+   enable_extension "pg_catalog.plpgsql"
+ 
+@@ -85,7 +85,9 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_22_000003) do
+     t.datetime "updated_at", null: false
+     t.bigint "assignee_id"
+     t.datetime "public_updated_at", null: false
++    t.string "priority", default: "normal", null: false
+     t.index ["account_id", "assignee_id"], name: "index_tickets_on_account_id_and_assignee_id"
++    t.index ["account_id", "priority"], name: "index_tickets_on_account_id_and_priority"
+     t.index ["account_id", "requester_id", "public_updated_at", "id"], name: "index_tickets_on_acct_requester_pub_updated_id"
+     t.index ["account_id", "requester_id", "updated_at", "id"], name: "idx_on_account_id_requester_id_updated_at_id_ba73f495e1"
+     t.index ["account_id", "status"], name: "index_tickets_on_account_id_and_status"
+diff --git a/test/integration/ticket_priority_filtering_and_search_test.rb b/test/integration/ticket_priority_filtering_and_search_test.rb
+new file mode 100644
+index 0000000..0a769e1
+--- /dev/null
++++ b/test/integration/ticket_priority_filtering_and_search_test.rb
+@@ -0,0 +1,584 @@
++require "test_helper"
++
++class TicketPriorityFilteringAndSearchTest < ActionDispatch::IntegrationTest
++  setup do
++    @acme_signup = signup_and_verify!(
++      name: "Acme",
++      subdomain: "acme",
++      admin_name: "Jo",
++      email: "jo@acme.test",
++      password: "my-first-password"
++    )
++    @owner_id = @acme_signup.dig("user", "id")
++    @owner_token = sign_in!(subdomain: "acme", email: "jo@acme.test", password: "my-first-password").dig("session", "token")
++
++    post "/api/v1/invitations",
++         params: { invitation: { email: "sam@acme.test", role: "agent" } },
++         headers: json_headers(account: "acme", token: @owner_token),
++         as: :json
++    assert_response :created
++    _u, _a, sam_inv_token = extract_token_from_mail(ActionMailer::Base.deliveries.last, path: "/accept-invitation")
++    post "/api/v1/invitation_acceptances",
++         params: { invitation_acceptance: { token: sam_inv_token, name: "Sam", password: "sam-password-1" } },
++         headers: json_headers(account: "acme"),
++         as: :json
++    assert_response :created
++    @agent_id = json_body.dig("user", "id")
++    @agent_token = sign_in!(subdomain: "acme", email: "sam@acme.test", password: "sam-password-1").dig("session", "token")
++
++    @avery_data = register_and_verify_customer!(subdomain: "acme", name: "Avery", email: "avery@example.test", password: "avery-password-1")
++    @avery_id = @avery_data.dig("user", "id")
++    @avery_token = sign_in!(subdomain: "acme", email: "avery@example.test", password: "avery-password-1").dig("session", "token")
++
++    @blake_data = register_and_verify_customer!(subdomain: "acme", name: "Blake", email: "blake@example.test", password: "blake-password-1")
++    @blake_id = @blake_data.dig("user", "id")
++    @blake_token = sign_in!(subdomain: "acme", email: "blake@example.test", password: "blake-password-1").dig("session", "token")
++
++    @globex_signup = signup_and_verify!(
++      name: "Globex",
++      subdomain: "globex",
++      admin_name: "Pat",
++      email: "pat@globex.test",
++      password: "globex-password-1"
++    )
++    @globex_owner_id = @globex_signup.dig("user", "id")
++    @globex_owner_token = sign_in!(subdomain: "globex", email: "pat@globex.test", password: "globex-password-1").dig("session", "token")
++
++    @casey_data = register_and_verify_customer!(subdomain: "globex", name: "Casey", email: "casey@example.test", password: "casey-password-1")
++    @casey_id = @casey_data.dig("user", "id")
++    @casey_token = sign_in!(subdomain: "globex", email: "casey@example.test", password: "casey-password-1").dig("session", "token")
++
++    ActionMailer::Base.deliveries.clear
++  end
++
++  def create_request(subdomain:, token:, subject:, body:, extra: {})
++    post "/api/v1/requests",
++         params: { request: { subject: subject, comment: { body: body } }.merge(extra) },
++         headers: json_headers(account: subdomain, token: token),
++         as: :json
++    assert_response :created
++    json_body["request"]
++  end
++
++  test "tickets default to normal priority, staff can update priority atomically, and priority stays internal" do
++    req_a = nil
++    req_b = nil
++
++    # Customer tries to pass priority: high on create -> ignored, ticket defaults to normal, response omits priority
++    travel_to Time.zone.parse("2026-11-22 10:00:00 UTC") do
++      req_a = create_request(
++        subdomain: "acme",
++        token: @avery_token,
++        subject: "First request",
++        body: "Initial details",
++        extra: { priority: "high" }
++      )
++      assert_not req_a.key?("priority")
++    end
++
++    travel_to Time.zone.parse("2026-11-22 10:05:00 UTC") do
++      req_b = create_request(
++        subdomain: "acme",
++        token: @avery_token,
++        subject: "Second request",
++        body: "More details"
++      )
++      assert_not req_b.key?("priority")
++    end
++
++    # Staff sees default normal priority on index and show
++    get "/api/v1/tickets", headers: json_headers(account: "acme", token: @owner_token)
++    assert_response :ok
++    assert_equal %w[normal normal], json_body["tickets"].map { |t| t["priority"] }
++
++    get "/api/v1/tickets/#{req_a["id"]}", headers: json_headers(account: "acme", token: @agent_token)
++    assert_response :ok
++    assert_equal "normal", json_body.dig("ticket", "priority")
++
++    # Customer cannot set priority alone (422) or alongside a comment (ignored)
++    patch "/api/v1/requests/#{req_a["id"]}",
++          params: { request: { priority: "high" } },
++          headers: json_headers(account: "acme", token: @avery_token),
++          as: :json
++    assert_response :unprocessable_content
++    assert_equal "normal", Ticket.find(req_a["id"]).priority
++
++    travel_to Time.zone.parse("2026-11-22 10:06:00 UTC") do
++      patch "/api/v1/requests/#{req_a["id"]}",
++            params: { request: { priority: "high", comment: { body: "Customer follow-up" } } },
++            headers: json_headers(account: "acme", token: @avery_token),
++            as: :json
++      assert_response :ok
++      assert_not json_body["request"].key?("priority")
++      assert_equal "normal", Ticket.find(req_a["id"]).priority
++      req_a = json_body["request"]
++    end
++
++    # Ensure req_b is at top of customer list before staff changes priority on req_a
++    travel_to Time.zone.parse("2026-11-22 10:08:00 UTC") do
++      patch "/api/v1/requests/#{req_b["id"]}",
++            params: { request: { comment: { body: "Bump B" } } },
++            headers: json_headers(account: "acme", token: @avery_token),
++            as: :json
++      assert_response :ok
++      req_b = json_body["request"]
++    end
++
++    # Agent updates req_a priority to high at 10:15 -> staff sees high + updated_at=10:15 + A at top,
++    # customer sees NO priority key, NO updated_at bump, and B still at top!
++    travel_to Time.zone.parse("2026-11-22 10:15:00 UTC") do
++      patch "/api/v1/tickets/#{req_a["id"]}",
++            params: { ticket: { priority: "high" } },
++            headers: json_headers(account: "acme", token: @agent_token),
++            as: :json
++      assert_response :ok
++      assert_equal "high", json_body.dig("ticket", "priority")
++      assert_equal Time.zone.parse("2026-11-22 10:15:00 UTC").iso8601(3), json_body.dig("ticket", "updated_at")
++    end
++
++    get "/api/v1/tickets", headers: json_headers(account: "acme", token: @owner_token)
++    assert_response :ok
++    assert_equal [ req_a["id"], req_b["id"] ], json_body["tickets"].map { |t| t["id"] }
++    assert_equal %w[high normal], json_body["tickets"].map { |t| t["priority"] }
++
++    get "/api/v1/requests", headers: json_headers(account: "acme", token: @avery_token)
++    assert_response :ok
++    assert_equal [ req_b["id"], req_a["id"] ], json_body["requests"].map { |r| r["id"] }
++    json_body["requests"].each { |r| assert_not r.key?("priority") }
++
++    get "/api/v1/requests/#{req_a["id"]}", headers: json_headers(account: "acme", token: @avery_token)
++    assert_response :ok
++    assert_equal req_a, json_body["request"]
++    assert_not json_body["request"].key?("priority")
++
++    # Admin combines priority, status, assignee_id, and private note in one PATCH
++    travel_to Time.zone.parse("2026-11-22 10:20:00 UTC") do
++      patch "/api/v1/tickets/#{req_a["id"]}",
++            params: {
++              ticket: {
++                priority: "normal",
++                status: "pending",
++                assignee_id: @agent_id,
++                comment: { body: "Downgrading internally", public: false }
++              }
++            },
++            headers: json_headers(account: "acme", token: @owner_token),
++            as: :json
++      assert_response :ok
++      assert_equal "normal", json_body.dig("ticket", "priority")
++      assert_equal "pending", json_body.dig("ticket", "status")
++      assert_equal @agent_id, json_body.dig("ticket", "assignee_id")
++    end
++
++    # Invalid priority values are rejected with 422 and roll back atomically
++    assert_no_difference "TicketComment.count" do
++      [ "urgent", "low", "HIGH", "", "   ", nil, 123, true, false, [ "high" ], { value: "high" } ].each do |bad_priority|
++        patch "/api/v1/tickets/#{req_a["id"]}",
++              params: {
++                ticket: {
++                  priority: bad_priority,
++                  status: "solved",
++                  comment: { body: "Should roll back" }
++                }
++              },
++              headers: json_headers(account: "acme", token: @owner_token),
++              as: :json
++        assert_response :unprocessable_content, "Expected 422 for priority=#{bad_priority.inspect}"
++        assert_equal "normal", Ticket.find(req_a["id"]).priority
++        assert_equal "pending", Ticket.find(req_a["id"]).status
++      end
++
++      # Valid priority paired with invalid status rolls back priority
++      patch "/api/v1/tickets/#{req_a["id"]}",
++            params: { ticket: { priority: "high", status: "bogus" } },
++            headers: json_headers(account: "acme", token: @owner_token),
++            as: :json
++      assert_response :unprocessable_content
++      assert_equal "normal", Ticket.find(req_a["id"]).priority
++
++      # Valid priority paired with invalid assignee rolls back priority
++      patch "/api/v1/tickets/#{req_a["id"]}",
++            params: { ticket: { priority: "high", assignee_id: @avery_id } },
++            headers: json_headers(account: "acme", token: @owner_token),
++            as: :json
++      assert_response :unprocessable_content
++      assert_equal "normal", Ticket.find(req_a["id"]).priority
++    end
++
++    # Customer cannot access staff ticket endpoints
++    patch "/api/v1/tickets/#{req_a["id"]}",
++          params: { ticket: { priority: "high" } },
++          headers: json_headers(account: "acme", token: @avery_token),
++          as: :json
++    assert_response :forbidden
++  end
++
++  test "staff can combine status, assignee_id, requester_id, priority, and q filters with pagination" do
++    t1 = t2 = t3 = t4 = t5 = globex_t = nil
++
++    travel_to Time.zone.parse("2026-11-22 10:00:00 UTC") do
++      t1 = create_request(subdomain: "acme", token: @avery_token, subject: "Cannot download my RECEIPT", body: "Button broken")
++    end
++    travel_to Time.zone.parse("2026-11-22 10:01:00 UTC") do
++      t2 = create_request(subdomain: "acme", token: @avery_token, subject: "Billing question", body: "Please resend my receipt PDF")
++    end
++    travel_to Time.zone.parse("2026-11-22 10:02:00 UTC") do
++      t3 = create_request(subdomain: "acme", token: @blake_token, subject: "Refund for receipt #42", body: "Double charge")
++    end
++    travel_to Time.zone.parse("2026-11-22 10:03:00 UTC") do
++      t4 = create_request(subdomain: "acme", token: @blake_token, subject: "Login problem", body: "Cannot sign in")
++    end
++    travel_to Time.zone.parse("2026-11-22 10:04:00 UTC") do
++      t5 = create_request(subdomain: "acme", token: @avery_token, subject: "Export issue", body: "CSV is empty")
++    end
++    travel_to Time.zone.parse("2026-11-22 10:04:30 UTC") do
++      globex_t = create_request(subdomain: "globex", token: @casey_token, subject: "Globex receipt urgent", body: "Need receipt")
++      patch "/api/v1/tickets/#{globex_t["id"]}",
++            params: { ticket: { priority: "high" } },
++            headers: json_headers(account: "globex", token: @globex_owner_token),
++            as: :json
++      assert_response :ok
++    end
++
++    # Configure distinct combinations:
++    # t1: open,   unassigned, high,   Avery, subject has "RECEIPT"
++    # t2: open,   unassigned, high,   Avery, public comment has "receipt" (and another public comment with "receipt")
++    # t3: pending, Sam,       high,   Blake, subject has "receipt"
++    # t4: solved,  Jo,        normal, Blake, private note has "receipt" (must NOT match q=receipt!)
++    # t5: open,   unassigned, normal, Avery, no receipt
++    travel_to Time.zone.parse("2026-11-22 10:10:00 UTC") do
++      patch "/api/v1/tickets/#{t1["id"]}",
++            params: { ticket: { priority: "high" } },
++            headers: json_headers(account: "acme", token: @owner_token),
++            as: :json
++      assert_response :ok
++    end
++
++    travel_to Time.zone.parse("2026-11-22 10:11:00 UTC") do
++      patch "/api/v1/tickets/#{t2["id"]}",
++            params: { ticket: { priority: "high", comment: { body: "Second public receipt mention", public: true } } },
++            headers: json_headers(account: "acme", token: @owner_token),
++            as: :json
++      assert_response :ok
++    end
++
++    travel_to Time.zone.parse("2026-11-22 10:12:00 UTC") do
++      patch "/api/v1/tickets/#{t3["id"]}",
++            params: { ticket: { status: "pending", priority: "high", assignee_id: @agent_id } },
++            headers: json_headers(account: "acme", token: @owner_token),
++            as: :json
++      assert_response :ok
++    end
++
++    travel_to Time.zone.parse("2026-11-22 10:13:00 UTC") do
++      patch "/api/v1/tickets/#{t4["id"]}",
++            params: {
++              ticket: {
++                status: "solved",
++                assignee_id: @owner_id,
++                comment: { body: "Internal receipt check only", public: false }
++              }
++            },
++            headers: json_headers(account: "acme", token: @owner_token),
++            as: :json
++      assert_response :ok
++    end
++
++    # Single filters
++    get "/api/v1/tickets?status=open", headers: json_headers(account: "acme", token: @agent_token)
++    assert_response :ok
++    assert_equal 3, json_body["count"]
++    assert_equal [ t2["id"], t1["id"], t5["id"] ], json_body["tickets"].map { |t| t["id"] }
++
++    get "/api/v1/tickets?status=PENDING", headers: json_headers(account: "acme", token: @agent_token)
++    assert_response :ok
++    assert_equal [ t3["id"] ], json_body["tickets"].map { |t| t["id"] }
++
++    get "/api/v1/tickets?status=solved", headers: json_headers(account: "acme", token: @agent_token)
++    assert_response :ok
++    assert_equal [ t4["id"] ], json_body["tickets"].map { |t| t["id"] }
++
++    get "/api/v1/tickets?priority=high", headers: json_headers(account: "acme", token: @owner_token)
++    assert_response :ok
++    assert_equal 3, json_body["count"]
++    assert_equal [ t3["id"], t2["id"], t1["id"] ], json_body["tickets"].map { |t| t["id"] }
++
++    get "/api/v1/tickets?priority=normal", headers: json_headers(account: "acme", token: @owner_token)
++    assert_response :ok
++    assert_equal [ t4["id"], t5["id"] ], json_body["tickets"].map { |t| t["id"] }
++
++    get "/api/v1/tickets?assignee_id=unassigned", headers: json_headers(account: "acme", token: @owner_token)
++    assert_response :ok
++    assert_equal 3, json_body["count"]
++    assert_equal [ t2["id"], t1["id"], t5["id"] ], json_body["tickets"].map { |t| t["id"] }
++
++    get "/api/v1/tickets?assignee_id=#{@agent_id}", headers: json_headers(account: "acme", token: @owner_token)
++    assert_response :ok
++    assert_equal [ t3["id"] ], json_body["tickets"].map { |t| t["id"] }
++
++    get "/api/v1/tickets?assignee_id=#{@owner_id}", headers: json_headers(account: "acme", token: @agent_token)
++    assert_response :ok
++    assert_equal [ t4["id"] ], json_body["tickets"].map { |t| t["id"] }
++
++    get "/api/v1/tickets?requester_id=#{@avery_id}", headers: json_headers(account: "acme", token: @owner_token)
++    assert_response :ok
++    assert_equal [ t2["id"], t1["id"], t5["id"] ], json_body["tickets"].map { |t| t["id"] }
++
++    get "/api/v1/tickets?requester_id=#{@blake_id}", headers: json_headers(account: "acme", token: @owner_token)
++    assert_response :ok
++    assert_equal [ t4["id"], t3["id"] ], json_body["tickets"].map { |t| t["id"] }
++
++    # Search q matches subject + public comments case-insensitively, excludes private notes, returns no duplicates
++    get "/api/v1/tickets?q=receipt", headers: json_headers(account: "acme", token: @owner_token)
++    assert_response :ok
++    assert_equal 3, json_body["count"]
++    assert_equal [ t3["id"], t2["id"], t1["id"] ], json_body["tickets"].map { |t| t["id"] }
++
++    # Requester name does not match q unless present in subject or public comments
++    get "/api/v1/tickets?q=Blake", headers: json_headers(account: "acme", token: @owner_token)
++    assert_response :ok
++    assert_equal 0, json_body["count"]
++    assert_equal [], json_body["tickets"]
++
++    # Exact combined query from spec: status=open&assignee_id=unassigned&priority=high&q=receipt
++    get "/api/v1/tickets?status=open&assignee_id=unassigned&priority=high&q=receipt",
++        headers: json_headers(account: "acme", token: @agent_token)
++    assert_response :ok
++    assert_equal 2, json_body["count"]
++    assert_equal [ t2["id"], t1["id"] ], json_body["tickets"].map { |t| t["id"] }
++
++    # Pagination on combined query
++    get "/api/v1/tickets?status=open&assignee_id=unassigned&priority=high&q=receipt&page=1&per_page=1",
++        headers: json_headers(account: "acme", token: @agent_token)
++    assert_response :ok
++    assert_equal 2, json_body["count"]
++    assert_equal 2, json_body["next_page"]
++    assert_nil json_body["previous_page"]
++    assert_equal [ t2["id"] ], json_body["tickets"].map { |t| t["id"] }
++
++    get "/api/v1/tickets?status=open&assignee_id=unassigned&priority=high&q=receipt&page=2&per_page=1",
++        headers: json_headers(account: "acme", token: @agent_token)
++    assert_response :ok
++    assert_equal 2, json_body["count"]
++    assert_nil json_body["next_page"]
++    assert_equal 1, json_body["previous_page"]
++    assert_equal [ t1["id"] ], json_body["tickets"].map { |t| t["id"] }
++
++    # Combining all 5 filters
++    get "/api/v1/tickets?status=pending&assignee_id=#{@agent_id}&requester_id=#{@blake_id}&priority=high&q=REFUND",
++        headers: json_headers(account: "acme", token: @owner_token)
++    assert_response :ok
++    assert_equal 1, json_body["count"]
++    assert_equal [ t3["id"] ], json_body["tickets"].map { |t| t["id"] }
++
++    # Blank filter params are ignored
++    get "/api/v1/tickets?status=&priority=&assignee_id=&requester_id=&q=%20%20",
++        headers: json_headers(account: "acme", token: @owner_token)
++    assert_response :ok
++    assert_equal 5, json_body["count"]
++
++    # Non-matching valid IDs and cross-tenant IDs return 200 empty (never leak Globex tickets)
++    [
++      "/api/v1/tickets?assignee_id=999999",
++      "/api/v1/tickets?requester_id=999999",
++      "/api/v1/tickets?assignee_id=#{@avery_id}",
++      "/api/v1/tickets?assignee_id=#{@globex_owner_id}",
++      "/api/v1/tickets?requester_id=#{@casey_id}",
++      "/api/v1/tickets?q=Globex"
++    ].each do |path|
++      get path, headers: json_headers(account: "acme", token: @owner_token)
++      assert_response :ok, "Expected 200 for #{path}"
++      assert_equal 0, json_body["count"], "Expected 0 results for #{path}"
++      assert_equal [], json_body["tickets"]
++    end
++
++    # Suspending Sam clears t3's assignment so t3 appears under assignee_id=unassigned
++    patch "/api/v1/users/#{@agent_id}",
++          params: { user: { suspended: true } },
++          headers: json_headers(account: "acme", token: @owner_token),
++          as: :json
++    assert_response :ok
++
++    get "/api/v1/tickets?assignee_id=#{@agent_id}", headers: json_headers(account: "acme", token: @owner_token)
++    assert_response :ok
++    assert_equal [], json_body["tickets"]
++
++    get "/api/v1/tickets?status=pending&assignee_id=unassigned&priority=high", headers: json_headers(account: "acme", token: @owner_token)
++    assert_response :ok
++    assert_equal [ t3["id"] ], json_body["tickets"].map { |t| t["id"] }
++  end
++
++  test "search q treats SQL LIKE wildcards, backslashes, punctuation, and SQL injection payloads as literal text" do
++    t_percent = create_request(subdomain: "acme", token: @avery_token, subject: "100% discount failed", body: "Promo code issue")
++    t_underscore = create_request(subdomain: "acme", token: @avery_token, subject: "Invoice inv_123 missing", body: "Check billing")
++    t_backslash = create_request(subdomain: "acme", token: @avery_token, subject: "Upload error", body: 'File C:\Users\Avery\receipt.pdf failed')
++    t_escaped_seq = create_request(subdomain: "acme", token: @avery_token, subject: 'Literal \% and \_ tokens', body: "Testing escapes")
++    t_special = create_request(subdomain: "acme", token: @avery_token, subject: "Café [a-z]+ (foo)* ' OR 1=1 --", body: "Regex and quotes")
++    _t_plain = create_request(subdomain: "acme", token: @avery_token, subject: "1000 refunds for invX123", body: "Plain ticket without special chars")
++
++    assert_search_ids = lambda do |q, expected_ids|
++      get "/api/v1/tickets", params: { q: q }, headers: json_headers(account: "acme", token: @owner_token)
++      assert_response :ok, "Expected 200 for q=#{q.inspect}"
++      assert_equal expected_ids.sort, json_body["tickets"].map { |t| t["id"] }.sort, "Mismatch for q=#{q.inspect}"
++      assert_equal expected_ids.size, json_body["count"], "Count mismatch for q=#{q.inspect}"
++    end
++
++    # % is literal, NOT wildcard
++    assert_search_ids.call("%", [ t_percent["id"], t_escaped_seq["id"] ])
++    assert_search_ids.call("100%", [ t_percent["id"] ])
++
++    # _ is literal, NOT single-char wildcard
++    assert_search_ids.call("_", [ t_underscore["id"], t_escaped_seq["id"] ])
++    assert_search_ids.call("inv_123", [ t_underscore["id"] ])
++
++    # \ is literal
++    assert_search_ids.call("\\", [ t_backslash["id"], t_escaped_seq["id"] ])
++    assert_search_ids.call('C:\Users\Avery', [ t_backslash["id"] ])
++    assert_search_ids.call('c:\users\avery', [ t_backslash["id"] ])
++
++    # Literal \% and \_
++    assert_search_ids.call('\%', [ t_escaped_seq["id"] ])
++    assert_search_ids.call('\_', [ t_escaped_seq["id"] ])
++
++    # Regex metacharacters, SQL injection text, and Unicode case-insensitivity
++    assert_search_ids.call("[a-z]+ (foo)*", [ t_special["id"] ])
++    assert_search_ids.call("' OR 1=1 --", [ t_special["id"] ])
++    assert_search_ids.call("café", [ t_special["id"] ])
++
++    # NUL byte returns empty 200 cleanly instead of 500
++    assert_search_ids.call("receipt\x00test", [])
++  end
++
++  test "invalid filter values on GET /api/v1/tickets return 422" do
++    invalid_paths = [
++      "/api/v1/tickets?status=closed",
++      "/api/v1/tickets?status=bogus",
++      "/api/v1/tickets?status[]=open",
++      "/api/v1/tickets?priority=urgent",
++      "/api/v1/tickets?priority=low",
++      "/api/v1/tickets?priority[]=high",
++      "/api/v1/tickets?assignee_id=abc",
++      "/api/v1/tickets?assignee_id=0",
++      "/api/v1/tickets?assignee_id=-1",
++      "/api/v1/tickets?assignee_id=null",
++      "/api/v1/tickets?assignee_id=999999999999999999999999999",
++      "/api/v1/tickets?assignee_id[]=1",
++      "/api/v1/tickets?requester_id=unassigned",
++      "/api/v1/tickets?requester_id=abc",
++      "/api/v1/tickets?requester_id=0",
++      "/api/v1/tickets?requester_id=-5",
++      "/api/v1/tickets?requester_id=999999999999999999999999999",
++      "/api/v1/tickets?requester_id[]=1",
++      "/api/v1/tickets?q[]=receipt",
++      "/api/v1/tickets?q[text]=receipt"
++    ]
++
++    invalid_paths.each do |path|
++      get path, headers: json_headers(account: "acme", token: @owner_token)
++      assert_response :unprocessable_content, "Expected 422 for #{path}"
++      assert json_body["error"].present?, "Expected error message for #{path}"
++      assert json_body["errors"].present?, "Expected errors hash for #{path}"
++    end
++
++    # Multiple invalid filters return all errors
++    get "/api/v1/tickets?status=bogus&priority=urgent&assignee_id=nope&requester_id=unassigned",
++        headers: json_headers(account: "acme", token: @owner_token)
++    assert_response :unprocessable_content
++    assert_equal %w[assignee_id priority requester_id status], json_body["errors"].keys.sort
++  end
++
++  test "customers can filter their own requests by status while internal fields remain hidden and ignored" do
++    open_high = open_normal = pending_req = solved_req = blake_open = nil
++
++    travel_to Time.zone.parse("2026-11-22 10:00:00 UTC") do
++      open_high = create_request(subdomain: "acme", token: @avery_token, subject: "Avery open 1", body: "First")
++    end
++    travel_to Time.zone.parse("2026-11-22 10:01:00 UTC") do
++      open_normal = create_request(subdomain: "acme", token: @avery_token, subject: "Avery open 2", body: "Second")
++    end
++    travel_to Time.zone.parse("2026-11-22 10:02:00 UTC") do
++      pending_req = create_request(subdomain: "acme", token: @avery_token, subject: "Avery pending", body: "Third")
++    end
++    travel_to Time.zone.parse("2026-11-22 10:03:00 UTC") do
++      solved_req = create_request(subdomain: "acme", token: @avery_token, subject: "Avery solved", body: "Fourth")
++    end
++    travel_to Time.zone.parse("2026-11-22 10:04:00 UTC") do
++      blake_open = create_request(subdomain: "acme", token: @blake_token, subject: "Blake open", body: "Other customer")
++    end
++
++    # Staff sets priority=high on open_high (does not bump public_updated_at),
++    # sets pending_req to pending, solved_req to solved
++    travel_to Time.zone.parse("2026-11-22 10:10:00 UTC") do
++      patch "/api/v1/tickets/#{open_high["id"]}",
++            params: { ticket: { priority: "high", assignee_id: @agent_id } },
++            headers: json_headers(account: "acme", token: @owner_token),
++            as: :json
++      assert_response :ok
++    end
++    travel_to Time.zone.parse("2026-11-22 10:11:00 UTC") do
++      patch "/api/v1/tickets/#{pending_req["id"]}",
++            params: { ticket: { status: "pending" } },
++            headers: json_headers(account: "acme", token: @owner_token),
++            as: :json
++      assert_response :ok
++    end
++    travel_to Time.zone.parse("2026-11-22 10:12:00 UTC") do
++      patch "/api/v1/tickets/#{solved_req["id"]}",
++            params: { ticket: { status: "solved" } },
++            headers: json_headers(account: "acme", token: @owner_token),
++            as: :json
++      assert_response :ok
++    end
++
++    # Filter by status=open -> only Avery's open requests, ordered by public_updated_at DESC (open_normal before open_high!)
++    get "/api/v1/requests?status=open", headers: json_headers(account: "acme", token: @avery_token)
++    assert_response :ok
++    assert_equal 2, json_body["count"]
++    assert_equal [ open_normal["id"], open_high["id"] ], json_body["requests"].map { |r| r["id"] }
++    json_body["requests"].each { |r| assert_not r.key?("priority") }
++
++    # Pagination with status filter
++    get "/api/v1/requests?status=open&page=1&per_page=1", headers: json_headers(account: "acme", token: @avery_token)
++    assert_response :ok
++    assert_equal 2, json_body["count"]
++    assert_equal 2, json_body["next_page"]
++    assert_equal [ open_normal["id"] ], json_body["requests"].map { |r| r["id"] }
++
++    # Case-insensitive status filters
++    get "/api/v1/requests?status=PENDING", headers: json_headers(account: "acme", token: @avery_token)
++    assert_response :ok
++    assert_equal [ pending_req["id"] ], json_body["requests"].map { |r| r["id"] }
++
++    get "/api/v1/requests?status=solved", headers: json_headers(account: "acme", token: @avery_token)
++    assert_response :ok
++    assert_equal [ solved_req["id"] ], json_body["requests"].map { |r| r["id"] }
++
++    # Blank status returns all of Avery's requests (never Blake's)
++    get "/api/v1/requests?status=", headers: json_headers(account: "acme", token: @avery_token)
++    assert_response :ok
++    assert_equal 4, json_body["count"]
++    assert_not_includes json_body["requests"].map { |r| r["id"] }, blake_open["id"]
++
++    # Invalid status returns 422
++    [ "/api/v1/requests?status=closed", "/api/v1/requests?status=bogus", "/api/v1/requests?status[]=open" ].each do |path|
++      get path, headers: json_headers(account: "acme", token: @avery_token)
++      assert_response :unprocessable_content, "Expected 422 for #{path}"
++    end
++
++    # Internal/staff-only params are ignored on /requests (never leak priority, assignee, or other requesters)
++    get "/api/v1/requests?priority=high", headers: json_headers(account: "acme", token: @avery_token)
++    assert_response :ok
++    assert_equal 4, json_body["count"]
++
++    get "/api/v1/requests?status=open&priority=high", headers: json_headers(account: "acme", token: @avery_token)
++    assert_response :ok
++    assert_equal 2, json_body["count"]
++    assert_equal [ open_normal["id"], open_high["id"] ], json_body["requests"].map { |r| r["id"] }
++
++    get "/api/v1/requests?priority=bogus&assignee_id=unassigned&requester_id=#{@blake_id}&q=Blake",
++        headers: json_headers(account: "acme", token: @avery_token)
++    assert_response :ok
++    assert_equal 4, json_body["count"]
++    assert_not_includes json_body["requests"].map { |r| r["id"] }, blake_open["id"]
++  end
++end
+diff --git a/test/models/ticket_test.rb b/test/models/ticket_test.rb
+index 7d55f3b..7be366e 100644
+--- a/test/models/ticket_test.rb
++++ b/test/models/ticket_test.rb
+@@ -58,4 +58,53 @@ class TicketTest < ActiveSupport::TestCase
+       assert_equal Time.zone.parse("2026-11-22 10:15:00 UTC"), ticket.reload.updated_at
+     end
+   end
++
++  test "priority defaults to normal, validates allowed values, and does not bump public_updated_at" do
++    ticket = nil
++    initial_time = Time.zone.parse("2026-11-22 10:00:00 UTC")
++    travel_to initial_time do
++      ticket = @acme.tickets.create!(requester: @acme_customer, subject: "Priority check")
++      assert_equal "normal", ticket.priority
++      assert ticket.normal_priority?
++      assert_not ticket.high_priority?
++    end
++
++    [ nil, "", "   ", "urgent", "low", "HIGH" ].each do |bad_priority|
++      ticket.priority = bad_priority
++      assert_not ticket.valid?, "Expected priority=#{bad_priority.inspect} to be invalid"
++      assert ticket.errors[:priority].any?
++    end
++
++    later_time = Time.zone.parse("2026-11-22 10:30:00 UTC")
++    travel_to later_time do
++      ticket.update!(priority: "high")
++      ticket.reload
++      assert_equal "high", ticket.priority
++      assert ticket.high_priority?
++      assert_equal later_time, ticket.updated_at
++      assert_equal initial_time, ticket.public_updated_at
++    end
++  end
++
++  test "search_text matches subjects and public comments literally without duplicates or private notes" do
++    t_subject = @acme.tickets.create!(requester: @acme_customer, subject: "100% receipt for inv_123")
++    t_subject.comments.create!(account: @acme, author: @acme_customer, body: "Another receipt mention", public: true)
++    t_subject.comments.create!(account: @acme, author: @acme_customer, body: "Second receipt mention", public: true)
++
++    t_public = @acme.tickets.create!(requester: @acme_customer, subject: "Path issue")
++    t_public.comments.create!(account: @acme, author: @acme_customer, body: 'Saved at C:\Users\Avery with literal \% and \_', public: true)
++
++    t_private = @acme.tickets.create!(requester: @acme_customer, subject: "Unrelated topic")
++    t_private.comments.create!(account: @acme, author: @acme_customer, body: "1000 refunds invX123", public: true)
++    t_private.comments.create!(account: @acme, author: @acme_customer, body: "Secret receipt audit note", public: false)
++
++    assert_equal [ t_subject.id ], @acme.tickets.search_text("RECEIPT").pluck(:id)
++    assert_equal [ t_subject.id ], @acme.tickets.search_text("100%").pluck(:id)
++    assert_equal [ t_subject.id ], @acme.tickets.search_text("inv_123").pluck(:id)
++    assert_equal [ t_public.id ], @acme.tickets.search_text('C:\Users\Avery').pluck(:id)
++    assert_equal [ t_public.id ], @acme.tickets.search_text('\%').pluck(:id)
++    assert_equal [ t_public.id ], @acme.tickets.search_text('\_').pluck(:id)
++    assert_equal [], @acme.tickets.search_text("Secret receipt").pluck(:id)
++    assert_equal [], @acme.tickets.search_text("foo\x00bar").pluck(:id)
++  end
+ end

@@ -1,0 +1,319 @@
+diff --git a/app/controllers/books/searches_controller.rb b/app/controllers/books/searches_controller.rb
+index 5268c55..994c177 100644
+--- a/app/controllers/books/searches_controller.rb
++++ b/app/controllers/books/searches_controller.rb
+@@ -1,9 +1,36 @@
+ class Books::SearchesController < ApplicationController
+   allow_unauthenticated_access
+ 
++  before_action :enforce_rate_limit, only: :create
++
+   include BookScoped
+ 
+   def create
+     @leaves = @book.leaves.active.search(params[:search]).favoring_title.limit(50)
+   end
++
++  private
++    def enforce_rate_limit
++      result = RateLimiter.check(
++        scope: controller_path,
++        key: request.remote_ip,
++        limit: 30,
++        within: 1.minute,
++        store: rate_limit_store
++      )
++
++      unless result.allowed?
++        head :too_many_requests, retry_after: result.retry_after
++      end
++    end
++
++    def rate_limit_store
++      if cache_store != ActionController::Base.cache_store && !cache_store.is_a?(ActiveSupport::Cache::NullStore)
++        cache_store
++      elsif Rails.cache && !Rails.cache.is_a?(ActiveSupport::Cache::NullStore)
++        Rails.cache
++      elsif cache_store && !cache_store.is_a?(ActiveSupport::Cache::NullStore)
++        cache_store
++      end
++    end
+ end
+diff --git a/app/models/rate_limiter.rb b/app/models/rate_limiter.rb
+new file mode 100644
+index 0000000..071e47b
+--- /dev/null
++++ b/app/models/rate_limiter.rb
+@@ -0,0 +1,259 @@
++require "digest"
++require "fileutils"
++require "ipaddr"
++require "securerandom"
++
++class RateLimiter
++  Result = Data.define(:allowed, :retry_after) do
++    def allowed?
++      allowed
++    end
++  end
++
++  REDIS_FALLBACK_COOLDOWN = 30.0
++  FILE_STORE_DIRECTORY = Rails.root.join("tmp/cache/rate_limits")
++
++  REDIS_SLIDING_WINDOW_SCRIPT = <<~LUA
++    local key = KEYS[1]
++    local now_ms = tonumber(ARGV[1])
++    local window_ms = tonumber(ARGV[2])
++    local limit = tonumber(ARGV[3])
++    local member = ARGV[4]
++
++    redis.call("ZREMRANGEBYSCORE", key, "-inf", now_ms - window_ms)
++    local count = redis.call("ZCARD", key)
++    if count >= limit then
++      local oldest = redis.call("ZRANGE", key, 0, 0, "WITHSCORES")
++      local retry_ms = window_ms
++      if oldest[2] then
++        retry_ms = tonumber(oldest[2]) + window_ms - now_ms
++      end
++      local max_retry = math.ceil(window_ms / 1000)
++      local retry_after = math.min(math.max(math.ceil(retry_ms / 1000), 1), max_retry)
++      return { 0, retry_after }
++    end
++
++    redis.call("ZADD", key, now_ms, member)
++    redis.call("PEXPIRE", key, window_ms)
++    return { 1, 0 }
++  LUA
++
++  class << self
++    def check(scope:, key:, limit:, within:, store: nil)
++      cache_key = "rate-limit:#{scope}:#{normalize_key(key)}"
++      now_ms = current_time_ms
++      window_ms = (within.to_f * 1000).round
++
++      if redis_store?(store)
++        result = check_redis(store, cache_key, limit: limit, window_ms: window_ms, now_ms: now_ms)
++        return result if result
++
++        file_backend.check(cache_key, limit: limit, window_ms: window_ms, now_ms: now_ms, within: within)
++      elsif usable_cache_store?(store)
++        check_cache_store(store, cache_key, limit: limit, window_ms: window_ms, now_ms: now_ms, within: within)
++      elsif Rails.env.test?
++        check_cache_store(fallback_memory_store, cache_key, limit: limit, window_ms: window_ms, now_ms: now_ms, within: within)
++      else
++        file_backend.check(cache_key, limit: limit, window_ms: window_ms, now_ms: now_ms, within: within)
++      end
++    end
++
++    def normalize_key(key)
++      raw = key.to_s.strip
++      return "unknown" if raw.empty?
++
++      IPAddr.new(raw).native.to_s
++    rescue IPAddr::InvalidAddressError
++      raw
++    end
++
++    private
++      def current_time_ms
++        now = Time.now
++        (now.to_i * 1000) + (now.usec / 1000)
++      end
++
++      def redis_store?(store)
++        defined?(ActiveSupport::Cache::RedisCacheStore) && store.is_a?(ActiveSupport::Cache::RedisCacheStore)
++      end
++
++      def usable_cache_store?(store)
++        store && !store.is_a?(ActiveSupport::Cache::NullStore)
++      end
++
++      def check_redis(store, cache_key, limit:, window_ms:, now_ms:)
++        return nil if redis_circuit_open?
++
++        redis_key = namespaced_redis_key(store, cache_key)
++        member = "#{now_ms}-#{SecureRandom.hex(8)}"
++
++        allowed, retry_after = store.redis.then do |conn|
++          conn = conn.node_for(redis_key) if defined?(Redis::Distributed) && conn.is_a?(Redis::Distributed)
++          conn.eval(REDIS_SLIDING_WINDOW_SCRIPT, keys: [ redis_key ], argv: [ now_ms, window_ms, limit, member ])
++        end
++
++        Result.new(allowed: allowed == 1, retry_after: retry_after.to_i)
++      rescue *redis_errors
++        open_redis_circuit!
++        nil
++      end
++
++      def namespaced_redis_key(store, cache_key)
++        namespace = store.options[:namespace]
++        namespace = namespace.call if namespace.respond_to?(:call)
++        namespace.present? ? "#{namespace}:#{cache_key}" : cache_key
++      end
++
++      def redis_errors
++        errors = [ IOError, SocketError, SystemCallError, Timeout::Error ]
++        errors << Redis::BaseError if defined?(Redis::BaseError)
++        errors << RedisClient::Error if defined?(RedisClient::Error)
++        errors << ConnectionPool::TimeoutError if defined?(ConnectionPool::TimeoutError)
++        errors
++      end
++
++      def redis_circuit_open?
++        until_time = @redis_down_until
++        until_time && Process.clock_gettime(Process::CLOCK_MONOTONIC) < until_time
++      end
++
++      def open_redis_circuit!
++        @redis_down_until = Process.clock_gettime(Process::CLOCK_MONOTONIC) + REDIS_FALLBACK_COOLDOWN
++      end
++
++      def check_cache_store(store, cache_key, limit:, window_ms:, now_ms:, within:)
++        cutoff_ms = now_ms - window_ms
++
++        cache_mutex.synchronize do
++          timestamps = Array(store.read(cache_key)).select { |ts| ts > cutoff_ms }
++
++          if timestamps.size >= limit
++            retry_after = calculate_retry_after(timestamps.min, now_ms: now_ms, window_ms: window_ms, within: within)
++            Result.new(allowed: false, retry_after: retry_after)
++          else
++            timestamps << now_ms
++            store.write(cache_key, timestamps, expires_in: within)
++            Result.new(allowed: true, retry_after: 0)
++          end
++        end
++      end
++
++      def calculate_retry_after(oldest_ms, now_ms:, window_ms:, within:)
++        retry_ms = oldest_ms + window_ms - now_ms
++        ((retry_ms / 1000.0).ceil).clamp(1, within.ceil)
++      end
++
++      def cache_mutex
++        @cache_mutex ||= Mutex.new
++      end
++
++      def fallback_memory_store
++        @fallback_memory_store ||= ActiveSupport::Cache::MemoryStore.new
++      end
++
++      def file_backend
++        @file_backend ||= FileBackend.new(FILE_STORE_DIRECTORY)
++      end
++  end
++
++  class FileBackend
++    CLEANUP_INTERVAL = 200
++    STALE_AGE = 5.minutes
++
++    def initialize(directory)
++      @directory = Pathname.new(directory)
++      @mutex = Mutex.new
++      @ops = 0
++    end
++
++    def check(cache_key, limit:, window_ms:, now_ms:, within:)
++      FileUtils.mkdir_p(@directory)
++      path = @directory.join("#{Digest::SHA256.hexdigest(cache_key)}.txt")
++      cutoff_ms = now_ms - window_ms
++
++      result = with_locked_file(path) do |file|
++        timestamps = read_timestamps(file).select { |ts| ts > cutoff_ms }
++
++        if timestamps.size >= limit
++          retry_ms = timestamps.min + window_ms - now_ms
++          retry_after = ((retry_ms / 1000.0).ceil).clamp(1, within.ceil)
++          Result.new(allowed: false, retry_after: retry_after)
++        else
++          timestamps << now_ms
++          write_timestamps(file, timestamps)
++          Result.new(allowed: true, retry_after: 0)
++        end
++      end
++
++      maybe_cleanup
++      result
++    end
++
++    private
++      def with_locked_file(path)
++        loop do
++          File.open(path, File::RDWR | File::CREAT, 0o600) do |file|
++            file.flock(File::LOCK_EX)
++
++            current_stat = begin
++              File.stat(path)
++            rescue Errno::ENOENT
++              nil
++            end
++
++            next unless current_stat && current_stat.ino == file.stat.ino
++
++            return yield(file)
++          end
++        end
++      end
++
++      def read_timestamps(file)
++        file.rewind
++        file.read.split.filter_map { |line| Integer(line, exception: false) }
++      end
++
++      def write_timestamps(file, timestamps)
++        file.rewind
++        file.write(timestamps.join("\n"))
++        file.truncate(file.pos)
++        file.flush
++      end
++
++      def maybe_cleanup
++        should_run = @mutex.synchronize do
++          @ops += 1
++          if @ops >= CLEANUP_INTERVAL
++            @ops = 0
++            true
++          else
++            false
++          end
++        end
++
++        return unless should_run
++
++        stale_cutoff = Time.at(Process.clock_gettime(Process::CLOCK_REALTIME)) - STALE_AGE
++
++        Dir.children(@directory).each do |entry|
++          next unless entry.end_with?(".txt")
++
++          path = @directory.join(entry)
++          next if File.stat(path).mtime > stale_cutoff
++
++          File.open(path, File::RDWR) do |file|
++            next unless file.flock(File::LOCK_EX | File::LOCK_NB)
++
++            current_stat = File.stat(path)
++            if current_stat.ino == file.stat.ino && current_stat.mtime <= stale_cutoff
++              File.unlink(path)
++            end
++          end
++        rescue Errno::ENOENT, Errno::EACCES
++          next
++        end
++      rescue Errno::ENOENT
++        nil
++      end
++  end
++end
+diff --git a/config/environments/test.rb b/config/environments/test.rb
+index 75f22c6..f251542 100644
+--- a/config/environments/test.rb
++++ b/config/environments/test.rb
+@@ -23,7 +23,7 @@ Rails.application.configure do
+   # Show full error reports and disable caching.
+   config.consider_all_requests_local = true
+   config.action_controller.perform_caching = false
+-  config.cache_store = :null_store
++  config.cache_store = :memory_store
+ 
+   # Render exception templates for rescuable exceptions and raise for other exceptions.
+   config.action_dispatch.show_exceptions = :rescuable

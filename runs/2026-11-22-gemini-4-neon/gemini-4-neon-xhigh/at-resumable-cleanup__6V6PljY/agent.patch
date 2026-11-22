@@ -1,0 +1,256 @@
+diff --git a/Procfile b/Procfile
+index 20e1430..9ed469e 100644
+--- a/Procfile
++++ b/Procfile
+@@ -1,3 +1,3 @@
+ web: bundle exec thrust bin/start-app
+ redis: redis-server config/redis.conf
+-workers: FORK_PER_JOB=false INTERVAL=0.1 bundle exec resque-pool
++workers: FORK_PER_JOB=false INTERVAL=0.1 bundle exec resque-pool --term-graceful-wait
+diff --git a/app/jobs/title_cleanup_job.rb b/app/jobs/title_cleanup_job.rb
+index 13721ed..ab7c177 100644
+--- a/app/jobs/title_cleanup_job.rb
++++ b/app/jobs/title_cleanup_job.rb
+@@ -1,7 +1,14 @@
+ class TitleCleanupJob < ApplicationJob
++  include ActiveJob::Continuable
++
++  self.resume_options = { wait: nil }
++
+   def perform
+-    Leaf.find_each(order: :asc) do |leaf|
+-      leaf.update!(title: cleaned(leaf.title))
++    step :clean_titles do |step|
++      Leaf.find_each(start: step.cursor, order: :asc) do |leaf|
++        leaf.update!(title: cleaned(leaf.title))
++        step.advance! from: leaf.id
++      end
+     end
+   end
+ 
+diff --git a/config/initializers/resque.rb b/config/initializers/resque.rb
+new file mode 100644
+index 0000000..d253ec4
+--- /dev/null
++++ b/config/initializers/resque.rb
+@@ -0,0 +1,22 @@
++module ResqueWorkerTracking
++  def perform(job, &block)
++    previous = Thread.current[:resque_worker]
++    Thread.current[:resque_worker] = self
++    super
++  ensure
++    Thread.current[:resque_worker] = previous
++  end
++end
++
++module ResqueAdapterStopping
++  def stopping?
++    super || !!Thread.current[:resque_worker]&.shutdown?
++  end
++end
++
++Resque::Worker.prepend ResqueWorkerTracking
++
++ActiveSupport.on_load :active_job do
++  require "active_job/queue_adapters/resque_adapter"
++  ActiveJob::QueueAdapters::ResqueAdapter.prepend ResqueAdapterStopping
++end
+diff --git a/test/jobs/title_cleanup_job_test.rb b/test/jobs/title_cleanup_job_test.rb
+new file mode 100644
+index 0000000..eb13ca6
+--- /dev/null
++++ b/test/jobs/title_cleanup_job_test.rb
+@@ -0,0 +1,192 @@
++require "test_helper"
++require "active_job/continuation/test_helper"
++
++class TitleCleanupJobTest < ActiveJob::TestCase
++  include ActiveJob::Continuation::TestHelper
++
++  setup do
++    @leaves = Leaf.order(id: :asc).to_a
++    @raw_titles = [
++      '""Hello" World"',
++      '""Quoted""',
++      '"She said "hi""',
++      '"Plain Tail"'
++    ]
++    @expected_titles = [
++      '"Hello" World',
++      '"Quoted"',
++      'She said "hi"',
++      "Plain Tail"
++    ]
++
++    @leaves.zip(@raw_titles).each do |leaf, title|
++      leaf.update_columns(title: title)
++    end
++  end
++
++  test "strips stray outer quotes from all leaf titles" do
++    TitleCleanupJob.perform_now
++
++    assert_equal @expected_titles, @leaves.map { |leaf| leaf.reload.title }
++  end
++
++  test "resumes where it left off after interruption without re-cleaning earlier leaves" do
++    TitleCleanupJob.perform_later
++
++    interrupt_job_during_step(TitleCleanupJob, :clean_titles, cursor: @leaves[1].id + 1) do
++      perform_enqueued_jobs
++    end
++
++    assert_equal @expected_titles[0..1], @leaves[0..1].map { |leaf| leaf.reload.title }
++    assert_equal @raw_titles[2..3], @leaves[2..3].map { |leaf| leaf.reload.title }
++    assert_enqueued_jobs 1, only: TitleCleanupJob
++
++    updated_ids = track_updated_leaf_ids do
++      perform_enqueued_jobs
++    end
++
++    assert_equal @leaves[2..3].map(&:id), updated_ids
++    assert_equal @expected_titles, @leaves.map { |leaf| leaf.reload.title }
++    assert_no_enqueued_jobs
++  end
++
++  test "survives multiple interruptions across every leaf" do
++    TitleCleanupJob.perform_later
++
++    updated_ids = track_updated_leaf_ids do
++      queue_adapter.with(stopping: true) do
++        while enqueued_jobs.any?
++          perform_enqueued_jobs
++        end
++      end
++    end
++
++    assert_equal @leaves.map(&:id), updated_ids
++    assert_equal @expected_titles, @leaves.map { |leaf| leaf.reload.title }
++    assert_no_enqueued_jobs
++  end
++
++  test "handles interruption on the final leaf without re-cleaning it" do
++    TitleCleanupJob.perform_later
++
++    interrupt_job_during_step(TitleCleanupJob, :clean_titles, cursor: @leaves.last.id + 1) do
++      perform_enqueued_jobs
++    end
++
++    assert_equal @expected_titles, @leaves.map { |leaf| leaf.reload.title }
++    assert_enqueued_jobs 1, only: TitleCleanupJob
++
++    updated_ids = track_updated_leaf_ids do
++      perform_enqueued_jobs
++    end
++
++    assert_empty updated_ids
++    assert_equal @expected_titles, @leaves.map { |leaf| leaf.reload.title }
++    assert_no_enqueued_jobs
++  end
++
++  test "handles an empty collection" do
++    Leaf.delete_all
++
++    TitleCleanupJob.perform_now
++    assert_no_enqueued_jobs
++  end
++
++  test "resumes from the failed leaf after a mid-run error without re-cleaning earlier leaves" do
++    TitleCleanupJob.perform_later
++
++    failing_leaf_id = @leaves[2].id
++    failed_once = false
++
++    callback = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
++      if !failed_once && payload[:sql].include?('UPDATE "leaves"') && payload[:type_casted_binds].include?(failing_leaf_id)
++        failed_once = true
++        raise RuntimeError, "transient failure"
++      end
++    end
++
++    begin
++      perform_enqueued_jobs
++    ensure
++      ActiveSupport::Notifications.unsubscribe(callback)
++    end
++
++    assert failed_once
++    assert_equal @expected_titles[0..1], @leaves[0..1].map { |leaf| leaf.reload.title }
++    assert_equal @raw_titles[2..3], @leaves[2..3].map { |leaf| leaf.reload.title }
++    assert_enqueued_jobs 1, only: TitleCleanupJob
++
++    updated_ids = track_updated_leaf_ids do
++      perform_enqueued_jobs
++    end
++
++    assert_equal @leaves[2..3].map(&:id), updated_ids
++    assert_equal @expected_titles, @leaves.map { |leaf| leaf.reload.title }
++    assert_no_enqueued_jobs
++  end
++
++  test "interrupts and resumes cleanly on ResqueAdapter when worker shuts down" do
++    adapter = ActiveJob::QueueAdapters::ResqueAdapter.new
++    resque_queue = []
++
++    original_enqueue_to = Resque.method(:enqueue_to)
++    Resque.define_singleton_method(:enqueue_to) do |queue, klass, *args|
++      resque_queue << [ queue, Resque.encode("class" => klass.to_s, "args" => args) ]
++    end
++
++    TitleCleanupJob.enable_test_adapter(adapter)
++
++    TitleCleanupJob.perform_later
++    assert_equal 1, resque_queue.size
++
++    worker = Resque::Worker.new("default")
++    worker.instance_variable_set(:@fork_per_job, false)
++
++    second_leaf_id = @leaves[1].id
++    callback = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
++      if payload[:sql].include?('UPDATE "leaves"') && payload[:type_casted_binds].include?(second_leaf_id)
++        worker.shutdown
++      end
++    end
++
++    queue_name, encoded_payload = resque_queue.shift
++    worker.perform(Resque::Job.new(queue_name, Resque.decode(encoded_payload)))
++    ActiveSupport::Notifications.unsubscribe(callback)
++    callback = nil
++
++    assert_equal @expected_titles[0..1], @leaves[0..1].map { |leaf| leaf.reload.title }
++    assert_equal @raw_titles[2..3], @leaves[2..3].map { |leaf| leaf.reload.title }
++    assert_equal 1, resque_queue.size
++
++    resumed_worker = Resque::Worker.new("default")
++    resumed_worker.instance_variable_set(:@fork_per_job, false)
++
++    updated_ids = track_updated_leaf_ids do
++      queue_name, encoded_payload = resque_queue.shift
++      resumed_worker.perform(Resque::Job.new(queue_name, Resque.decode(encoded_payload)))
++    end
++
++    assert_equal @leaves[2..3].map(&:id), updated_ids
++    assert_equal @expected_titles, @leaves.map { |leaf| leaf.reload.title }
++    assert_empty resque_queue
++  ensure
++    ActiveSupport::Notifications.unsubscribe(callback) if callback
++    TitleCleanupJob.disable_test_adapter
++    Resque.define_singleton_method(:enqueue_to, original_enqueue_to) if original_enqueue_to
++  end
++
++  private
++    def track_updated_leaf_ids
++      updated_ids = []
++      callback = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
++        if payload[:sql].include?('UPDATE "leaves"')
++          updated_ids << payload[:type_casted_binds].last
++        end
++      end
++
++      yield
++      updated_ids
++    ensure
++      ActiveSupport::Notifications.unsubscribe(callback)
++    end
++end

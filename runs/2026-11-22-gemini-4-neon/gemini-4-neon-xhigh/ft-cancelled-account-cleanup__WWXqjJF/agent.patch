@@ -1,0 +1,710 @@
+diff --git a/app/jobs/account/incinerate_due_job.rb b/app/jobs/account/incinerate_due_job.rb
+new file mode 100644
+index 0000000..e75291d
+--- /dev/null
++++ b/app/jobs/account/incinerate_due_job.rb
+@@ -0,0 +1,8 @@
++class Account::IncinerateDueJob < ApplicationJob
++  queue_as :backend
++  limits_concurrency to: 1, key: :all, on_conflict: :discard
++
++  def perform
++    Account.incinerate_due
++  end
++end
+diff --git a/app/models/account.rb b/app/models/account.rb
+index a6a70b1..92590d9 100644
+--- a/app/models/account.rb
++++ b/app/models/account.rb
+@@ -1,5 +1,5 @@
+ class Account < ApplicationRecord
+-  include Account::Storage, Cancellable, Entropic, MultiTenantable, Seedeable
++  include Account::Storage, Cancellable, Entropic, Incineratable, MultiTenantable, Seedeable
+ 
+   has_one :join_code, dependent: :destroy
+   has_many :users, dependent: :destroy
+diff --git a/app/models/account/incineratable.rb b/app/models/account/incineratable.rb
+index 2357b99..bb9ce92 100644
+--- a/app/models/account/incineratable.rb
++++ b/app/models/account/incineratable.rb
+@@ -1,3 +1,35 @@
+ module Account::Incineratable
++  extend ActiveSupport::Concern
++
+   INCINERATION_GRACE_PERIOD = 30.days
++
++  included do
++    define_callbacks :incinerate
++
++    scope :due_for_incineration, -> {
++      joins(:cancellation).where(account_cancellations: { created_at: ...INCINERATION_GRACE_PERIOD.ago })
++    }
++  end
++
++  class_methods do
++    def incinerate_due
++      due_for_incineration.find_each do |account|
++        account.incinerate if account.due_for_incineration?
++      end
++    end
++  end
++
++  def due_for_incineration?
++    !destroyed? && reload_cancellation.present? && cancellation.created_at < INCINERATION_GRACE_PERIOD.ago
++  end
++
++  def incinerate
++    return if destroyed?
++
++    if reload_cancellation.present?
++      run_callbacks :incinerate do
++        Account::Incineration.new(self).run
++      end
++    end
++  end
+ end
+diff --git a/app/models/account/incineration.rb b/app/models/account/incineration.rb
+new file mode 100644
+index 0000000..4428d58
+--- /dev/null
++++ b/app/models/account/incineration.rb
+@@ -0,0 +1,109 @@
++class Account::Incineration
++  FILTER_JOIN_TABLES = %w[
++    assignees_filters
++    assigners_filters
++    boards_filters
++    closers_filters
++    creators_filters
++    filters_tags
++  ].freeze
++
++  ACCOUNT_SCOPED_MODELS = [
++    ActionText::RichText,
++    Webhook::Delivery,
++    Webhook::DelinquencyTracker,
++    Webhook,
++    Notification,
++    Notification::Bundle,
++    Mention,
++    Reaction,
++    Event,
++    Comment,
++    Step,
++    Assignment,
++    Tagging,
++    Closure,
++    Card::Goldness,
++    Card::NotNow,
++    Card::ActivitySpike,
++    Watch,
++    Pin,
++    Card,
++    Column,
++    Board::Publication,
++    Access,
++    Entropy,
++    Board,
++    Tag,
++    Search::Query,
++    Push::Subscription,
++    User::Settings,
++    Export,
++    Account::Import,
++    Storage::Entry,
++    User,
++    Account::JoinCode
++  ].freeze
++
++  attr_reader :account
++
++  def initialize(account)
++    @account = account
++  end
++
++  def run
++    Current.without_account do
++      purge_active_storage
++      delete_search_records
++      delete_storage_totals
++      delete_filters
++      delete_account_scoped_records
++      destroy_account
++    end
++  end
++
++  private
++    def purge_active_storage
++      ActiveStorage::Attachment.where(account_id: account.id).in_batches(&:delete_all)
++      ActiveStorage::VariantRecord.where(account_id: account.id).in_batches(&:delete_all)
++      ActiveStorage::Blob.where(account_id: account.id).find_each(&:purge)
++    end
++
++    def delete_search_records
++      Search::Record.delete_for_account(account.id)
++    end
++
++    def delete_storage_totals
++      Board.where(account_id: account.id).in_batches do |batch|
++        Storage::Total.where(owner_type: "Board", owner_id: batch.select(:id)).delete_all
++      end
++
++      Storage::Total.where(owner_type: "Account", owner_id: account.id).delete_all
++    end
++
++    def delete_filters
++      Filter.where(account_id: account.id).in_batches do |batch|
++        delete_filter_join_records(batch)
++        batch.delete_all
++      end
++    end
++
++    def delete_filter_join_records(batch)
++      connection = Account.connection
++      subquery = batch.select(:id).to_sql
++
++      FILTER_JOIN_TABLES.each do |table|
++        connection.delete("DELETE FROM #{connection.quote_table_name(table)} WHERE filter_id IN (#{subquery})")
++      end
++    end
++
++    def delete_account_scoped_records
++      ACCOUNT_SCOPED_MODELS.each do |model|
++        model.where(account_id: account.id).in_batches(&:delete_all)
++      end
++    end
++
++    def destroy_account
++      account.reload.destroy!
++    end
++end
+diff --git a/app/models/search/record/sqlite.rb b/app/models/search/record/sqlite.rb
+index 857e858..f21ef39 100644
+--- a/app/models/search/record/sqlite.rb
++++ b/app/models/search/record/sqlite.rb
+@@ -30,6 +30,13 @@ module Search::Record::SQLite
+     def for(account_id)
+       self
+     end
++
++    def delete_for_account(account_id)
++      where(account_id: account_id).in_batches do |batch|
++        Fts.where(rowid: batch.pluck(:id)).delete_all
++        batch.delete_all
++      end
++    end
+   end
+ 
+   def card_title
+diff --git a/app/models/search/record/trilogy.rb b/app/models/search/record/trilogy.rb
+index 7705f3b..3317c5a 100644
+--- a/app/models/search/record/trilogy.rb
++++ b/app/models/search/record/trilogy.rb
+@@ -35,6 +35,10 @@ module Search::Record::Trilogy
+     def for(account_id)
+       SHARD_CLASSES[shard_id_for_account(account_id)]
+     end
++
++    def delete_for_account(account_id)
++      self.for(account_id).where(account_id: account_id).in_batches(&:delete_all)
++    end
+   end
+ 
+   def card_title
+diff --git a/config/recurring.yml b/config/recurring.yml
+index 549f6ae..89cf91c 100644
+--- a/config/recurring.yml
++++ b/config/recurring.yml
+@@ -13,6 +13,9 @@ production: &production
+   delete_unused_tags:
+     class: DeleteUnusedTagsJob
+     schedule: every day at 04:02
++  incinerate_due_accounts:
++    class: Account::IncinerateDueJob
++    schedule: every hour at minute 30
+ 
+   # Operations cleanup and backups
+   clear_solid_queue_finished_jobs:
+diff --git a/saas/app/models/account/storage_limited.rb b/saas/app/models/account/storage_limited.rb
+index 46db552..cdb8232 100644
+--- a/saas/app/models/account/storage_limited.rb
++++ b/saas/app/models/account/storage_limited.rb
+@@ -5,7 +5,7 @@ module Account::StorageLimited
+   NEAR_STORAGE_LIMIT_THRESHOLD = 500.megabytes
+ 
+   included do
+-    has_one :storage_exception
++    has_one :storage_exception, dependent: :destroy
+   end
+ 
+   def storage_limit
+diff --git a/test/jobs/account/incinerate_due_job_test.rb b/test/jobs/account/incinerate_due_job_test.rb
+new file mode 100644
+index 0000000..b940a18
+--- /dev/null
++++ b/test/jobs/account/incinerate_due_job_test.rb
+@@ -0,0 +1,76 @@
++require "test_helper"
++require "fugit"
++
++class Account::IncinerateDueJobTest < ActiveJob::TestCase
++  test "incinerates accounts canceled more than 30 days ago and keeps others" do
++    freeze_time do
++      due_account = create_cancelled_account(name: "Due Account", cancelled_at: 31.days.ago)
++      just_due_account = create_cancelled_account(name: "Just Due Account", cancelled_at: 30.days.ago - 1.second)
++      boundary_account = create_cancelled_account(name: "Boundary Account", cancelled_at: 30.days.ago)
++      recent_account = create_cancelled_account(name: "Recent Account", cancelled_at: 29.days.ago)
++      active_account = accounts(:initech)
++
++      reactivated_account = create_cancelled_account(name: "Reactivated Account", cancelled_at: 31.days.ago)
++      reactivated_account.reactivate
++
++      Account::IncinerateDueJob.perform_now
++
++      assert_not Account.exists?(due_account.id)
++      assert_not Account.exists?(just_due_account.id)
++      assert_equal 0, User.where(account_id: due_account.id).count
++      assert_equal 0, Board.where(account_id: due_account.id).count
++      assert_equal 0, Card.where(account_id: due_account.id).count
++      assert_equal 0, Account::Cancellation.where(account_id: due_account.id).count
++
++      assert Account.exists?(boundary_account.id)
++      assert Account.exists?(recent_account.id)
++      assert Account.exists?(active_account.id)
++      assert Account.exists?(reactivated_account.id)
++    end
++  end
++
++  test "works when enqueued and performed asynchronously" do
++    due_account = create_cancelled_account(name: "Async Due Account", cancelled_at: 31.days.ago)
++
++    perform_enqueued_jobs do
++      Account::IncinerateDueJob.perform_later
++    end
++
++    assert_not Account.exists?(due_account.id)
++  end
++
++  test "queued to backend queue with concurrency limit" do
++    job = Account::IncinerateDueJob.new
++
++    assert_equal "backend", job.queue_name
++    assert_predicate job, :concurrency_limited?
++  end
++
++  test "configured as a recurring job in config/recurring.yml" do
++    path = Rails.root.join("config/recurring.yml")
++    erb = ERB.new(File.read(path))
++    erb.filename = path.to_s
++    config = YAML.safe_load(erb.result, aliases: true)
++
++    entry = config.fetch("production").values.find { |task| task["class"] == "Account::IncinerateDueJob" }
++
++    assert_not_nil entry, "Expected Account::IncinerateDueJob to be configured in config/recurring.yml"
++    assert_instance_of Fugit::Cron, Fugit.parse(entry["schedule"], multi: :fail)
++  end
++
++  private
++    def create_cancelled_account(name:, cancelled_at:)
++      account = Account.create_with_owner(
++        account: { name: name },
++        owner: { name: "#{name} Owner", identity: identities(:david) }
++      )
++      owner = account.users.owner.first
++      Current.set(account: account, user: owner) do
++        board = account.boards.create!(name: "#{name} Board", creator: owner)
++        board.cards.create!(title: "#{name} Card", creator: owner, status: :published)
++      end
++      account.cancel(initiated_by: owner)
++      account.cancellation.update_column(:created_at, cancelled_at)
++      account
++    end
++end
+diff --git a/test/models/account/incineratable_test.rb b/test/models/account/incineratable_test.rb
+new file mode 100644
+index 0000000..836b44f
+--- /dev/null
++++ b/test/models/account/incineratable_test.rb
+@@ -0,0 +1,382 @@
++require "test_helper"
++
++class Account::IncineratableTest < ActiveSupport::TestCase
++  setup do
++    @account = accounts("37s")
++    @user = users(:david)
++  end
++
++  test "due_for_incineration includes only accounts cancelled more than 30 days ago" do
++    freeze_time do
++      active_account = Account.create!(name: "Active")
++      recent_account = create_cancelled_account(name: "Recent", cancelled_at: 29.days.ago)
++      boundary_account = create_cancelled_account(name: "Boundary", cancelled_at: 30.days.ago)
++      just_due_account = create_cancelled_account(name: "Just Due", cancelled_at: 30.days.ago - 1.second)
++      overdue_account = create_cancelled_account(name: "Overdue", cancelled_at: 31.days.ago)
++
++      reactivated_account = create_cancelled_account(name: "Reactivated", cancelled_at: 31.days.ago)
++      reactivated_account.reactivate
++
++      due = Account.due_for_incineration
++
++      assert_not_includes due, active_account
++      assert_not_includes due, recent_account
++      assert_not_includes due, boundary_account
++      assert_not_includes due, reactivated_account
++      assert_includes due, just_due_account
++      assert_includes due, overdue_account
++    end
++  end
++
++  test "incinerate permanently removes all data across every account-scoped table and storage files" do
++    identity = identities(:david)
++    target = Account.create_with_owner(
++      account: { name: "Doomed Account" },
++      owner: { name: "Doomed Owner", identity: identity }
++    )
++    owner = target.users.owner.first
++    member = target.users.create!(name: "Doomed Member", role: :member)
++
++    blob_keys = []
++    board_ids = []
++    filter_ids = []
++    search_record_ids = []
++
++    Current.set(account: target, user: owner) do
++      board = target.boards.create!(name: "Doomed Board", creator: owner, all_access: true)
++      board.update!(public_description: "Public description")
++      board.publish
++      board.create_entropy!(auto_postpone_period: 7.days, account: target)
++      column = board.columns.create!(name: "In Progress", color: Color::COLORS.first)
++      tag = target.tags.create!(title: "doomed-tag")
++
++      embed_blob = ActiveStorage::Blob.create_and_upload!(
++        io: file_fixture("moon.jpg").open,
++        filename: "embed.jpg",
++        content_type: "image/jpeg"
++      )
++      embed_html = ActionText::Attachment.from_attachable(embed_blob).to_html
++
++      card = board.cards.create!(
++        title: "Doomed Card",
++        creator: owner,
++        status: :published,
++        column: column,
++        description: "<p>Card body #{embed_html}</p>"
++      )
++      card.image.attach(io: file_fixture("moon.jpg").open, filename: "card.jpg", content_type: "image/jpeg")
++      card.toggle_tag_with(tag.title)
++      card.assignments.create!(assignee: member, assigner: owner)
++      card.steps.create!(content: "Finish incineration")
++      card.pin_by(owner)
++      card.gild
++      card.reactions.create!(content: "👍", reacter: owner)
++
++      comment_blob = ActiveStorage::Blob.create_and_upload!(
++        io: StringIO.new("comment attachment"),
++        filename: "note.txt",
++        content_type: "text/plain"
++      )
++      comment_embed_html = ActionText::Attachment.from_attachable(comment_blob).to_html
++      comment = card.comments.create!(body: "<p>Comment #{comment_embed_html}</p>", creator: owner)
++      comment.reactions.create!(content: "🎉", reacter: member)
++      Mention.create!(account: target, source: comment, mentioner: owner, mentionee: member)
++
++      card.close(user: owner)
++      postponed_card = board.cards.create!(title: "Postponed Card", creator: owner, status: :published)
++      postponed_card.postpone(user: owner)
++      card.create_activity_spike!(account: target)
++
++      event = card.events.first
++      webhook = board.webhooks.create!(name: "Hook", url: "https://example.com/hook", subscribed_actions: [ "card_published" ])
++      webhook.deliveries.create!(account: target, event: event, state: "completed")
++
++      Notification.create!(account: target, user: member, creator: owner, source: event, card: card)
++      Notification::Bundle.create!(account: target, user: member, starts_at: 1.hour.ago, ends_at: Time.current)
++
++      filter = owner.filters.create!(
++        fields: { indexed_by: "all" },
++        boards: [ board ],
++        tags: [ tag ],
++        assignees: [ member ],
++        creators: [ owner ],
++        closers: [ owner ]
++      )
++      bin_uid = ActiveRecord::Type::Uuid.new.serialize(owner.id)
++      bin_fid = ActiveRecord::Type::Uuid.new.serialize(filter.id)
++      Account.connection.execute(
++        "INSERT INTO assigners_filters (assigner_id, filter_id) VALUES (#{Account.connection.quote(bin_uid)}, #{Account.connection.quote(bin_fid)})"
++      )
++
++      owner.remember_search("doomed search")
++      push_sub = owner.push_subscriptions.build(
++        account: target,
++        endpoint: "https://fcm.googleapis.com/fcm/send/doomed",
++        p256dh_key: "key",
++        auth_key: "auth"
++      )
++      push_sub.save!(validate: false)
++
++      owner.avatar.attach(io: file_fixture("moon.jpg").open, filename: "avatar.jpg", content_type: "image/jpeg")
++      owner.avatar.variant(:thumb).processed
++
++      ActiveStorage::Blob.create_and_upload!(
++        io: StringIO.new("unattached direct upload"),
++        filename: "orphan.txt",
++        content_type: "text/plain"
++      )
++
++      account_export = Account::Export.create!(account: target, user: owner)
++      account_export.file.attach(io: StringIO.new("account export"), filename: "account.zip", content_type: "application/zip")
++
++      user_export = User::DataExport.create!(account: target, user: owner)
++      user_export.file.attach(io: StringIO.new("user export"), filename: "user.zip", content_type: "application/zip")
++
++      import = Account::Import.create!(account: target, identity: identity, status: :completed)
++      import.file.attach(io: StringIO.new("import data"), filename: "import.zip", content_type: "application/zip")
++
++      Storage::Entry.record(account: target, board: board, delta: 2048, operation: "attach")
++      target.materialize_storage
++      board.materialize_storage
++
++      card.reindex
++      comment.reindex
++
++      target.cancel(initiated_by: owner)
++
++      blob_keys = ActiveStorage::Blob.where(account_id: target.id).pluck(:key)
++      board_ids = target.boards.ids
++      filter_ids = Filter.where(account_id: target.id).ids
++      search_record_ids = Search::Record.for(target.id).where(account_id: target.id).pluck(:id)
++    end
++
++    assert_operator blob_keys.size, :>=, 7
++    assert_operator search_record_ids.size, :>=, 2
++    blob_keys.each do |key|
++      assert ActiveStorage::Blob.service.exist?(key), "Expected blob #{key} to exist before incineration"
++    end
++
++    # Verify every account-scoped table actually has test rows populated before incineration
++    assert_every_account_table_populated(target.id, board_ids, filter_ids)
++
++    enqueued_jobs.clear
++
++    target.incinerate
++
++    assert target.destroyed?
++    assert_not Account.exists?(target.id)
++    assert_empty enqueued_jobs, "Incineration should not enqueue background jobs"
++
++    # Verify zero rows remain in EVERY table in the database for the incinerated account
++    assert_no_records_remain_for_account(target.id, board_ids, filter_ids, search_record_ids)
++
++    # Verify all physical files were purged from storage
++    blob_keys.each do |key|
++      assert_not ActiveStorage::Blob.service.exist?(key), "Expected blob #{key} to be deleted from storage"
++    end
++  end
++
++  test "incinerate preserves other accounts and global identity records" do
++    other_account = accounts(:initech)
++    shared_identity = identities(:david)
++
++    other_card = cards(:radio)
++    other_blob = nil
++    Current.set(account: other_account, user: users(:mike)) do
++      other_card.image.attach(io: StringIO.new("initech image"), filename: "initech.png", content_type: "image/png")
++      other_blob = other_card.image.blob
++      other_card.reindex
++    end
++
++    snapshot_before = account_snapshot(other_account)
++    identity_count_before = Identity.count
++    session_count_before = Session.count
++    sequence_value_before = Account::ExternalIdSequence.value
++
++    @account.cancel(initiated_by: @user)
++    @account.incinerate
++
++    assert_not Account.exists?(@account.id)
++    assert Account.exists?(other_account.id)
++    assert_equal snapshot_before, account_snapshot(other_account)
++    assert ActiveStorage::Blob.service.exist?(other_blob.key)
++
++    assert Identity.exists?(shared_identity.id)
++    assert_equal identity_count_before, Identity.count
++    assert_equal session_count_before, Session.count
++    assert_equal sequence_value_before, Account::ExternalIdSequence.value
++  end
++
++  test "incinerate does nothing for an active account" do
++    assert_not @account.cancelled?
++
++    assert_no_difference -> { Account.count } do
++      @account.incinerate
++    end
++
++    assert Account.exists?(@account.id)
++    assert_not @account.destroyed?
++  end
++
++  test "incinerate is idempotent when called twice" do
++    @account.cancel(initiated_by: @user)
++    @account.incinerate
++
++    assert_nothing_raised do
++      @account.incinerate
++    end
++
++    assert_not Account.exists?(@account.id)
++  end
++
++  test "incinerate handles missing blob files on disk gracefully" do
++    target = create_cancelled_account(name: "Missing Blob Account", cancelled_at: 31.days.ago)
++
++    missing_blob = Current.with_account(target) do
++      ActiveStorage::Blob.create!(
++        account: target,
++        key: "missing-file-key-#{SecureRandom.hex}",
++        filename: "missing.txt",
++        byte_size: 42,
++        checksum: "abc",
++        service_name: ActiveStorage::Blob.service.name
++      )
++    end
++
++    assert_nothing_raised do
++      target.incinerate
++    end
++
++    assert_not Account.exists?(target.id)
++    assert_not ActiveStorage::Blob.exists?(missing_blob.id)
++  end
++
++  test "incinerate preserves a blob if another account still has an attachment to it" do
++    target = create_cancelled_account(name: "Shared Blob Owner", cancelled_at: 31.days.ago)
++    other_account = accounts(:initech)
++    other_card = cards(:radio)
++
++    shared_blob = Current.with_account(target) do
++      ActiveStorage::Blob.create_and_upload!(
++        io: StringIO.new("shared content"),
++        filename: "shared.txt",
++        content_type: "text/plain"
++      )
++    end
++
++    # Insert cross-account attachment directly to simulate a shared template blob
++    cross_attachment = ActiveStorage::Attachment.new(
++      name: "image",
++      record: other_card,
++      blob: shared_blob,
++      account: other_account
++    )
++    cross_attachment.save!(validate: false)
++
++    target.incinerate
++
++    assert_not Account.exists?(target.id)
++    assert ActiveStorage::Blob.exists?(shared_blob.id)
++    assert ActiveStorage::Attachment.exists?(cross_attachment.id)
++    assert ActiveStorage::Blob.service.exist?(shared_blob.key)
++  ensure
++    cross_attachment&.delete
++    shared_blob&.purge if shared_blob && ActiveStorage::Blob.exists?(shared_blob.id)
++  end
++
++  test "incinerate_due skips accounts reactivated before incineration" do
++    target = create_cancelled_account(name: "Reactivated Race", cancelled_at: 31.days.ago)
++    target.reactivate
++
++    Account.incinerate_due
++
++    assert Account.exists?(target.id)
++  end
++
++  test "incinerate_due skips accounts reactivated and re-cancelled within grace period" do
++    target = create_cancelled_account(name: "Re-cancelled Account", cancelled_at: 31.days.ago)
++    target.reactivate
++    target.cancel(initiated_by: target.users.owner.first)
++
++    Account.incinerate_due
++
++    assert Account.exists?(target.id)
++    assert target.reload.cancelled?
++  end
++
++  private
++    def create_cancelled_account(name:, cancelled_at:)
++      account = Account.create_with_owner(
++        account: { name: name },
++        owner: { name: "#{name} Owner", identity: identities(:david) }
++      )
++      account.cancel(initiated_by: account.users.owner.first)
++      account.cancellation.update_column(:created_at, cancelled_at)
++      account
++    end
++
++    def account_snapshot(account)
++      {
++        users: User.where(account_id: account.id).count,
++        boards: Board.where(account_id: account.id).count,
++        cards: Card.where(account_id: account.id).count,
++        comments: Comment.where(account_id: account.id).count,
++        events: Event.where(account_id: account.id).count,
++        filters: Filter.where(account_id: account.id).count,
++        tags: Tag.where(account_id: account.id).count,
++        search_records: Search::Record.for(account.id).where(account_id: account.id).count,
++        blobs: ActiveStorage::Blob.where(account_id: account.id).count,
++        attachments: ActiveStorage::Attachment.where(account_id: account.id).count
++      }
++    end
++
++    def assert_every_account_table_populated(account_id, board_ids, filter_ids)
++      conn = ActiveRecord::Base.connection
++      quoted_aid = conn.quote(ActiveRecord::Type::Uuid.new.serialize(account_id))
++      account_search_table = Search::Record.for(account_id).table_name
++
++      conn.tables.sort.each do |table|
++        next if table.start_with?("search_records_") && table != account_search_table
++
++        cols = conn.columns(table).map(&:name)
++        if cols.include?("account_id")
++          count = conn.select_value("SELECT COUNT(*) FROM #{conn.quote_table_name(table)} WHERE account_id = #{quoted_aid}")
++          assert_operator count, :>, 0, "Expected test setup to populate #{table}"
++        elsif table == "storage_totals"
++          count = Storage::Total.where(owner_id: [ account_id, *board_ids ]).count
++          assert_operator count, :==, 1 + board_ids.size, "Expected test setup to populate storage_totals for account and boards"
++        elsif Account::Incineration::FILTER_JOIN_TABLES.include?(table)
++          subquery = filter_ids.map { |fid| conn.quote(ActiveRecord::Type::Uuid.new.serialize(fid)) }.join(",")
++          count = conn.select_value("SELECT COUNT(*) FROM #{conn.quote_table_name(table)} WHERE filter_id IN (#{subquery})")
++          assert_operator count, :>, 0, "Expected test setup to populate #{table}"
++        end
++      end
++    end
++
++    def assert_no_records_remain_for_account(account_id, board_ids, filter_ids, search_record_ids)
++      conn = ActiveRecord::Base.connection
++      quoted_aid = conn.quote(ActiveRecord::Type::Uuid.new.serialize(account_id))
++
++      conn.tables.sort.each do |table|
++        cols = conn.columns(table).map(&:name)
++        if cols.include?("account_id")
++          count = conn.select_value("SELECT COUNT(*) FROM #{conn.quote_table_name(table)} WHERE account_id = #{quoted_aid}")
++          assert_equal 0, count, "Expected 0 remaining rows in #{table} for incinerated account"
++        elsif table == "accounts"
++          assert_not Account.exists?(account_id), "Expected account to be deleted"
++        elsif table == "storage_totals"
++          count = Storage::Total.where(owner_id: [ account_id, *board_ids ]).count
++          assert_equal 0, count, "Expected 0 remaining rows in storage_totals for incinerated account and its boards"
++        elsif Account::Incineration::FILTER_JOIN_TABLES.include?(table)
++          subquery = filter_ids.map { |fid| conn.quote(ActiveRecord::Type::Uuid.new.serialize(fid)) }.join(",")
++          count = conn.select_value("SELECT COUNT(*) FROM #{conn.quote_table_name(table)} WHERE filter_id IN (#{subquery})")
++          assert_equal 0, count, "Expected 0 remaining rows in #{table} for incinerated account filters"
++        end
++      end
++
++      if conn.adapter_name == "SQLite"
++        fts_count = Search::Record::SQLite::Fts.where(rowid: search_record_ids).count
++        assert_equal 0, fts_count, "Expected 0 remaining rows in search_records_fts for incinerated account"
++      end
++    end
++end

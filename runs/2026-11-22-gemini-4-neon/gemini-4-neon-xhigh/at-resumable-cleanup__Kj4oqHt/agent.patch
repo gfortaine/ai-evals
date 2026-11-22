@@ -1,0 +1,361 @@
+diff --git a/Procfile b/Procfile
+index 20e1430..9ed469e 100644
+--- a/Procfile
++++ b/Procfile
+@@ -1,3 +1,3 @@
+ web: bundle exec thrust bin/start-app
+ redis: redis-server config/redis.conf
+-workers: FORK_PER_JOB=false INTERVAL=0.1 bundle exec resque-pool
++workers: FORK_PER_JOB=false INTERVAL=0.1 bundle exec resque-pool --term-graceful-wait
+diff --git a/app/jobs/title_cleanup_job.rb b/app/jobs/title_cleanup_job.rb
+index 13721ed..80b1eca 100644
+--- a/app/jobs/title_cleanup_job.rb
++++ b/app/jobs/title_cleanup_job.rb
+@@ -1,7 +1,18 @@
+ class TitleCleanupJob < ApplicationJob
++  include ActiveJob::Continuable
++
++  self.resume_options = {}
++
++  rescue_from Resque::TermException do |exception|
++    resume_job(exception)
++  end
++
+   def perform
+-    Leaf.find_each(order: :asc) do |leaf|
+-      leaf.update!(title: cleaned(leaf.title))
++    step :clean_titles do |step|
++      Leaf.find_each(start: step.cursor, order: :asc) do |leaf|
++        leaf.update!(title: cleaned(leaf.title))
++        step.advance! from: leaf.id
++      end
+     end
+   end
+ 
+diff --git a/config/initializers/resque.rb b/config/initializers/resque.rb
+new file mode 100644
+index 0000000..058815e
+--- /dev/null
++++ b/config/initializers/resque.rb
+@@ -0,0 +1,22 @@
++module ResqueWorkerStopping
++  def perform(job, &block)
++    previous = Thread.current[:resque_worker]
++    Thread.current[:resque_worker] = self
++    super
++  ensure
++    Thread.current[:resque_worker] = previous
++  end
++end
++
++module ResqueAdapterStopping
++  def stopping?
++    super || !!Thread.current[:resque_worker]&.shutdown?
++  end
++end
++
++Resque::Worker.prepend ResqueWorkerStopping
++
++ActiveSupport.on_load :active_job do
++  require "active_job/queue_adapters/resque_adapter"
++  ActiveJob::QueueAdapters::ResqueAdapter.prepend ResqueAdapterStopping
++end
+diff --git a/test/jobs/title_cleanup_job_test.rb b/test/jobs/title_cleanup_job_test.rb
+new file mode 100644
+index 0000000..8f8e407
+--- /dev/null
++++ b/test/jobs/title_cleanup_job_test.rb
+@@ -0,0 +1,293 @@
++require "test_helper"
++require "active_job/continuation/test_helper"
++
++class TitleCleanupJobTest < ActiveJob::TestCase
++  include ActiveJob::Continuation::TestHelper
++
++  setup do
++    @ordered_leaves = Leaf.order(:id).to_a
++    @ordered_leaves[0].update!(title: '""Hello" World"')
++    @ordered_leaves[1].update!(title: '""Quoted Title""')
++    @ordered_leaves[2].update!(title: '"Plain Title"')
++    @ordered_leaves[3].update!(title: '"Say "Goodbye""')
++  end
++
++  test "strips outer quotes while preserving inner quotes" do
++    TitleCleanupJob.perform_now
++
++    assert_equal '"Hello" World', @ordered_leaves[0].reload.title
++    assert_equal '"Quoted Title"', @ordered_leaves[1].reload.title
++    assert_equal "Plain Title", @ordered_leaves[2].reload.title
++    assert_equal 'Say "Goodbye"', @ordered_leaves[3].reload.title
++  end
++
++  test "resumes after interruption without re-cleaning earlier leaves" do
++    TitleCleanupJob.perform_later
++
++    interrupt_job_during_step(TitleCleanupJob, :clean_titles, cursor: @ordered_leaves[1].id + 1) do
++      perform_enqueued_jobs
++    end
++
++    assert_equal '"Hello" World', @ordered_leaves[0].reload.title
++    assert_equal '"Quoted Title"', @ordered_leaves[1].reload.title
++    assert_equal '"Plain Title"', @ordered_leaves[2].reload.title
++    assert_equal '"Say "Goodbye""', @ordered_leaves[3].reload.title
++    assert_enqueued_jobs 1, only: TitleCleanupJob
++
++    perform_enqueued_jobs
++
++    assert_equal '"Hello" World', @ordered_leaves[0].reload.title
++    assert_equal '"Quoted Title"', @ordered_leaves[1].reload.title
++    assert_equal "Plain Title", @ordered_leaves[2].reload.title
++    assert_equal 'Say "Goodbye"', @ordered_leaves[3].reload.title
++    assert_no_enqueued_jobs
++  end
++
++  test "survives multiple consecutive interruptions cleaning each leaf exactly once" do
++    updated_ids = []
++    subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |_name, _start, _finish, _id, payload|
++      if payload[:sql].start_with?("UPDATE \"leaves\"")
++        updated_ids << payload[:type_casted_binds].last
++      end
++    end
++
++    TitleCleanupJob.perform_later
++
++    3.times do
++      queue_adapter.with(stopping: true) do
++        perform_enqueued_jobs
++      end
++      assert_enqueued_jobs 1, only: TitleCleanupJob
++    end
++
++    perform_enqueued_jobs
++
++    assert_equal @ordered_leaves.map(&:id), updated_ids
++    assert_equal '"Hello" World', @ordered_leaves[0].reload.title
++    assert_equal '"Quoted Title"', @ordered_leaves[1].reload.title
++    assert_equal "Plain Title", @ordered_leaves[2].reload.title
++    assert_equal 'Say "Goodbye"', @ordered_leaves[3].reload.title
++    assert_no_enqueued_jobs
++  ensure
++    ActiveSupport::Notifications.unsubscribe(subscriber) if subscriber
++  end
++
++  test "resumes from the failed leaf after an error during update" do
++    TitleCleanupJob.perform_later
++    target_id = @ordered_leaves[2].id
++
++    with_failing_leaf_update(target_id, RuntimeError.new("transient error")) do
++      perform_enqueued_jobs
++    end
++
++    assert_equal '"Hello" World', @ordered_leaves[0].reload.title
++    assert_equal '"Quoted Title"', @ordered_leaves[1].reload.title
++    assert_equal '"Plain Title"', @ordered_leaves[2].reload.title
++    assert_equal '"Say "Goodbye""', @ordered_leaves[3].reload.title
++    assert_enqueued_jobs 1, only: TitleCleanupJob
++
++    perform_enqueued_jobs
++
++    assert_equal '"Hello" World', @ordered_leaves[0].reload.title
++    assert_equal '"Quoted Title"', @ordered_leaves[1].reload.title
++    assert_equal "Plain Title", @ordered_leaves[2].reload.title
++    assert_equal 'Say "Goodbye"', @ordered_leaves[3].reload.title
++    assert_no_enqueued_jobs
++  end
++
++  test "resumes from the interrupted leaf after Resque::TermException" do
++    TitleCleanupJob.perform_later
++    target_id = @ordered_leaves[2].id
++
++    with_failing_leaf_update(target_id, Resque::TermException.new("SIGTERM")) do
++      perform_enqueued_jobs
++    end
++
++    assert_equal '"Hello" World', @ordered_leaves[0].reload.title
++    assert_equal '"Quoted Title"', @ordered_leaves[1].reload.title
++    assert_equal '"Plain Title"', @ordered_leaves[2].reload.title
++    assert_equal '"Say "Goodbye""', @ordered_leaves[3].reload.title
++    assert_enqueued_jobs 1, only: TitleCleanupJob
++
++    perform_enqueued_jobs
++
++    assert_equal '"Hello" World', @ordered_leaves[0].reload.title
++    assert_equal '"Quoted Title"', @ordered_leaves[1].reload.title
++    assert_equal "Plain Title", @ordered_leaves[2].reload.title
++    assert_equal 'Say "Goodbye"', @ordered_leaves[3].reload.title
++    assert_no_enqueued_jobs
++  end
++
++  test "resumes from the first leaf after Resque::TermException on the first leaf" do
++    TitleCleanupJob.perform_later
++    target_id = @ordered_leaves[0].id
++
++    with_failing_leaf_update(target_id, Resque::TermException.new("SIGTERM")) do
++      perform_enqueued_jobs
++    end
++
++    assert_equal '""Hello" World"', @ordered_leaves[0].reload.title
++    assert_enqueued_jobs 1, only: TitleCleanupJob
++
++    perform_enqueued_jobs
++
++    assert_equal '"Hello" World', @ordered_leaves[0].reload.title
++    assert_equal '"Quoted Title"', @ordered_leaves[1].reload.title
++    assert_equal "Plain Title", @ordered_leaves[2].reload.title
++    assert_equal 'Say "Goodbye"', @ordered_leaves[3].reload.title
++    assert_no_enqueued_jobs
++  end
++
++  test "interrupts and re-enqueues via Resque without resque-scheduler when worker shuts down" do
++    enqueued = []
++    resque_adapter = ActiveJob::QueueAdapters::ResqueAdapter.new
++
++    with_resque_adapter(resque_adapter, enqueued) do
++      worker = Resque::Worker.new("default")
++      worker.fork_per_job = false
++
++      target_id = @ordered_leaves[1].id
++      job_data = TitleCleanupJob.new.serialize
++      resque_job = Resque::Job.new("default", { "class" => ActiveJob::QueueAdapters::ResqueAdapter::JobWrapper.name, "args" => [ job_data ] })
++
++      with_after_leaf_update(target_id, -> { worker.shutdown }) do
++        worker.perform(resque_job)
++      end
++
++      assert_equal 1, enqueued.size
++      assert_equal '"Hello" World', @ordered_leaves[0].reload.title
++      assert_equal '"Quoted Title"', @ordered_leaves[1].reload.title
++      assert_equal '"Plain Title"', @ordered_leaves[2].reload.title
++      assert_equal '"Say "Goodbye""', @ordered_leaves[3].reload.title
++
++      next_worker = Resque::Worker.new("default")
++      next_worker.fork_per_job = false
++      queue, klass, args = enqueued.shift
++      resumed_job = Resque::Job.new(queue, { "class" => klass.name, "args" => args })
++      next_worker.perform(resumed_job)
++
++      assert_empty enqueued
++      assert_equal '"Hello" World', @ordered_leaves[0].reload.title
++      assert_equal '"Quoted Title"', @ordered_leaves[1].reload.title
++      assert_equal "Plain Title", @ordered_leaves[2].reload.title
++      assert_equal 'Say "Goodbye"', @ordered_leaves[3].reload.title
++    end
++  end
++
++  test "resque adapter honors explicit stopping flag and resumes without resque-scheduler" do
++    enqueued = []
++    resque_adapter = ActiveJob::QueueAdapters::ResqueAdapter.new
++
++    with_resque_adapter(resque_adapter, enqueued) do
++      resque_adapter.stopping = true
++      TitleCleanupJob.perform_now
++
++      assert_equal 1, enqueued.size
++      assert_equal '"Hello" World', @ordered_leaves[0].reload.title
++      assert_equal '""Quoted Title""', @ordered_leaves[1].reload.title
++
++      resque_adapter.stopping = false
++      _queue, klass, args = enqueued.shift
++      klass.perform(*args)
++
++      assert_empty enqueued
++      assert_equal '"Hello" World', @ordered_leaves[0].reload.title
++      assert_equal '"Quoted Title"', @ordered_leaves[1].reload.title
++      assert_equal "Plain Title", @ordered_leaves[2].reload.title
++      assert_equal 'Say "Goodbye"', @ordered_leaves[3].reload.title
++    end
++  end
++
++  test "handles interruption right after the final leaf without re-cleaning it" do
++    TitleCleanupJob.perform_later
++
++    interrupt_job_during_step(TitleCleanupJob, :clean_titles, cursor: @ordered_leaves.last.id + 1) do
++      perform_enqueued_jobs
++    end
++
++    assert_enqueued_jobs 1, only: TitleCleanupJob
++
++    perform_enqueued_jobs
++
++    assert_equal '"Hello" World', @ordered_leaves[0].reload.title
++    assert_equal '"Quoted Title"', @ordered_leaves[1].reload.title
++    assert_equal "Plain Title", @ordered_leaves[2].reload.title
++    assert_equal 'Say "Goodbye"', @ordered_leaves[3].reload.title
++    assert_no_enqueued_jobs
++  end
++
++  test "handles deleted leaf between interruption and resume" do
++    TitleCleanupJob.perform_later
++
++    interrupt_job_during_step(TitleCleanupJob, :clean_titles, cursor: @ordered_leaves[0].id + 1) do
++      perform_enqueued_jobs
++    end
++
++    @ordered_leaves[1].destroy!
++    perform_enqueued_jobs
++
++    assert_equal '"Hello" World', @ordered_leaves[0].reload.title
++    assert_equal "Plain Title", @ordered_leaves[2].reload.title
++    assert_equal 'Say "Goodbye"', @ordered_leaves[3].reload.title
++    assert_no_enqueued_jobs only: TitleCleanupJob
++  end
++
++  test "handles an empty collection" do
++    Leaf.destroy_all
++
++    assert_no_enqueued_jobs only: TitleCleanupJob do
++      TitleCleanupJob.perform_now
++    end
++  end
++
++  private
++    def with_failing_leaf_update(target_id, error)
++      original = Leaf.instance_method(:update!)
++      failed = false
++
++      Leaf.define_method(:update!) do |*args, **kwargs|
++        if !failed && id == target_id
++          failed = true
++          raise error
++        end
++        original.bind_call(self, *args, **kwargs)
++      end
++
++      yield
++    ensure
++      Leaf.define_method(:update!, original)
++    end
++
++    def with_after_leaf_update(target_id, callback)
++      original = Leaf.instance_method(:update!)
++
++      Leaf.define_method(:update!) do |*args, **kwargs|
++        result = original.bind_call(self, *args, **kwargs)
++        callback.call if id == target_id
++        result
++      end
++
++      yield
++    ensure
++      Leaf.define_method(:update!, original)
++    end
++
++    def with_resque_adapter(adapter, enqueued)
++      original_adapter = TitleCleanupJob._queue_adapter
++      original_adapter_name = TitleCleanupJob._queue_adapter_name
++      original_enqueue_to = Resque.method(:enqueue_to)
++
++      TitleCleanupJob.disable_test_adapter
++      TitleCleanupJob.queue_adapter = adapter
++      Resque.define_singleton_method(:enqueue_to) do |queue, klass, *args|
++        enqueued << [ queue, klass, args ]
++      end
++
++      yield
++    ensure
++      Resque.define_singleton_method(:enqueue_to, original_enqueue_to)
++      TitleCleanupJob._queue_adapter = original_adapter
++      TitleCleanupJob._queue_adapter_name = original_adapter_name
++      TitleCleanupJob.enable_test_adapter(queue_adapter)
++    end
++end

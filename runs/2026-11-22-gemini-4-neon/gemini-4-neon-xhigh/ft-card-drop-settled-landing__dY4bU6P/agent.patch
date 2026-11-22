@@ -1,0 +1,1398 @@
+diff --git a/app/controllers/cards/closures_controller.rb b/app/controllers/cards/closures_controller.rb
+index a78b304..5d32e35 100644
+--- a/app/controllers/cards/closures_controller.rb
++++ b/app/controllers/cards/closures_controller.rb
+@@ -4,20 +4,18 @@ class Cards::ClosuresController < ApplicationController
+   def create
+     capture_card_location
+     @card.close
+-    refresh_stream_if_needed
+ 
+     respond_to do |format|
+-      format.turbo_stream
++      format.turbo_stream { refresh_stream_if_needed }
+       format.json { head :no_content }
+     end
+   end
+ 
+   def destroy
+     @card.reopen
+-    refresh_stream_after_reopen
+ 
+     respond_to do |format|
+-      format.turbo_stream
++      format.turbo_stream { refresh_stream_after_reopen }
+       format.json { head :no_content }
+     end
+   end
+diff --git a/app/controllers/cards/not_nows_controller.rb b/app/controllers/cards/not_nows_controller.rb
+index ea91436..72e48f2 100644
+--- a/app/controllers/cards/not_nows_controller.rb
++++ b/app/controllers/cards/not_nows_controller.rb
+@@ -4,10 +4,9 @@ class Cards::NotNowsController < ApplicationController
+   def create
+     capture_card_location
+     @card.postpone
+-    refresh_stream_if_needed
+ 
+     respond_to do |format|
+-      format.turbo_stream
++      format.turbo_stream { refresh_stream_if_needed }
+       format.json { head :no_content }
+     end
+   end
+diff --git a/app/helpers/columns_helper.rb b/app/helpers/columns_helper.rb
+index e3b39c1..a22f312 100644
+--- a/app/helpers/columns_helper.rb
++++ b/app/helpers/columns_helper.rb
+@@ -17,12 +17,18 @@ module ColumnsHelper
+ 
+     data = {
+       navigable_list_target: "item",
+-      column_name: name
++      drag_and_drop_target: "container",
++      column_name: name,
++      card_color: card_color
+     }.merge(data)
+ 
+     data[:action] = token_list(
+       "turbo:before-morph-attribute->collapsible-columns#preventToggle",
+       "focus->navigable-list#select",
++      "dragenter->drag-and-drop#dragEnter",
++      "dragover->drag-and-drop#dragOver",
++      "dragleave->drag-and-drop#dragLeave",
++      "drop->drag-and-drop#drop",
+       data.delete(:action)
+     )
+ 
+diff --git a/app/javascript/controllers/drag_and_drop_controller.js b/app/javascript/controllers/drag_and_drop_controller.js
+new file mode 100644
+index 0000000..44e3711
+--- /dev/null
++++ b/app/javascript/controllers/drag_and_drop_controller.js
+@@ -0,0 +1,461 @@
++import { Controller } from "@hotwired/stimulus"
++import { Turbo } from "@hotwired/turbo-rails"
++import { post, destroy } from "@rails/request.js"
++import { onNextEventLoopTick } from "helpers/timing_helpers"
++import { isMobile } from "helpers/platform_helpers"
++
++const MAX_PROGRESS_COUNT = 15 // should match first geared pagination page size
++
++export default class extends Controller {
++  static classes = [ "draggedItem", "hoverContainer" ]
++  static targets = [ "container", "item" ]
++  static values = {
++    desktopBreakpoint: { type: String, default: "(min-width: 640px)" }
++  }
++
++  #draggedItem = null
++  #sourceContainer = null
++  #hoveredContainer = null
++  #pendingSaves = Promise.resolve()
++  #inFlightSaves = 0
++  #dropVersion = 0
++  #containerDropVersion = new WeakMap()
++  #frameFetchVersion = new WeakMap()
++  #staleFrames = new Set()
++  #needsPageRefresh = false
++  #mediaQuery = null
++  #handleMediaChange = null
++
++  connect() {
++    this.#mediaQuery = window.matchMedia(this.desktopBreakpointValue)
++    this.#handleMediaChange = () => this.#updateDraggableItems()
++    this.#mediaQuery.addEventListener("change", this.#handleMediaChange)
++    this.#updateDraggableItems()
++  }
++
++  disconnect() {
++    this.#mediaQuery?.removeEventListener("change", this.#handleMediaChange)
++    this.#resetDragState()
++    this.itemTargets.forEach(item => item.removeAttribute("draggable"))
++  }
++
++  itemTargetConnected(item) {
++    this.#updateDraggableItem(item)
++  }
++
++  // Actions
++
++  dragStart(event) {
++    if (!this.#isDragEnabled) {
++      event.preventDefault()
++      return
++    }
++
++    const item = event.currentTarget
++    const sourceContainer = this.#containerFor(item)
++    if (!sourceContainer) return
++
++    this.#draggedItem = item
++    this.#sourceContainer = sourceContainer
++
++    if (event.dataTransfer) {
++      event.dataTransfer.effectAllowed = "move"
++      event.dataTransfer.setData("text/plain", item.id || "")
++    }
++
++    onNextEventLoopTick(() => {
++      if (this.#draggedItem === item) {
++        item.classList.add(this.draggedItemClass)
++      }
++    })
++  }
++
++  dragEnter(event) {
++    this.#handleDragHover(event)
++  }
++
++  dragOver(event) {
++    this.#handleDragHover(event)
++  }
++
++  dragLeave(event) {
++    if (!this.#draggedItem) return
++
++    const container = event.currentTarget
++    if (container === this.#hoveredContainer && !container.contains(event.relatedTarget)) {
++      this.#clearHoverContainer()
++    }
++  }
++
++  drop(event) {
++    if (!this.#draggedItem) return
++
++    const item = this.#draggedItem
++    const sourceContainer = this.#sourceContainer
++    const targetContainer = event.currentTarget
++
++    this.#resetDragState()
++
++    if (targetContainer === sourceContainer) return
++
++    event.preventDefault()
++
++    this.#dropVersion += 1
++    this.#containerDropVersion.set(sourceContainer, this.#dropVersion)
++    this.#containerDropVersion.set(targetContainer, this.#dropVersion)
++    this.#inFlightSaves += 1
++
++    const snapshot = this.#captureSnapshot(item, sourceContainer, targetContainer)
++    const insertedIntoList = this.#moveItem(item, sourceContainer, targetContainer)
++
++    this.#enqueueSave(() => this.#persistMove(item, targetContainer, snapshot, insertedIntoList))
++  }
++
++  dragEnd() {
++    this.#resetDragState()
++  }
++
++  refresh() {
++    this.#updateDraggableItems()
++  }
++
++  preserveDragAttributes(event) {
++    const { attributeName } = event.detail
++    const target = event.target
++
++    if (attributeName === "draggable" && this.#isDragEnabled && target.matches('[data-drag-and-drop-target~="item"]')) {
++      event.preventDefault()
++    } else if (attributeName === "class" && (target === this.#draggedItem || target === this.#hoveredContainer)) {
++      event.preventDefault()
++    }
++  }
++
++  trackFrameFetch(event) {
++    const frame = event.target
++    if (frame?.tagName === "TURBO-FRAME") {
++      this.#frameFetchVersion.set(frame, this.#dropVersion)
++    }
++  }
++
++  preventStaleFrameRender(event) {
++    const frame = event.target
++    if (frame?.tagName !== "TURBO-FRAME") return
++
++    const container = this.#containerFor(frame)
++    if (!container) return
++
++    const containerVersion = this.#containerDropVersion.get(container) || 0
++    const fetchVersion = this.#frameFetchVersion.get(frame) ?? 0
++
++    if (fetchVersion < containerVersion || (this.#inFlightSaves > 0 && containerVersion > 0)) {
++      event.detail.render = () => {}
++
++      if (this.#inFlightSaves > 0) {
++        this.#staleFrames.add(frame)
++      } else {
++        onNextEventLoopTick(() => {
++          if (frame.isConnected) frame.reload()
++        })
++      }
++    }
++  }
++
++  preventStalePageMorph(event) {
++    if (event.detail.renderMethod === "morph" && this.#inFlightSaves > 0) {
++      event.detail.render = () => {}
++      this.#needsPageRefresh = true
++    }
++  }
++
++  // Private
++
++  get #isDragEnabled() {
++    if (isMobile()) return false
++
++    const mediaQuery = this.#mediaQuery || window.matchMedia(this.desktopBreakpointValue)
++    return mediaQuery.matches
++  }
++
++  #updateDraggableItems() {
++    this.itemTargets.forEach(item => this.#updateDraggableItem(item))
++  }
++
++  #updateDraggableItem(item) {
++    if (this.#isDragEnabled) {
++      item.setAttribute("draggable", "true")
++    } else {
++      item.removeAttribute("draggable")
++    }
++  }
++
++  #containerFor(element) {
++    return element.closest('[data-drag-and-drop-target~="container"]')
++  }
++
++  #handleDragHover(event) {
++    if (!this.#draggedItem) return
++
++    const container = event.currentTarget
++    if (container === this.#sourceContainer) {
++      this.#clearHoverContainer()
++      return
++    }
++
++    event.preventDefault()
++    if (event.dataTransfer) {
++      event.dataTransfer.dropEffect = "move"
++    }
++
++    this.#setHoverContainer(container)
++  }
++
++  #setHoverContainer(container) {
++    if (this.#hoveredContainer === container) return
++
++    this.#clearHoverContainer()
++    this.#hoveredContainer = container
++    this.#hoveredContainer.classList.add(this.hoverContainerClass)
++  }
++
++  #clearHoverContainer() {
++    this.#hoveredContainer?.classList.remove(this.hoverContainerClass)
++    this.#hoveredContainer = null
++  }
++
++  #resetDragState() {
++    this.#draggedItem?.classList.remove(this.draggedItemClass)
++    this.#clearHoverContainer()
++    this.#draggedItem = null
++    this.#sourceContainer = null
++  }
++
++  #captureSnapshot(item, sourceContainer, targetContainer) {
++    const updatedTime = item.querySelector(".card__meta-text--updated time")
++    const bubble = item.querySelector(".bubble")
++
++    return {
++      sourceContainer,
++      targetContainer,
++      previousParent: item.parentElement,
++      previousNextSibling: item.nextElementSibling,
++      previousCardColor: item.style.getPropertyValue("--card-color"),
++      wasActive: item.classList.contains("card--active"),
++      wasPostponed: item.classList.contains("card--postponed"),
++      stamps: Array.from(item.querySelectorAll(".card__closed")).map(stamp => ({
++        element: stamp,
++        parent: stamp.parentElement,
++        nextSibling: stamp.nextElementSibling
++      })),
++      previousUpdatedDatetime: updatedTime?.getAttribute("datetime"),
++      previousBubble: bubble ? {
++        hidden: bubble.hidden,
++        entropy: bubble.dataset.bubbleEntropyValue,
++        stalled: bubble.dataset.bubbleStalledValue
++      } : null
++    }
++  }
++
++  #moveItem(item, sourceContainer, targetContainer) {
++    this.#clearNavigableSelection(item, sourceContainer)
++    this.#updateItemState(item, targetContainer)
++
++    const insertedIntoList = this.#insertIntoContainer(item, targetContainer)
++
++    this.#adjustCount(sourceContainer, -1)
++    this.#adjustCount(targetContainer, +1)
++
++    return insertedIntoList
++  }
++
++  #clearNavigableSelection(item, sourceContainer) {
++    item.removeAttribute("aria-selected")
++
++    const listElement = sourceContainer.querySelector('[data-controller~="navigable-list"]')
++    const listController = listElement && this.application.getControllerForElementAndIdentifier(listElement, "navigable-list")
++    if (listController?.isSelected(item)) {
++      listController.clearSelection()
++    }
++  }
++
++  #updateItemState(item, targetContainer) {
++    item.classList.remove("card--active", "card--postponed")
++    item.querySelectorAll(".card__closed").forEach(stamp => stamp.remove())
++
++    const dropKind = targetContainer.dataset.dropKind
++    if (dropKind === "column" || dropKind === "stream") {
++      item.classList.add("card--active")
++      if (targetContainer.dataset.cardColor) {
++        item.style.setProperty("--card-color", targetContainer.dataset.cardColor)
++      }
++    } else if (dropKind === "not-now") {
++      item.classList.add("card--postponed")
++      item.style.setProperty("--card-color", "var(--color-card-default)")
++    }
++
++    const updatedTime = item.querySelector(".card__meta-text--updated time")
++    if (updatedTime) {
++      updatedTime.setAttribute("datetime", Math.floor(Date.now() / 1000))
++    }
++
++    const bubble = item.querySelector(".bubble")
++    if (bubble) {
++      bubble.hidden = true
++      bubble.dataset.bubbleEntropyValue = "{}"
++      bubble.dataset.bubbleStalledValue = "{}"
++    }
++  }
++
++  #insertIntoContainer(item, targetContainer) {
++    const cardsList = targetContainer.querySelector(".cards__list")
++    if (!cardsList) {
++      item.remove()
++      return false
++    }
++
++    const existingCards = Array.from(cardsList.querySelectorAll('[data-drag-and-drop-target~="item"]'))
++    const goldenFirst = targetContainer.dataset.goldenFirst === "true"
++    const isGolden = item.classList.contains("golden-effect")
++
++    if (existingCards.length === 0) {
++      const targetParent = cardsList.querySelector("turbo-frame") || cardsList
++      targetParent.prepend(item)
++    } else if (!goldenFirst || isGolden) {
++      existingCards[0].before(item)
++    } else {
++      const firstNonGolden = existingCards.find(card => !card.classList.contains("golden-effect"))
++      if (firstNonGolden) {
++        firstNonGolden.before(item)
++      } else {
++        existingCards[existingCards.length - 1].after(item)
++      }
++    }
++
++    return true
++  }
++
++  #adjustCount(container, delta) {
++    const countElement = container.querySelector(".cards__expander-count")
++    if (!countElement) return
++
++    const currentCount = parseInt(countElement.dataset.count ?? countElement.textContent, 10)
++    if (Number.isNaN(currentCount)) return
++
++    const nextCount = Math.max(0, currentCount + delta)
++    countElement.dataset.count = nextCount
++    countElement.textContent = nextCount > 99 ? "99+" : String(nextCount)
++
++    const counterButton = container.querySelector('[data-css-variable-counter-target="counter"]')
++    if (counterButton) {
++      counterButton.style.setProperty("--card-count", Math.min(nextCount, MAX_PROGRESS_COUNT))
++    }
++  }
++
++  #enqueueSave(saveFn) {
++    const result = this.#pendingSaves.then(saveFn, saveFn)
++    this.#pendingSaves = result.catch(() => {})
++    return result
++  }
++
++  async #persistMove(item, targetContainer, snapshot, insertedIntoList) {
++    try {
++      const response = await this.#sendMoveRequest(item, targetContainer)
++
++      if (!response.ok) {
++        this.#revertMove(item, snapshot)
++        return
++      }
++
++      if (!insertedIntoList) {
++        const targetFrame = targetContainer.querySelector("turbo-frame")
++        if (targetFrame) this.#staleFrames.add(targetFrame)
++      }
++    } catch {
++      this.#revertMove(item, snapshot)
++    } finally {
++      this.#inFlightSaves -= 1
++      if (this.#inFlightSaves === 0) {
++        this.#flushDeferredRefreshes()
++      }
++    }
++  }
++
++  #flushDeferredRefreshes() {
++    if (this.#needsPageRefresh) {
++      this.#needsPageRefresh = false
++      this.#staleFrames.clear()
++      Turbo.visit(window.location.href, { action: "replace" })
++      return
++    }
++
++    if (this.#staleFrames.size > 0) {
++      const frames = Array.from(this.#staleFrames)
++      this.#staleFrames.clear()
++      frames.forEach(frame => {
++        if (frame.isConnected) frame.reload()
++      })
++    }
++  }
++
++  #sendMoveRequest(item, targetContainer) {
++    const options = { responseKind: "json", keepalive: true }
++
++    switch (targetContainer.dataset.dropKind) {
++      case "not-now":
++        return post(item.dataset.cardNotNowUrl, options)
++      case "closed":
++        return post(item.dataset.cardClosureUrl, options)
++      case "stream":
++        return destroy(item.dataset.cardTriageUrl, options)
++      case "column":
++        return post(item.dataset.cardTriageUrl, {
++          ...options,
++          body: { column_id: targetContainer.dataset.columnId }
++        })
++    }
++  }
++
++  #revertMove(item, snapshot) {
++    if (!snapshot.previousParent?.isConnected || (item.isConnected && this.#containerFor(item) !== snapshot.targetContainer)) {
++      Turbo.visit(window.location.href, { action: "replace" })
++      return
++    }
++
++    item.classList.toggle("card--active", snapshot.wasActive)
++    item.classList.toggle("card--postponed", snapshot.wasPostponed)
++
++    if (snapshot.previousCardColor) {
++      item.style.setProperty("--card-color", snapshot.previousCardColor)
++    } else {
++      item.style.removeProperty("--card-color")
++    }
++
++    snapshot.stamps.forEach(({ element, parent, nextSibling }) => {
++      if (nextSibling?.parentElement === parent) {
++        nextSibling.before(element)
++      } else {
++        parent?.append(element)
++      }
++    })
++
++    const updatedTime = item.querySelector(".card__meta-text--updated time")
++    if (updatedTime && snapshot.previousUpdatedDatetime != null) {
++      updatedTime.setAttribute("datetime", snapshot.previousUpdatedDatetime)
++    }
++
++    const bubble = item.querySelector(".bubble")
++    if (bubble && snapshot.previousBubble) {
++      bubble.hidden = snapshot.previousBubble.hidden
++      bubble.dataset.bubbleEntropyValue = snapshot.previousBubble.entropy
++      bubble.dataset.bubbleStalledValue = snapshot.previousBubble.stalled
++    }
++
++    if (snapshot.previousNextSibling?.parentElement === snapshot.previousParent) {
++      snapshot.previousNextSibling.before(item)
++    } else {
++      snapshot.previousParent.append(item)
++    }
++
++    this.#adjustCount(snapshot.sourceContainer, +1)
++    this.#adjustCount(snapshot.targetContainer, -1)
++  }
++}
+diff --git a/app/models/card/closeable.rb b/app/models/card/closeable.rb
+index ff94745..30da60f 100644
+--- a/app/models/card/closeable.rb
++++ b/app/models/card/closeable.rb
+@@ -32,6 +32,7 @@ module Card::Closeable
+     unless closed?
+       transaction do
+         not_now&.destroy
++        association(:not_now).reset
+         create_closure! user: user
+         track_event :closed, creator: user
+       end
+@@ -42,6 +43,7 @@ module Card::Closeable
+     if closed?
+       transaction do
+         closure&.destroy
++        association(:closure).reset
+         track_event :reopened, creator: user
+       end
+     end
+diff --git a/app/models/card/postponable.rb b/app/models/card/postponable.rb
+index ab58960..af28c3c 100644
+--- a/app/models/card/postponable.rb
++++ b/app/models/card/postponable.rb
+@@ -43,6 +43,7 @@ module Card::Postponable
+       reopen
+       activity_spike&.destroy
+       not_now&.destroy
++      association(:not_now).reset
+     end
+   end
+ end
+diff --git a/app/views/boards/columns/closeds/show.html.erb b/app/views/boards/columns/closeds/show.html.erb
+index 28362b1..1ad835c 100644
+--- a/app/views/boards/columns/closeds/show.html.erb
++++ b/app/views/boards/columns/closeds/show.html.erb
+@@ -17,9 +17,8 @@
+         <%= with_automatic_pagination :closed_column, @page do %>
+           <%= render "cards/display/previews", cards: @page.records %>
+         <% end %>
+-      <% else %>
+-        <%= render "boards/columns/empty_placeholder" %>
+       <% end %>
++      <%= render "boards/columns/empty_placeholder" %>
+     </div>
+   <% end %>
+ </section>
+diff --git a/app/views/boards/columns/not_nows/show.html.erb b/app/views/boards/columns/not_nows/show.html.erb
+index e1ebb2c..d52c645 100644
+--- a/app/views/boards/columns/not_nows/show.html.erb
++++ b/app/views/boards/columns/not_nows/show.html.erb
+@@ -17,9 +17,8 @@
+         <%= with_automatic_pagination :not_now_column, @page do %>
+           <%= render "cards/display/previews", cards: @page.records %>
+         <% end %>
+-      <% else %>
+-        <%= render "boards/columns/empty_placeholder" %>
+       <% end %>
++      <%= render "boards/columns/empty_placeholder" %>
+     </div>
+   <% end %>
+ </section>
+diff --git a/app/views/boards/columns/show.html.erb b/app/views/boards/columns/show.html.erb
+index e96b5eb..da99e80 100644
+--- a/app/views/boards/columns/show.html.erb
++++ b/app/views/boards/columns/show.html.erb
+@@ -17,9 +17,8 @@
+         <%= with_automatic_pagination dom_id(@column, :cards), @page do %>
+           <%= render "cards/display/previews", cards: @page.records %>
+         <% end %>
+-      <% else %>
+-        <%= render "boards/columns/empty_placeholder" %>
+       <% end %>
++      <%= render "boards/columns/empty_placeholder" %>
+     </div>
+   <% end %>
+ </section>
+diff --git a/app/views/boards/columns/streams/show.html.erb b/app/views/boards/columns/streams/show.html.erb
+index 74ba004..5a19979 100644
+--- a/app/views/boards/columns/streams/show.html.erb
++++ b/app/views/boards/columns/streams/show.html.erb
+@@ -17,9 +17,8 @@
+         <%= with_automatic_pagination :stream_column, @page do %>
+           <%= render "cards/display/previews", cards: @page.records %>
+         <% end %>
+-      <% else %>
+-        <%= render "boards/columns/empty_placeholder" %>
+       <% end %>
++      <%= render "boards/columns/empty_placeholder" %>
+     </div>
+   <% end %>
+ </section>
+diff --git a/app/views/boards/show/_closed.html.erb b/app/views/boards/show/_closed.html.erb
+index 2449d03..8d8c1f7 100644
+--- a/app/views/boards/show/_closed.html.erb
++++ b/app/views/boards/show/_closed.html.erb
+@@ -1,7 +1,8 @@
+-<%= column_tag id: "closed-cards", name: "Done", class: "cards--closed", style: "--card-color: var(--color-card-complete);",
++<%= column_tag id: "closed-cards", name: "Done", card_color: "var(--color-card-complete)", class: "cards--closed", style: "--card-color: var(--color-card-complete);",
+   data: {
+     card_hotkeys_disabled: true,
+     collapsible_columns_target: "column",
++    drop_kind: "closed",
+     action: "focus->collapsible-columns#focusOnColumn"
+   } do %>
+   <header class="cards__header">
+diff --git a/app/views/boards/show/_column.html.erb b/app/views/boards/show/_column.html.erb
+index b8f2fdd..c261802 100644
+--- a/app/views/boards/show/_column.html.erb
++++ b/app/views/boards/show/_column.html.erb
+@@ -3,6 +3,9 @@
+   data: {
+     collapsible_columns_target: "column",
+     controller: "clicker",
++    drop_kind: "column",
++    column_id: column.id,
++    golden_first: true,
+     action: "turbo:before-stream-render@document->collapsible-columns#restoreState focus->collapsible-columns#focusOnColumn dialog:show->collapsible-columns#frameColumnOnMobile"
+   } do %>
+   <header class="cards__header">
+diff --git a/app/views/boards/show/_columns.html.erb b/app/views/boards/show/_columns.html.erb
+index 7769866..b5a6a89 100644
+--- a/app/views/boards/show/_columns.html.erb
++++ b/app/views/boards/show/_columns.html.erb
+@@ -1,10 +1,12 @@
+ <%= tag.div class: "card-columns hide-scrollbar", data: {
+-      controller: "collapsible-columns navigable-list card-hotkeys",
++      controller: "collapsible-columns navigable-list card-hotkeys drag-and-drop",
+       collapsible_columns_board_value: board.id,
+       collapsible_columns_collapsed_class: "is-collapsed",
+       collapsible_columns_expanded_class: "is-expanded",
+       collapsible_columns_no_transitions_class: "no-transitions",
+       collapsible_columns_title_not_visible_class: "is-off-screen",
++      drag_and_drop_dragged_item_class: "drag-and-drop__dragged-item",
++      drag_and_drop_hover_container_class: "drag-and-drop__hover-container",
+       navigable_list_supports_vertical_navigation_value: false,
+       navigable_list_has_nested_navigation_value: true,
+       navigable_list_prevent_handled_keys_value: true,
+@@ -16,6 +18,12 @@
+         keydown->navigable-list#navigate
+         keydown->card-hotkeys#handleKeydown
+         turbo:morph@document->card-hotkeys#handleMorphComplete
++        turbo:morph@document->drag-and-drop#refresh
++        turbo:frame-render->drag-and-drop#refresh
++        turbo:before-morph-attribute->drag-and-drop#preserveDragAttributes
++        turbo:before-fetch-request->drag-and-drop#trackFrameFetch
++        turbo:before-frame-render->drag-and-drop#preventStaleFrameRender
++        turbo:before-render@document->drag-and-drop#preventStalePageMorph
+         click@document->navigable-list#deselectWhenClickingOutside" } do %>
+   <div class="card-columns__left">
+     <%= render "boards/show/not_now", board: board %>
+diff --git a/app/views/boards/show/_expander.html.erb b/app/views/boards/show/_expander.html.erb
+index 7711154..30ba4a8 100644
+--- a/app/views/boards/show/_expander.html.erb
++++ b/app/views/boards/show/_expander.html.erb
+@@ -1,6 +1,6 @@
+ <button class="cards__expander btn btn--plain" data-collapsible-columns-target="button" data-css-variable-counter-target="counter" data-action="click->collapsible-columns#toggle click->navigable-list#selectCurrentOrReset"
+   style="--card-count: <%= [ count, 15 ].min %>" aria-controls="<%= column_id %>" aria-expanded="false">
+-  <span class="cards__expander-count"><%= count > 99 ? "99+" : count %></span>
++  <span class="cards__expander-count" data-count="<%= count %>"><%= count > 99 ? "99+" : count %></span>
+   <h2 class="cards__expander-title" data-collapsible-columns-target="title">
+     <%= title %>
+     <%= icon_tag "collapse" %>
+diff --git a/app/views/boards/show/_not_now.html.erb b/app/views/boards/show/_not_now.html.erb
+index 2804a8f..282a472 100644
+--- a/app/views/boards/show/_not_now.html.erb
++++ b/app/views/boards/show/_not_now.html.erb
+@@ -1,7 +1,8 @@
+-<%= column_tag id: "not-now", name: "Not Now", class: "cards--on-deck", style: "--card-color: var(--color-card-complete);",
++<%= column_tag id: "not-now", name: "Not Now", card_color: "var(--color-card-complete)", class: "cards--on-deck", style: "--card-color: var(--color-card-complete);",
+   data: {
+     card_hotkeys_disabled: true,
+     collapsible_columns_target: "column",
++    drop_kind: "not-now",
+     action: "focus->collapsible-columns#focusOnColumn"
+   } do %>
+   <header class="cards__header">
+diff --git a/app/views/boards/show/_stream.html.erb b/app/views/boards/show/_stream.html.erb
+index 1c430af..4e1da72 100644
+--- a/app/views/boards/show/_stream.html.erb
++++ b/app/views/boards/show/_stream.html.erb
+@@ -1,5 +1,7 @@
+ <%= column_tag id: "maybe", name: "Maybe?", collapsed: false, selected: "true", class: "cards--maybe", data: {
+   collapsible_columns_target: "column maybeColumn",
++  drop_kind: "stream",
++  golden_first: true,
+   action: "focus->collapsible-columns#focusOnColumn"
+ } do %>
+   <header class="cards__header">
+diff --git a/app/views/cards/display/_preview.html.erb b/app/views/cards/display/_preview.html.erb
+index caddff6..7585471 100644
+--- a/app/views/cards/display/_preview.html.erb
++++ b/app/views/cards/display/_preview.html.erb
+@@ -1,15 +1,18 @@
+ <% card_data = {
+   navigable_list_target: "item",
+-  css_variable_counter_target: "item"
++  css_variable_counter_target: "item",
++  drag_and_drop_target: "item",
++  card_not_now_url: card_not_now_path(card),
++  card_closure_url: card_closure_path(card),
++  card_triage_url: card_triage_path(card),
++  card_assign_to_self_url: card_self_assignment_path(card),
++  action: token_list(
++    "mouseenter->navigable-list#hoverSelect",
++    "dragstart->drag-and-drop#dragStart",
++    "dragend->drag-and-drop#dragEnd"
++  )
+ } %>
+ 
+-<% if card.open? %>
+-  <% card_data[:card_not_now_url] = card_not_now_path(card) %>
+-  <% card_data[:card_closure_url] = card_closure_path(card) %>
+-  <% card_data[:action] = "mouseenter->navigable-list#hoverSelect" %>
+-  <% card_data[:card_assign_to_self_url] = card_self_assignment_path(card) %>
+-<% end %>
+-
+ <%= card_article_tag card, class: "card", data: card_data, tabindex: 0 do %>
+   <div class="flex flex-column flex-item-grow max-inline-size">
+     <%= link_to card_path(card), draggable: false, class: "card__link", title: card_title_tag(card), data: { action: "dialog#close", turbo_frame: "_top" } do %>
+diff --git a/test/models/card/postponable_test.rb b/test/models/card/postponable_test.rb
+index 0bafd3e..64c9d53 100644
+--- a/test/models/card/postponable_test.rb
++++ b/test/models/card/postponable_test.rb
+@@ -30,9 +30,26 @@ class Card::PostponableTest < ActiveSupport::TestCase
+ 
+     assert_changes -> { card.reload.postponed? }, to: false do
+       card.resume
++      assert_not card.postponed?
+     end
+   end
+ 
++  test "postpone a closed card tracks only one reopen event" do
++    card = cards(:shipping)
++    assert card.closed?
++
++    assert_difference -> { card.events.where(action: "card_reopened").count }, +1 do
++      assert_difference -> { card.events.where(action: "card_postponed").count }, +1 do
++        card.postpone
++      end
++    end
++
++    assert_not card.closed?
++    assert card.postponed?
++    assert card.reload.postponed?
++    assert card.open?
++  end
++
+   test "auto_postpone a card" do
+     card = cards(:text)
+ 
+diff --git a/test/system/card_drag_and_drop_test.rb b/test/system/card_drag_and_drop_test.rb
+new file mode 100644
+index 0000000..93e58e5
+--- /dev/null
++++ b/test/system/card_drag_and_drop_test.rb
+@@ -0,0 +1,607 @@
++require "application_system_test_case"
++
++class CardDragAndDropTest < ApplicationSystemTestCase
++  include ActionView::RecordIdentifier
++
++  setup do
++    sign_in_as(users(:david))
++    @board = boards(:writebook)
++  end
++
++  test "visual feedback dims dragged card, lights up hovered column, ignores source column, and cleans up on cancel" do
++    visit board_url(@board)
++
++    card = cards(:buy_domain)
++    in_progress = columns(:writebook_in_progress)
++    card_selector = "##{dom_id(card, :article)}"
++    maybe_selector = "#maybe"
++    target_selector = "##{dom_id(in_progress)}"
++
++    assert_selector "#{maybe_selector} #{card_selector}[draggable='true']"
++    wait_for_column_frame(in_progress)
++
++    # Start dragging the card
++    dispatch_drag_event(card_selector, "dragstart")
++    assert_selector "#{card_selector}.drag-and-drop__dragged-item"
++
++    # Hovering over the source column does not light it up
++    dispatch_drag_event(maybe_selector, "dragenter")
++    dispatch_drag_event(maybe_selector, "dragover")
++    assert_no_selector "#{maybe_selector}.drag-and-drop__hover-container"
++
++    # Hovering over another column lights it up
++    dispatch_drag_event(target_selector, "dragenter")
++    dispatch_drag_event(target_selector, "dragover")
++    assert_selector "#{target_selector}.drag-and-drop__hover-container"
++
++    # Leaving to a child inside the same hovered column does NOT remove highlight
++    page.execute_script(<<~JS, target_selector)
++      const col = document.querySelector(arguments[0])
++      const child = col.querySelector(".cards__header")
++      col.dispatchEvent(new DragEvent("dragleave", { bubbles: true, cancelable: true, relatedTarget: child }))
++    JS
++    assert_selector "#{target_selector}.drag-and-drop__hover-container"
++
++    # Leaving outside the column removes highlight
++    dispatch_drag_event(target_selector, "dragleave")
++    assert_no_selector "#{target_selector}.drag-and-drop__hover-container"
++
++    # Cancelling removes dimmed state and keeps card in original column
++    dispatch_drag_event(card_selector, "dragend")
++    assert_no_selector "#{card_selector}.drag-and-drop__dragged-item"
++    assert_selector "#{maybe_selector} #{card_selector}"
++    assert_nil card.reload.column
++  end
++
++  test "dragging a card onto its own column keeps column order and makes no request" do
++    triage = columns(:writebook_triage)
++    first_card = cards(:logo)
++    second_card = cards(:layout)
++    first_card.update_column(:last_active_at, 1.hour.ago)
++    second_card.update_column(:last_active_at, 2.hours.ago)
++
++    visit board_url(@board)
++    expand_column(triage)
++    assert_selector "##{dom_id(triage)} ##{dom_id(first_card, :article)}"
++    assert_selector "##{dom_id(triage)} ##{dom_id(second_card, :article)}"
++
++    initial_order = card_ids_in("##{dom_id(triage)}")
++    assert_equal [ dom_id(first_card, :article), dom_id(second_card, :article) ], initial_order
++
++    # Track network requests to prove none are made
++    page.execute_script(<<~JS)
++      window.__dragRequests = 0
++      const origFetch = window.fetch
++      window.fetch = function(...args) {
++        window.__dragRequests++
++        return origFetch.apply(this, args)
++      }
++    JS
++
++    drag_and_drop("##{dom_id(second_card, :article)}", "##{dom_id(triage)}")
++
++    assert_equal initial_order, card_ids_in("##{dom_id(triage)}")
++    assert_equal 0, page.evaluate_script("window.__dragRequests")
++  end
++
++  test "dragging from Maybe? to a collapsed custom column updates immediately before save and persists" do
++    visit board_url(@board)
++
++    card = cards(:buy_domain)
++    in_progress = columns(:writebook_in_progress)
++    card_selector = "##{dom_id(card, :article)}"
++    target_selector = "##{dom_id(in_progress)}"
++
++    assert_selector "#maybe #{card_selector}[draggable='true']"
++    wait_for_column_frame(in_progress)
++
++    assert_equal "1", find("#maybe .cards__expander-count", visible: :all).text(:all)
++    assert_equal "1", find("#{target_selector} .cards__expander-count", visible: :all).text(:all)
++
++    # Intercept fetch so save stays pending while we assert instant optimistic state
++    install_deferred_fetch
++
++    drag_and_drop(card_selector, target_selector)
++
++    # Immediately (before save resolves!):
++    assert_no_selector "#maybe #{card_selector}", wait: 0
++    assert_selector "#{target_selector} #{card_selector}", visible: :all, wait: 0
++    assert_no_selector "#{card_selector}.drag-and-drop__dragged-item", visible: :all, wait: 0
++    assert_no_selector "#{target_selector}.drag-and-drop__hover-container", visible: :all, wait: 0
++
++    # Counts updated immediately
++    assert_equal "0", find("#maybe .cards__expander-count", visible: :all).text(:all)
++    assert_equal "2", find("#{target_selector} .cards__expander-count", visible: :all).text(:all)
++
++    # Card color updated immediately to target column's color
++    card_color = page.evaluate_script("document.querySelector(arguments[0]).style.getPropertyValue('--card-color').trim()", card_selector)
++    assert_equal in_progress.color.to_s, card_color
++
++    # Order inside target column is already right: dropped card first, existing card second
++    assert_equal [ dom_id(card, :article), dom_id(cards(:text), :article) ], card_ids_in(target_selector)
++
++    # DB has NOT saved yet because fetch is held
++    assert_nil card.reload.column
++
++    # Track whether any DOM morph happens on the originating tab when broadcast arrives
++    page.execute_script(<<~JS)
++      window.__morphCount = 0
++      document.addEventListener("turbo:morph", () => window.__morphCount++)
++    JS
++
++    # Now let the save complete and run any broadcast refresh jobs
++    release_deferred_fetches
++    wait_until { card.reload.column == in_progress }
++    perform_enqueued_jobs only: Turbo::Streams::BroadcastStreamJob
++
++    # Expand target column: card is right there at the top, nothing shifted
++    expand_column(in_progress)
++    assert_equal [ dom_id(card, :article), dom_id(cards(:text), :article) ], card_ids_in(target_selector)
++    assert_equal 0, page.evaluate_script("window.__morphCount")
++
++    # Reload page: exact same board state from server
++    visit board_url(@board)
++    expand_column(in_progress)
++    assert_equal [ dom_id(card, :article), dom_id(cards(:text), :article) ], card_ids_in(target_selector)
++    assert_no_selector "#maybe #{card_selector}"
++  end
++
++  test "dragging between custom columns updates colors, empty placeholders, and persists" do
++    in_progress = columns(:writebook_in_progress)
++    on_hold = columns(:writebook_on_hold)
++    card = cards(:text)
++
++    visit board_url(@board)
++    wait_for_column_frame(in_progress)
++    wait_for_column_frame(on_hold)
++    expand_column(in_progress)
++
++    card_selector = "##{dom_id(card, :article)}"
++    assert_selector "##{dom_id(in_progress)} #{card_selector}[draggable='true']"
++    assert_no_selector "##{dom_id(in_progress)} .blank-slate--drag"
++
++    # Drag the only card from In progress to empty On Hold
++    drag_and_drop(card_selector, "##{dom_id(on_hold)}")
++
++    # Immediately: In progress shows "Drag cards here", On Hold has card with On Hold color
++    assert_selector "##{dom_id(in_progress)} .blank-slate--drag", text: "Drag cards here"
++    assert_selector "##{dom_id(on_hold)} #{card_selector}", visible: :all
++    card_color = page.evaluate_script("document.querySelector(arguments[0]).style.getPropertyValue('--card-color').trim()", card_selector)
++    assert_equal on_hold.color.to_s, card_color
++
++    wait_until { card.reload.column == on_hold }
++
++    # Expand On Hold: card is visible and "Drag cards here" is hidden
++    expand_column(on_hold)
++    assert_selector "##{dom_id(on_hold)} #{card_selector}"
++    assert_no_selector "##{dom_id(on_hold)} .blank-slate--drag"
++
++    # Drag card back to Maybe?
++    drag_and_drop(card_selector, "#maybe")
++
++    assert_selector "#maybe #{card_selector}"
++    assert_selector "##{dom_id(on_hold)} .blank-slate--drag", text: "Drag cards here"
++    card_color = page.evaluate_script("document.querySelector(arguments[0]).style.getPropertyValue('--card-color').trim()", card_selector)
++    assert_equal "var(--color-card-default)", card_color
++
++    wait_until { card.reload.awaiting_triage? }
++  end
++
++  test "dragging to and from Not Now and Done updates status, clears stamps, and persists" do
++    card = cards(:buy_domain)
++    in_progress = columns(:writebook_in_progress)
++    card_selector = "##{dom_id(card, :article)}"
++
++    visit board_url(@board)
++    wait_for_column_frame(in_progress)
++    wait_for_frame("not_now_column")
++    wait_for_frame("closed_column")
++
++    # 1. Maybe? -> Not Now
++    drag_and_drop(card_selector, "#not-now")
++    assert_selector "#not-now #{card_selector}.card--postponed", visible: :all
++    wait_until { card.reload.postponed? }
++
++    # Reload to get real server-rendered Not Now card (including .card__closed stamp)
++    visit board_url(@board)
++    wait_for_frame("not_now_column")
++    wait_for_frame("closed_column")
++    expand_column_by_id("not-now")
++    assert_selector "#not-now #{card_selector}.card--postponed"
++    assert_selector "#not-now #{card_selector} .card__closed", visible: :all
++
++    # 2. Not Now -> Done
++    drag_and_drop(card_selector, "#closed-cards")
++    assert_selector "#closed-cards #{card_selector}", visible: :all
++    assert_no_selector "#closed-cards #{card_selector}.card--postponed", visible: :all
++    wait_until { card.reload.closed? && !card.postponed? }
++
++    # Reload to get real server-rendered Done card (with .card__closed stamp)
++    visit board_url(@board)
++    wait_for_frame("closed_column")
++    wait_for_column_frame(in_progress)
++    expand_column_by_id("closed-cards")
++    assert_selector "#closed-cards #{card_selector}"
++    assert_selector "#closed-cards #{card_selector} .card__closed", visible: :all
++
++    # 3. Done -> In progress (reopens + removes stamp + restores column color immediately)
++    drag_and_drop(card_selector, "##{dom_id(in_progress)}")
++    assert_selector "##{dom_id(in_progress)} #{card_selector}.card--active", visible: :all
++    assert_no_selector "##{dom_id(in_progress)} #{card_selector} .card__closed", visible: :all
++    card_color = page.evaluate_script("document.querySelector(arguments[0]).style.getPropertyValue('--card-color').trim()", card_selector)
++    assert_equal in_progress.color.to_s, card_color
++    wait_until { card.reload.open? && card.column == in_progress }
++
++    # 4. In progress -> Done -> Not Now (verify only one reopen event)
++    expand_column(in_progress)
++    drag_and_drop(card_selector, "#closed-cards")
++    wait_until { card.reload.closed? }
++
++    reopen_events_before = card.events.where(action: "card_reopened").count
++    expand_column_by_id("closed-cards")
++    drag_and_drop(card_selector, "#not-now")
++    wait_until { card.reload.postponed? && card.open? }
++    assert_equal reopen_events_before + 1, card.events.where(action: "card_reopened").count
++
++    # 5. Not Now -> Maybe?
++    expand_column_by_id("not-now")
++    drag_and_drop(card_selector, "#maybe")
++    assert_selector "#maybe #{card_selector}.card--active"
++    assert_no_selector "#maybe #{card_selector}.card--postponed"
++    wait_until { card.reload.awaiting_triage? }
++  end
++
++  test "golden-first ordering matches server order on drop with no shifting" do
++    in_progress = columns(:writebook_in_progress)
++    golden_existing = cards(:text)
++    golden_existing.gild
++
++    regular_card = cards(:buy_domain)
++    golden_dragged = cards(:logo)
++    golden_dragged.gild
++
++    visit board_url(@board)
++    wait_for_column_frame(in_progress)
++    expand_column(in_progress)
++
++    # Regular card dropped onto the existing card inside In progress still obeys golden-first order
++    drag_and_drop("##{dom_id(regular_card, :article)}", "##{dom_id(golden_existing, :article)}")
++    expected_after_regular = [ dom_id(golden_existing, :article), dom_id(regular_card, :article) ]
++    assert_equal expected_after_regular, card_ids_in("##{dom_id(in_progress)}")
++    wait_until { regular_card.reload.column == in_progress }
++
++    # Verify reload has the EXACT same order
++    visit board_url(@board)
++    expand_column(in_progress)
++    assert_equal expected_after_regular, card_ids_in("##{dom_id(in_progress)}")
++
++    # Golden card dragged into column goes at the VERY TOP (above existing golden card)
++    triage = columns(:writebook_triage)
++    expand_column(triage)
++    drag_and_drop("##{dom_id(golden_dragged, :article)}", "##{dom_id(in_progress)}")
++    expected_after_golden = [
++      dom_id(golden_dragged, :article),
++      dom_id(golden_existing, :article),
++      dom_id(regular_card, :article)
++    ]
++    assert_equal expected_after_golden, card_ids_in("##{dom_id(in_progress)}")
++    wait_until { golden_dragged.reload.column == in_progress }
++
++    # Verify reload has the EXACT same order
++    visit board_url(@board)
++    expand_column(in_progress)
++    assert_equal expected_after_golden, card_ids_in("##{dom_id(in_progress)}")
++
++    # In Done, regular card goes ABOVE golden card (recently_closed_first, not golden-first)
++    drag_and_drop("##{dom_id(golden_dragged, :article)}", "#closed-cards")
++    wait_until { golden_dragged.reload.closed? }
++
++    drag_and_drop("##{dom_id(regular_card, :article)}", "#closed-cards")
++    assert_equal dom_id(regular_card, :article), card_ids_in("#closed-cards").first
++    wait_until { regular_card.reload.closed? }
++
++    visit board_url(@board)
++    expand_column_by_id("closed-cards")
++    assert_equal dom_id(regular_card, :article), card_ids_in("#closed-cards").first
++  end
++
++  test "rapid consecutive drags serialize saves and preserve final order" do
++    triage = columns(:writebook_triage)
++    on_hold = columns(:writebook_on_hold)
++    card_a = cards(:logo)
++    card_b = cards(:layout)
++
++    visit board_url(@board)
++    wait_for_column_frame(triage)
++    wait_for_column_frame(on_hold)
++    expand_column(triage)
++
++    install_deferred_fetch
++
++    # Rapidly drag card A then card B to On Hold, then drag card A to Done
++    drag_and_drop("##{dom_id(card_a, :article)}", "##{dom_id(on_hold)}")
++    drag_and_drop("##{dom_id(card_b, :article)}", "##{dom_id(on_hold)}")
++    expand_column(on_hold)
++    drag_and_drop("##{dom_id(card_a, :article)}", "#closed-cards")
++
++    # Immediately right in DOM
++    assert_equal [ dom_id(card_b, :article) ], card_ids_in("##{dom_id(on_hold)}")
++    assert_includes card_ids_in("#closed-cards"), dom_id(card_a, :article)
++
++    # Release saves in FIFO order
++    release_deferred_fetches_continuously
++    wait_until { card_a.reload.closed? && card_b.reload.column == on_hold }
++
++    # Reload matches DOM
++    visit board_url(@board)
++    expand_column(on_hold)
++    assert_equal [ dom_id(card_b, :article) ], card_ids_in("##{dom_id(on_hold)}")
++    assert_includes card_ids_in("#closed-cards"), dom_id(card_a, :article)
++  end
++
++  test "failed save reverts card to original column and restores counts and color" do
++    card = cards(:buy_domain)
++    in_progress = columns(:writebook_in_progress)
++    card_selector = "##{dom_id(card, :article)}"
++    target_selector = "##{dom_id(in_progress)}"
++
++    visit board_url(@board)
++    wait_for_column_frame(in_progress)
++
++    # Make fetch return 500
++    page.execute_script(<<~JS)
++      window.__origFetch = window.fetch
++      window.fetch = () => Promise.resolve(new Response("", { status: 500 }))
++    JS
++
++    drag_and_drop(card_selector, target_selector)
++
++    # Card reverts back to Maybe? with restored color and counts
++    assert_selector "#maybe #{card_selector}"
++    assert_no_selector "#{target_selector} #{card_selector}", visible: :all
++    assert_equal "1", find("#maybe .cards__expander-count", visible: :all).text(:all)
++    assert_equal "1", find("#{target_selector} .cards__expander-count", visible: :all).text(:all)
++    card_color = page.evaluate_script("document.querySelector(arguments[0]).style.getPropertyValue('--card-color').trim()", card_selector)
++    assert_equal "var(--color-card-default)", card_color
++  end
++
++  test "cards remain draggable after a broadcast morph refresh and clicking still navigates" do
++    card = cards(:buy_domain)
++    in_progress = columns(:writebook_in_progress)
++    card_selector = "##{dom_id(card, :article)}"
++
++    visit board_url(@board)
++    wait_for_column_frame(in_progress)
++    wait_for_cable_subscriptions
++
++    # Update card title elsewhere and broadcast morph refresh
++    Current.user = users(:kevin)
++    card.update!(title: "Buy awesome domain")
++    perform_enqueued_jobs only: Turbo::Streams::BroadcastStreamJob
++
++    assert_selector "#maybe #{card_selector}", text: "Buy awesome domain", wait: 5
++    assert_selector "#maybe #{card_selector}[draggable='true']"
++
++    # Still draggable even while column frames may still be morph-reloading
++    drag_and_drop(card_selector, "##{dom_id(in_progress)}")
++    assert_selector "##{dom_id(in_progress)} #{card_selector}", visible: :all
++    wait_until { card.reload.column == in_progress }
++
++    # Clicking card still navigates to card page
++    expand_column(in_progress)
++    find("##{dom_id(in_progress)} #{card_selector} a.card__link").click
++    assert_selector "h1", text: "Buy awesome domain"
++  end
++
++  test "dropping into a column with a stale in-flight frame reload keeps the card without wiping it out" do
++    card = cards(:buy_domain)
++    in_progress = columns(:writebook_in_progress)
++    card_selector = "##{dom_id(card, :article)}"
++    target_selector = "##{dom_id(in_progress)}"
++
++    visit board_url(@board)
++    wait_for_column_frame(in_progress)
++
++    # Hold the column frame reload response while the user drops a card into it
++    install_deferred_fetch
++
++    # Trigger an in-flight reload of the target column frame (simulating a broadcast morph reload)
++    page.execute_script("document.getElementById(arguments[0]).reload()", dom_id(in_progress, :cards))
++    wait_until { page.evaluate_script("window.__deferredResolvers.length") == 1 }
++
++    # Drop the card while that stale frame reload is still pending
++    drag_and_drop(card_selector, target_selector)
++    assert_selector "#{target_selector} #{card_selector}", visible: :all, wait: 0
++
++    # Resolve ONLY the stale frame GET first (before the POST save resolves)
++    page.execute_script("window.__deferredResolvers.shift()()")
++    sleep 0.1
++
++    # Card MUST still be in the target column — stale frame render was ignored!
++    assert_selector "#{target_selector} #{card_selector}", visible: :all
++
++    # Now release the save request and allow subsequent refreshes
++    release_deferred_fetches_continuously
++    wait_until { card.reload.column == in_progress }
++
++    expand_column(in_progress)
++    assert_selector "#{target_selector} #{card_selector}"
++  end
++
++  test "dragging broadcasts update to another viewer while originating view stays put" do
++    card = cards(:buy_domain)
++    in_progress = columns(:writebook_in_progress)
++    card_selector = "##{dom_id(card, :article)}"
++
++    visit board_url(@board)
++    wait_for_column_frame(in_progress)
++    wait_for_cable_subscriptions
++
++    second_window = open_new_window
++    within_window(second_window) do
++      visit board_url(@board)
++      wait_for_column_frame(in_progress)
++      wait_for_cable_subscriptions
++      assert_selector "#maybe #{card_selector}"
++    end
++
++    drag_and_drop(card_selector, "##{dom_id(in_progress)}")
++    assert_selector "##{dom_id(in_progress)} #{card_selector}", visible: :all
++    wait_until { card.reload.column == in_progress }
++    perform_enqueued_jobs only: Turbo::Streams::BroadcastStreamJob
++
++    within_window(second_window) do
++      assert_selector "##{dom_id(in_progress)} #{card_selector}", visible: :all, wait: 5
++      assert_no_selector "#maybe #{card_selector}", wait: 5
++    end
++  end
++
++  test "dynamically created column immediately accepts dragged cards" do
++    card = cards(:buy_domain)
++    card_selector = "##{dom_id(card, :article)}"
++
++    visit board_url(@board)
++    assert_selector "#maybe #{card_selector}[draggable='true']"
++
++    find(".cards__new-column > button").click
++    within(".cards__new-column dialog[open]") do
++      fill_in "column[name]", with: "QA"
++      click_button "Add column"
++    end
++
++    new_column = nil
++    wait_until { (new_column = @board.columns.find_by(name: "QA")).present? }
++    wait_for_column_frame(new_column)
++
++    drag_and_drop(card_selector, "##{dom_id(new_column)}")
++    assert_selector "##{dom_id(new_column)} #{card_selector}", visible: :all
++    wait_until { card.reload.column == new_column }
++  end
++
++  test "real mouse drag moves card between columns and non-board or public views are not draggable" do
++    card = cards(:buy_domain)
++    in_progress = columns(:writebook_in_progress)
++
++    visit board_url(@board)
++    wait_for_column_frame(in_progress)
++
++    card_el = find("#maybe ##{dom_id(card, :article)}")
++    target_el = find("##{dom_id(in_progress)}")
++    card_el.drag_to(target_el)
++
++    assert_selector "##{dom_id(in_progress)} ##{dom_id(card, :article)}", visible: :all
++    wait_until { card.reload.column == in_progress }
++
++    # Cards index (not a board) should not have draggable cards
++    visit cards_url
++    assert_selector "article.card"
++    assert_no_selector "article.card[draggable='true']"
++
++    # Public board should not have draggable cards
++    @board.publish
++    visit published_board_url(@board)
++    assert_selector "article.card", visible: :all
++    assert_no_selector "article.card[draggable='true']", visible: :all
++    assert_no_selector "[data-controller~='drag-and-drop']"
++  end
++
++  private
++    def wait_for_cable_subscriptions
++      assert_selector "turbo-cable-stream-source[connected]", visible: :all
++      assert_no_selector "turbo-cable-stream-source:not([connected])", visible: :all
++    end
++
++    def wait_for_column_frame(column)
++      wait_for_frame(dom_id(column, :cards))
++    end
++
++    def wait_for_frame(frame_id)
++      assert_selector "turbo-frame##{frame_id} .cards__list", visible: :all
++    end
++
++    def expand_column(column)
++      expand_column_by_id(dom_id(column))
++    end
++
++    def expand_column_by_id(column_id)
++      section = find("##{column_id}")
++      if section[:class].include?("is-collapsed")
++        section.find(".cards__expander").click
++        assert_selector "##{column_id}.is-expanded"
++      end
++    end
++
++    def card_ids_in(container_selector)
++      page.evaluate_script(<<~JS, container_selector)
++        Array.from(document.querySelectorAll(`${arguments[0]} .cards__list [data-drag-and-drop-target~="item"]`))
++          .map(el => el.id)
++      JS
++    end
++
++    def dispatch_drag_event(selector, type)
++      page.execute_script(<<~JS, selector, type)
++        const el = document.querySelector(arguments[0])
++        const dt = new DataTransfer()
++        el.dispatchEvent(new DragEvent(arguments[1], { bubbles: true, cancelable: true, dataTransfer: dt }))
++      JS
++    end
++
++    def drag_and_drop(source_selector, target_selector)
++      page.execute_script(<<~JS, source_selector, target_selector)
++        const source = document.querySelector(arguments[0])
++        const target = document.querySelector(arguments[1])
++        const dt = new DataTransfer()
++        source.dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, dataTransfer: dt }))
++        target.dispatchEvent(new DragEvent("dragenter", { bubbles: true, cancelable: true, dataTransfer: dt }))
++        target.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: dt }))
++        target.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: dt }))
++        source.dispatchEvent(new DragEvent("dragend", { bubbles: true, cancelable: true, dataTransfer: dt }))
++      JS
++    end
++
++    def install_deferred_fetch
++      page.execute_script(<<~JS)
++        window.__deferredResolvers = []
++        window.__autoReleaseDeferred = false
++        window.__origFetch = window.fetch
++        window.fetch = function(...args) {
++          if (window.__autoReleaseDeferred) {
++            return window.__origFetch.apply(this, args)
++          }
++          return new Promise((resolve, reject) => {
++            window.__deferredResolvers.push(() => {
++              window.__origFetch.apply(this, args).then(resolve, reject)
++            })
++          })
++        }
++      JS
++    end
++
++    def release_deferred_fetches
++      page.execute_script(<<~JS)
++        window.fetch = window.__origFetch
++        while (window.__deferredResolvers.length > 0) {
++          window.__deferredResolvers.shift()()
++        }
++      JS
++    end
++
++    def release_deferred_fetches_continuously
++      page.execute_script(<<~JS)
++        window.__autoReleaseDeferred = true
++        window.fetch = window.__origFetch
++        while (window.__deferredResolvers.length > 0) {
++          window.__deferredResolvers.shift()()
++        }
++      JS
++    end
++
++    def wait_until(timeout: 5)
++      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
++      loop do
++        return if yield
++        flunk "Condition was not met within #{timeout}s" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
++        sleep 0.05
++      end
++    end
++end
