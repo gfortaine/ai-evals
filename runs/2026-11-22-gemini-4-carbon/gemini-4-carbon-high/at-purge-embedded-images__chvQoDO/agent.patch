@@ -1,0 +1,308 @@
+diff --git a/app/models/leaf.rb b/app/models/leaf.rb
+index fb7e68b..c731cca 100644
+--- a/app/models/leaf.rb
++++ b/app/models/leaf.rb
+@@ -5,7 +5,7 @@ class Leaf < ApplicationRecord
+   delegated_type :leafable, types: Leafable::TYPES, dependent: :destroy
+   positioned_within :book, association: :leaves, filter: :active
+ 
+-  delegate :searchable_content, to: :leafable
++  delegate :searchable_content, to: :leafable, allow_nil: true
+ 
+   enum :status, %w[ active trashed ].index_by(&:itself), default: :active
+ 
+diff --git a/app/models/leaf/editable.rb b/app/models/leaf/editable.rb
+index d00f2a6..adefc4a 100644
+--- a/app/models/leaf/editable.rb
++++ b/app/models/leaf/editable.rb
+@@ -6,6 +6,7 @@ module Leaf::Editable
+   included do
+     has_many :edits, dependent: :delete_all
+ 
++    before_destroy :destroy_superseded_leafables, prepend: true
+     after_update :record_moved_to_trash, if: :was_trashed?
+   end
+ 
+@@ -35,6 +36,7 @@ module Leaf::Editable
+     def update_without_recording_edit(leaf_params, leafable_params)
+       transaction do
+         leafable.update!(leafable_params)
++        reconcile_markdown_uploads
+ 
+         edits.last&.touch
+         update! leaf_params
+@@ -48,6 +50,7 @@ module Leaf::Editable
+ 
+         edits.revision.create!(leafable: leafable)
+         update! leaf_params.merge(leafable: new_leafable)
++        reconcile_markdown_uploads
+       end
+     end
+ 
+@@ -59,6 +62,49 @@ module Leaf::Editable
+       end
+     end
+ 
++    def reconcile_markdown_uploads
++      return unless page?
++
++      current_markdown = leafable.body
++      current_content = current_markdown.content.to_s
++      moved = false
++
++      edits.where(leafable_type: "Page").where.not(leafable_id: leafable_id).includes(leafable: { markdown_body: :uploads_attachments }).find_each do |edit|
++        old_markdown = edit.leafable&.markdown_body
++        next unless old_markdown && old_markdown.uploads_attachments.any?
++
++        old_content = old_markdown.content.to_s
++        moved_from_old = false
++
++        old_markdown.uploads_attachments.each do |attachment|
++          if current_content.include?(attachment.slug_path) || old_content.exclude?(attachment.slug_path)
++            current_markdown.save! unless current_markdown.persisted?
++            unless current_markdown.uploads_attachments.exists?(blob_id: attachment.blob_id)
++              attachment.update!(record: current_markdown)
++              moved = true
++              moved_from_old = true
++            end
++          end
++        end
++
++        if moved_from_old
++          old_markdown.uploads_attachments.reset
++          old_markdown.uploads_blobs.reset
++        end
++      end
++
++      if moved
++        current_markdown.uploads_attachments.reset
++        current_markdown.uploads_blobs.reset
++      end
++    end
++
++    def destroy_superseded_leafables
++      edits.includes(:leafable).filter_map(&:leafable).uniq.each do |edit_leafable|
++        edit_leafable.destroy unless edit_leafable == leafable
++      end
++    end
++
+     def record_moved_to_trash
+       edits.trash.create!(leafable: leafable)
+     end
+diff --git a/app/models/leaf/searchable.rb b/app/models/leaf/searchable.rb
+index d90c5c9..23c7d11 100644
+--- a/app/models/leaf/searchable.rb
++++ b/app/models/leaf/searchable.rb
+@@ -4,7 +4,7 @@ module Leaf::Searchable
+   included do
+     after_create_commit  :create_in_search_index,   if: :searchable?
+     after_update_commit  :update_in_search_index,   if: :searchable?
+-    after_destroy_commit :remove_from_search_index, if: :searchable?
++    after_destroy_commit :remove_from_search_index
+ 
+     scope :favoring_title, -> { order(Arel.sql("bm25(leaf_search_index, 2.0)")) }
+   end
+diff --git a/lib/rails_ext/action_text_markdown.rb b/lib/rails_ext/action_text_markdown.rb
+index fa0a622..eb68f57 100644
+--- a/lib/rails_ext/action_text_markdown.rb
++++ b/lib/rails_ext/action_text_markdown.rb
+@@ -29,14 +29,39 @@ module ActionText::Markdown::Uploads
+   extend ActiveSupport::Concern
+ 
+   included do
+-    has_many_attached :uploads, dependent: :destroy
++    has_many_attached :uploads, dependent: :purge_later
++
++    after_create :adopt_uploads_from_duplicate_markdowns
+   end
++
++  private
++    def adopt_uploads_from_duplicate_markdowns
++      return unless record_type.present? && record_id.present?
++
++      duplicates = self.class.where(record_type: record_type, record_id: record_id, name: name).where.not(id: id)
++      return if duplicates.none?
++
++      adopted = false
++      duplicates.includes(:uploads_attachments).find_each do |duplicate|
++        duplicate.uploads_attachments.each do |attachment|
++          unless uploads_attachments.exists?(blob_id: attachment.blob_id)
++            attachment.update!(record: self)
++            adopted = true
++          end
++        end
++        duplicate.uploads_attachments.reset
++        duplicate.destroy!
++      end
++
++      if adopted
++        uploads_attachments.reset
++        uploads_blobs.reset
++      end
++    end
+ end
+ 
+-ActiveSupport.on_load :active_storage_attachment do
+-  class ActionText::Markdown
+-    include ActionText::Markdown::Uploads
+-  end
++Rails.application.config.to_prepare do
++  ActionText::Markdown.include ActionText::Markdown::Uploads unless ActionText::Markdown < ActionText::Markdown::Uploads
+ end
+ 
+ ActiveSupport.run_load_hooks :action_text_markdown, ActionText::Markdown
+diff --git a/test/controllers/action_text/markdown/uploads_controller_test.rb b/test/controllers/action_text/markdown/uploads_controller_test.rb
+index 48141c1..c9ddd4a 100644
+--- a/test/controllers/action_text/markdown/uploads_controller_test.rb
++++ b/test/controllers/action_text/markdown/uploads_controller_test.rb
+@@ -31,4 +31,42 @@ class ActionText::Markdown::UploadsControllerTest < ActionDispatch::IntegrationT
+     assert_response :redirect
+     assert_match /\/rails\/active_storage\/.*\/reading\.webp/, @response.redirect_url
+   end
++
++  test "upload, fetch back from returned URL, and purge when page is destroyed" do
++    leaf = leaves(:welcome_page)
++
++    post action_text_markdown_uploads_path, params: {
++      record_gid: leaf.page.to_signed_global_id.to_s,
++      attribute_name: "body",
++      file: fixture_file_upload("reading.webp", "image/webp")
++    }, as: :xhr
++    assert_response :created
++
++    file_url = JSON.parse(response.body)["fileUrl"]
++
++    get file_url
++    assert_response :redirect
++    follow_redirect!
++    assert_response :success
++    assert_equal File.binread(file_fixture("reading.webp")), response.body
++
++    attachment = ActiveStorage::Attachment.find_by!(slug: file_url.delete_prefix("/u/"))
++    blob = attachment.blob
++
++    put leafable_path(leaf), params: {
++      page: { body: "Check out ![reading](#{file_url})" }
++    }
++    assert_response :no_content
++
++    perform_enqueued_jobs do
++      leaf.reload.page.destroy!
++    end
++
++    assert_not ActiveStorage::Attachment.exists?(attachment.id)
++    assert_not ActiveStorage::Blob.exists?(blob.id)
++    assert_not ActiveStorage::Blob.service.exist?(blob.key)
++
++    get file_url
++    assert_response :not_found
++  end
+ end
+diff --git a/test/models/leaf/editable_test.rb b/test/models/leaf/editable_test.rb
+index b654642..1775485 100644
+--- a/test/models/leaf/editable_test.rb
++++ b/test/models/leaf/editable_test.rb
+@@ -1,6 +1,9 @@
+ require "test_helper"
+ 
+ class Leaf::EditableTest < ActiveSupport::TestCase
++  include ActiveJob::TestHelper
++  include ActionDispatch::TestProcess::FixtureFile
++
+   test "editing a leafable records the edit" do
+     leaves(:welcome_page).edit leafable_params: { body: "New body" }
+ 
+@@ -63,4 +66,44 @@ class Leaf::EditableTest < ActiveSupport::TestCase
+     assert leaves(:welcome_page).edits.last.trash?
+     assert_equal "This is _such_ a great handbook.", leaves(:welcome_page).edits.last.page.body.content
+   end
++
++  test "editing a page carries over markdown uploads so destroying the page purges them" do
++    leaf = leaves(:welcome_page)
++    leaf.page.body.tap(&:save!).uploads.attach fixture_file_upload("reading.webp", "image/webp")
++    attachment = leaf.page.body.uploads.attachments.last
++    blob = attachment.blob
++
++    leaf.edit leafable_params: { body: "Updated with ![image](#{attachment.slug_path})" }
++
++    perform_enqueued_jobs do
++      leaf.reload.page.destroy!
++    end
++
++    assert_not ActiveStorage::Attachment.exists?(attachment.id)
++    assert_not ActiveStorage::Blob.exists?(blob.id)
++    assert_not ActiveStorage::Blob.service.exist?(blob.key)
++  end
++
++  test "destroying a leaf purges markdown uploads from superseded revisions" do
++    leaf = leaves(:welcome_page)
++    leaf.page.body.tap(&:save!).uploads.attach fixture_file_upload("reading.webp", "image/webp")
++    attachment = leaf.page.body.uploads.attachments.last
++    blob = attachment.blob
++
++    leaf.edit leafable_params: { body: "With ![image](#{attachment.slug_path})" }
++    revision_with_image = leaf.reload.page
++
++    travel 15.minutes
++    leaf.edit leafable_params: { body: "Image removed from current version" }
++    leaf.trashed!
++
++    perform_enqueued_jobs do
++      leaf.destroy!
++    end
++
++    assert_not Page.exists?(revision_with_image.id)
++    assert_not ActiveStorage::Attachment.exists?(attachment.id)
++    assert_not ActiveStorage::Blob.exists?(blob.id)
++    assert_not ActiveStorage::Blob.service.exist?(blob.key)
++  end
+ end
+diff --git a/test/models/page_test.rb b/test/models/page_test.rb
+index b4bb79b..1660603 100644
+--- a/test/models/page_test.rb
++++ b/test/models/page_test.rb
+@@ -1,6 +1,9 @@
+ require "test_helper"
+ 
+ class PageTest < ActiveSupport::TestCase
++  include ActiveJob::TestHelper
++  include ActionDispatch::TestProcess::FixtureFile
++
+   test "html preview" do
+     page = Page.new(body: "# Hello\n\nWorld!")
+ 
+@@ -26,4 +29,34 @@ class PageTest < ActiveSupport::TestCase
+     assert_includes page.searchable_content, "5 &lt; 10 &amp; 10 &gt; 5"
+     assert page.searchable_content.html_safe?
+   end
++
++  test "destroying a page purges embedded markdown uploads and files" do
++    page = pages(:welcome)
++    other_page = pages(:summary)
++
++    page.body.tap(&:save!).uploads.attach fixture_file_upload("reading.webp", "image/webp")
++    attachment = page.body.uploads.attachments.last
++    blob = attachment.blob
++    page.update!(body: "![Reading](#{attachment.slug_path})")
++
++    other_page.body.tap(&:save!).uploads.attach fixture_file_upload("white-rabbit.webp", "image/webp")
++    other_attachment = other_page.body.uploads.attachments.last
++    other_blob = other_attachment.blob
++    other_page.update!(body: "![Rabbit](#{other_attachment.slug_path})")
++
++    assert ActiveStorage::Blob.service.exist?(blob.key)
++    assert ActiveStorage::Blob.service.exist?(other_blob.key)
++
++    perform_enqueued_jobs do
++      page.destroy!
++    end
++
++    assert_not ActiveStorage::Attachment.exists?(attachment.id)
++    assert_not ActiveStorage::Blob.exists?(blob.id)
++    assert_not ActiveStorage::Blob.service.exist?(blob.key)
++
++    assert ActiveStorage::Attachment.exists?(other_attachment.id)
++    assert ActiveStorage::Blob.exists?(other_blob.id)
++    assert ActiveStorage::Blob.service.exist?(other_blob.key)
++  end
+ end

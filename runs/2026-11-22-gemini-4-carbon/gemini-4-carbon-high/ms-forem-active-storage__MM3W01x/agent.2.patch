@@ -1,0 +1,861 @@
+diff --git a/app/services/images/profile_images_copy.rb b/app/services/images/profile_images_copy.rb
+new file mode 100644
+index 0000000..08bf743
+--- /dev/null
++++ b/app/services/images/profile_images_copy.rb
+@@ -0,0 +1,377 @@
++require "fastimage"
++require "stringio"
++
++module Images
++  class ProfileImagesCopy
++    DEFAULT_BATCH_SIZE = 500
++    SKIPPED_IDENTIFIERS = [nil, "", Moderator::BanishUser::DEFAULT_PROFILE_IMAGE].freeze
++
++    def self.call(batch_size: DEFAULT_BATCH_SIZE)
++      new(batch_size: batch_size).call
++    end
++
++    def initialize(batch_size: DEFAULT_BATCH_SIZE)
++      @batch_size = batch_size
++    end
++
++    def call
++      users_copied = copy_records(User)
++      organizations_copied = copy_records(Organization)
++      articles_updated = refresh_stale_articles
++      notifications_updated = refresh_stale_notifications
++
++      if (users_copied + organizations_copied + articles_updated + notifications_updated).positive?
++        bust_global_caches
++      end
++
++      {
++        users_copied: users_copied,
++        organizations_copied: organizations_copied,
++        articles_updated: articles_updated,
++        notifications_updated: notifications_updated
++      }
++    end
++
++    private
++
++    attr_reader :batch_size
++
++    def copy_records(model_class)
++      copied = 0
++
++      model_class
++        .where.not(profile_image: SKIPPED_IDENTIFIERS)
++        .where.missing(:profile_image_attachment)
++        .find_each(batch_size: batch_size) do |record|
++          copied += 1 if copy_record(record)
++        end
++
++      copied
++    end
++
++    def copy_record(record)
++      identifier = record.legacy_profile_image_identifier
++      return false if identifier.blank? || SKIPPED_IDENTIFIERS.include?(identifier)
++      return false if ActiveStorage::Attachment.exists?(record: record, name: "profile_image")
++
++      source = fetch_source_bytes(record, identifier)
++      return false unless source
++
++      blob = create_blob_from_source(record, source)
++      return false unless attach_blob_to_record(record, blob)
++
++      record.reload
++      refresh_record_dependents(record)
++      true
++    end
++
++    def fetch_source_bytes(record, identifier)
++      if identifier.start_with?("http://", "https://")
++        fetch_remote_bytes(record, identifier)
++      else
++        fetch_carrierwave_bytes(record, identifier)
++      end
++    end
++
++    def fetch_carrierwave_bytes(record, identifier)
++      uploader = ProfileImageUploader.new(record, :profile_image)
++      uploader.retrieve_from_store!(identifier)
++      stored_file = uploader.file
++      unless stored_file.present? && stored_file.exists?
++        Rails.logger.warn(
++          "Skipping missing CarrierWave profile_image for #{record.class.name}##{record.id}: #{identifier}",
++        )
++        return
++      end
++
++      bytes = stored_file.read&.b
++      if bytes.blank?
++        Rails.logger.warn(
++          "Skipping empty CarrierWave profile_image for #{record.class.name}##{record.id}: #{identifier}",
++        )
++        return
++      end
++
++      filename = File.basename(identifier)
++      declared_type = stored_file.respond_to?(:content_type) ? stored_file.content_type : nil
++      content_type = resolve_content_type(bytes, filename: filename, declared_type: declared_type)
++
++      { bytes: bytes, filename: filename, content_type: content_type }
++    end
++
++    def fetch_remote_bytes(record, url)
++      downloaded = Images::ProfileImageProcessor.download_remote(url)
++      if downloaded[:error] || downloaded[:empty] || downloaded[:attachable].blank?
++        Rails.logger.warn(
++          "Skipping unreachable remote profile_image for #{record.class.name}##{record.id}: #{url}",
++        )
++        return
++      end
++
++      attachable = downloaded[:attachable]
++      io = attachable[:io]
++      io.rewind if io.respond_to?(:rewind)
++      bytes = io.read.to_s.b
++      return if bytes.empty?
++
++      filename = attachable[:filename].to_s
++      content_type = resolve_content_type(bytes, filename: filename, declared_type: attachable[:content_type])
++
++      { bytes: bytes, filename: filename, content_type: content_type }
++    end
++
++    def resolve_content_type(bytes, filename:, declared_type:)
++      normalized_declared = declared_type == "image/x-icon" ? "image/vnd.microsoft.icon" : declared_type
++      detected = Marcel::MimeType.for(
++        StringIO.new(bytes),
++        name: filename,
++        declared_type: normalized_declared.presence,
++      )
++      detected == "image/x-icon" ? "image/vnd.microsoft.icon" : detected
++    end
++
++    def create_blob_from_source(record, source)
++      bytes = source[:bytes]
++      filename = source[:filename]
++      ext = File.extname(filename).delete_prefix(".").downcase
++      token = ActiveStorage::Blob.generate_unique_secure_token
++      model_key = record.model_name.singular
++      key = if ext.present?
++              "uploads/#{model_key}/profile_image/#{token}.#{ext}"
++            else
++              "uploads/#{model_key}/profile_image/#{token}"
++            end
++
++      metadata = build_blob_metadata(bytes)
++
++      blob = ActiveStorage::Blob.build_after_unfurling(
++        key: key,
++        io: StringIO.new(bytes),
++        filename: filename,
++        content_type: source[:content_type],
++        metadata: metadata,
++        identify: false,
++      )
++      blob.save!
++      blob.upload_without_unfurling(StringIO.new(bytes))
++      blob
++    rescue Exception => e # rubocop:disable Lint/RescueException
++      blob.destroy if blob&.persisted?
++      raise e
++    end
++
++    def build_blob_metadata(bytes)
++      dimensions = FastImage.size(StringIO.new(bytes))
++      metadata = { identified: true, analyzed: true }
++      if dimensions.is_a?(Array) && dimensions.size == 2
++        metadata[:width] = dimensions[0]
++        metadata[:height] = dimensions[1]
++      end
++      metadata
++    end
++
++    def attach_blob_to_record(record, blob)
++      attached = false
++
++      record.with_lock do
++        unless ActiveStorage::Attachment.exists?(record: record, name: "profile_image")
++          ActiveStorage::Attachment.create!(name: "profile_image", record: record, blob: blob)
++          touch_record_cache_timestamps(record)
++          attached = true
++        end
++      end
++
++      blob.purge unless attached
++      attached
++    end
++
++    def touch_record_cache_timestamps(record)
++      now = [Time.current, record.updated_at&.+(0.001.seconds)].compact.max
++      if record.is_a?(User)
++        record.update_columns(
++          updated_at: now,
++          profile_updated_at: now,
++          latest_article_updated_at: now,
++        )
++      elsif record.is_a?(Organization)
++        record.update_columns(
++          updated_at: now,
++          latest_article_updated_at: now,
++        )
++      end
++    end
++
++    def refresh_record_dependents(record)
++      now = Time.current
++
++      if record.is_a?(User)
++        cached_entity = Articles::CachedEntity.from_object(record)
++        record.articles.find_each(batch_size: batch_size) do |article|
++          next unless cached_entity_stale?(article.cached_user, record)
++
++          article.update_columns(cached_user: cached_entity)
++        end
++        touch_user_comment_trees(record, now)
++      elsif record.is_a?(Organization)
++        cached_entity = Articles::CachedEntity.from_object(record)
++        record.articles.find_each(batch_size: batch_size) do |article|
++          next unless cached_entity_stale?(article.cached_organization, record)
++
++          article.update_columns(cached_organization: cached_entity)
++        end
++        record.users.update_all(organization_info_updated_at: now)
++      end
++    end
++
++    def touch_user_comment_trees(user, timestamp)
++      comment_rows = user.comments.pluck(:id, :ancestry)
++      return if comment_rows.empty?
++
++      comment_ids = comment_rows.map(&:first)
++      root_ids = comment_rows.filter_map { |_id, ancestry| ancestry&.split("/")&.first&.to_i }
++      Comment.where(id: (comment_ids + root_ids).uniq).update_all(updated_at: timestamp)
++    end
++
++    def refresh_stale_articles
++      updated = 0
++
++      Article
++        .includes(
++          user: { profile_image_attachment: :blob },
++          organization: { profile_image_attachment: :blob },
++        )
++        .find_each(batch_size: batch_size) do |article|
++          updates = stale_article_cache_updates(article)
++          next if updates.empty?
++
++          article.update_columns(updates)
++          updated += 1
++        end
++
++      updated
++    end
++
++    def stale_article_cache_updates(article)
++      updates = {}
++      if article.user && cached_entity_stale?(article.cached_user, article.user)
++        updates[:cached_user] = Articles::CachedEntity.from_object(article.user)
++      end
++      if article.organization && cached_entity_stale?(article.cached_organization, article.organization)
++        updates[:cached_organization] = Articles::CachedEntity.from_object(article.organization)
++      end
++      updates
++    end
++
++    def cached_entity_stale?(cached_entity, owner)
++      return true if cached_entity.nil?
++
++      cached_entity.profile_image_url != owner.profile_image_url ||
++        cached_entity.profile_image_90 != owner.profile_image_90
++    end
++
++    def refresh_stale_notifications
++      updated = 0
++
++      Notification.where.not(json_data: nil).in_batches(of: batch_size) do |relation|
++        notifications = relation.to_a
++        users_by_id, orgs_by_id = load_notification_actors(notifications)
++        next if users_by_id.empty? && orgs_by_id.empty?
++
++        notifications.each do |notification|
++          new_data, changed = rewrite_actor_images(notification.json_data, users_by_id, orgs_by_id)
++          next unless changed
++
++          notification.update_columns(json_data: new_data)
++          updated += 1
++        end
++      end
++
++      updated
++    end
++
++    def load_notification_actors(notifications)
++      user_ids = Set.new
++      org_ids = Set.new
++
++      notifications.each do |notification|
++        collect_actor_ids(notification.json_data, user_ids, org_ids)
++      end
++
++      users_by_id = if user_ids.any?
++                      User.with_attached_profile_image.where(id: user_ids.to_a).index_by(&:id)
++                    else
++                      {}
++                    end
++      orgs_by_id = if org_ids.any?
++                     Organization.with_attached_profile_image.where(id: org_ids.to_a).index_by(&:id)
++                   else
++                     {}
++                   end
++
++      [users_by_id, orgs_by_id]
++    end
++
++    def collect_actor_ids(node, user_ids, org_ids)
++      case node
++      when Hash
++        klass = node.dig("class", "name")
++        actor_id = node["id"]
++        if actor_id.present? && node.key?("profile_image_90")
++          user_ids << actor_id if klass == "User"
++          org_ids << actor_id if klass == "Organization"
++        end
++        node.each_value { |value| collect_actor_ids(value, user_ids, org_ids) }
++      when Array
++        node.each { |value| collect_actor_ids(value, user_ids, org_ids) }
++      end
++    end
++
++    def rewrite_actor_images(node, users_by_id, orgs_by_id)
++      case node
++      when Hash
++        changed = false
++        result = {}
++        node.each do |key, value|
++          updated_value, child_changed = rewrite_actor_images(value, users_by_id, orgs_by_id)
++          result[key] = updated_value
++          changed ||= child_changed
++        end
++
++        actor = lookup_actor(result, users_by_id, orgs_by_id)
++        if actor && result.key?("profile_image_90") && result["profile_image_90"] != actor.profile_image_90
++          result["profile_image_90"] = actor.profile_image_90
++          changed = true
++        end
++
++        [result, changed]
++      when Array
++        changed = false
++        mapped = node.map do |value|
++          updated_value, child_changed = rewrite_actor_images(value, users_by_id, orgs_by_id)
++          changed ||= child_changed
++          updated_value
++        end
++        [mapped, changed]
++      else
++        [node, false]
++      end
++    end
++
++    def lookup_actor(hash, users_by_id, orgs_by_id)
++      actor_id = hash["id"]
++      return unless actor_id
++
++      case hash.dig("class", "name")
++      when "User"
++        users_by_id[actor_id]
++      when "Organization"
++        orgs_by_id[actor_id]
++      end
++    end
++
++    def bust_global_caches
++      Settings::General.admin_action_taken_at = Time.current
++      EdgeCache::PurgeByKey.call([User.table_key, Organization.table_key, Article.table_key], soft: true)
++    end
++  end
++end
+diff --git a/lib/tasks/profile_images.rake b/lib/tasks/profile_images.rake
+new file mode 100644
+index 0000000..e7ff8bf
+--- /dev/null
++++ b/lib/tasks/profile_images.rake
+@@ -0,0 +1,6 @@
++namespace :profile_images do
++  desc "Copy existing User and Organization profile pictures from CarrierWave into Active Storage"
++  task copy: :environment do
++    Images::ProfileImagesCopy.call
++  end
++end
+diff --git a/spec/requests/profile_images_active_storage_spec.rb b/spec/requests/profile_images_active_storage_spec.rb
+index e25745c..cecfb7f 100644
+--- a/spec/requests/profile_images_active_storage_spec.rb
++++ b/spec/requests/profile_images_active_storage_spec.rb
+@@ -116,4 +116,94 @@
+       uploader&.remove!
+     end
+   end
++
++  describe "serving every profile picture from Active Storage after profile_images:copy" do
++    before do
++      Rake::Task["profile_images:copy"].reenable
++    end
++
++    it "serves copied User and Organization profile pictures from Active Storage everywhere", :aggregate_failures do
++      user = create(:user, profile_image: nil)
++      user_uploader = ProfileImageUploader.new(user, :profile_image)
++      png_path.open { |f| user_uploader.store!(f) }
++      user.update_columns(profile_image: user_uploader.identifier)
++      user.reload
++
++      org = build(:organization, profile_image: nil)
++      org.save!(validate: false)
++      org_uploader = ProfileImageUploader.new(org, :profile_image)
++      jpg_path.open { |f| org_uploader.store!(f) }
++      org.update_columns(profile_image: org_uploader.identifier)
++      org.reload
++
++      article = create(:article, user: user, organization: org, published: true, score: 50)
++
++      # Before copy runs after deploy, CarrierWave profile pictures continue working
++      get user.path
++      expect(response).to have_http_status(:ok)
++      expect(response.body).to include(user_uploader.url)
++
++      get org.path
++      expect(response).to have_http_status(:ok)
++      expect(response.body).to include(org_uploader.url)
++
++      get article.path
++      expect(response).to have_http_status(:ok)
++      expect(response.body).to include(user_uploader.url)
++
++      # Run post-deploy copy task
++      Rake::Task["profile_images:copy"].invoke
++
++      user.reload
++      org.reload
++
++      expect(user.profile_image_url).to start_with("/rails/active_storage/blobs/proxy/")
++      expect(org.profile_image_url).to start_with("/rails/active_storage/blobs/proxy/")
++
++      # Direct Active Storage blob proxy requests serve exact image bytes
++      get user.profile_image_url
++      expect(response).to have_http_status(:ok)
++      expect(response.media_type).to eq("image/png")
++      expect(response.body.b).to eq(File.binread(png_path))
++
++      get org.profile_image_url
++      expect(response).to have_http_status(:ok)
++      expect(response.media_type).to eq("image/jpeg")
++      expect(response.body.b).to eq(File.binread(jpg_path))
++
++      # Web pages and API endpoints now serve from Active Storage instead of CarrierWave
++      get user.path
++      expect(response).to have_http_status(:ok)
++      expect(response.body).to include(user.profile_image_url)
++      expect(response.body).not_to include(user_uploader.url)
++
++      get org.path
++      expect(response).to have_http_status(:ok)
++      expect(response.body).to include(org.profile_image_url)
++      expect(response.body).not_to include(org_uploader.url)
++
++      get article.path
++      expect(response).to have_http_status(:ok)
++      expect(response.body).to include(user.profile_image_url)
++      expect(response.body).not_to include(user_uploader.url)
++
++      get "/"
++      expect(response).to have_http_status(:ok)
++      expect(response.body).to include(user.profile_image_url)
++      expect(response.body).to include(org.profile_image_url)
++      expect(response.body).not_to include(user_uploader.url)
++      expect(response.body).not_to include(org_uploader.url)
++
++      get api_profile_image_path(user.username)
++      expect(response).to have_http_status(:ok)
++      expect(response.parsed_body["profile_image"]).to eq(user.profile_image_url_for(length: 640))
++
++      get api_profile_image_path(org.username)
++      expect(response).to have_http_status(:ok)
++      expect(response.parsed_body["profile_image"]).to eq(org.profile_image_url_for(length: 640))
++    ensure
++      user_uploader&.remove!
++      org_uploader&.remove!
++    end
++  end
+ end
+diff --git a/spec/tasks/profile_images_spec.rb b/spec/tasks/profile_images_spec.rb
+new file mode 100644
+index 0000000..3cc8374
+--- /dev/null
++++ b/spec/tasks/profile_images_spec.rb
+@@ -0,0 +1,361 @@
++require "rails_helper"
++
++RSpec::Matchers.define_negated_matcher :not_change, :change
++
++RSpec.describe "profile_images:copy", type: :task do
++  let(:png_path) { Rails.root.join("spec/fixtures/files/800x600.png") }
++  let(:jpg_path) { Rails.root.join("spec/fixtures/files/800x600.jpg") }
++  let(:webp_path) { Rails.root.join("spec/fixtures/files/800x600.webp") }
++  let(:cleanup_uploaders) { [] }
++
++  before do
++    Rake::Task["profile_images:copy"].reenable
++  end
++
++  after do
++    cleanup_uploaders.each(&:remove!)
++  end
++
++  def create_carrierwave_user(image_path = png_path)
++    user = create(:user, profile_image: nil)
++    uploader = ProfileImageUploader.new(user, :profile_image)
++    image_path.open { |file| uploader.store!(file) }
++    cleanup_uploaders << uploader
++    user.update_columns(profile_image: uploader.identifier)
++    [user.reload, uploader]
++  end
++
++  def create_carrierwave_organization(image_path = jpg_path)
++    organization = build(:organization, profile_image: nil)
++    organization.save!(validate: false)
++    uploader = ProfileImageUploader.new(organization, :profile_image)
++    image_path.open { |file| uploader.store!(file) }
++    cleanup_uploaders << uploader
++    organization.update_columns(profile_image: uploader.identifier)
++    [organization.reload, uploader]
++  end
++
++  it "copies existing CarrierWave User and Organization profile pictures into Active Storage", :aggregate_failures do
++    user, user_uploader = create_carrierwave_user(png_path)
++    organization, org_uploader = create_carrierwave_organization(jpg_path)
++    new_user = create(:user, profile_image: fixture_file_upload("800x600.webp", "image/webp"))
++    existing_blob_id = new_user.profile_image.blob.id
++
++    Rake::Task["profile_images:copy"].invoke
++
++    user.reload
++    organization.reload
++    new_user.reload
++
++    expect(user.profile_image).to be_attached
++    expect(user.profile_image.download).to eq(File.binread(png_path))
++    expect(user.profile_image.blob.content_type).to eq("image/png")
++    expect(user.profile_image.blob.key).to match(%r{\Auploads/user/profile_image/[a-z0-9]+\.png\z})
++    expect(user.profile_image.blob).to be_analyzed
++    expect(user.profile_image_url).to start_with("/rails/active_storage/blobs/proxy/")
++    expect(File.exist?(user_uploader.file.path)).to be(true)
++
++    expect(organization.profile_image).to be_attached
++    expect(organization.profile_image.download).to eq(File.binread(jpg_path))
++    expect(organization.profile_image.blob.content_type).to eq("image/jpeg")
++    expect(organization.profile_image.blob.key).to match(%r{\Auploads/organization/profile_image/[a-z0-9]+\.jpg\z})
++    expect(organization.profile_image.blob).to be_analyzed
++    expect(organization.profile_image_url).to start_with("/rails/active_storage/blobs/proxy/")
++    expect(File.exist?(org_uploader.file.path)).to be(true)
++
++    expect(new_user.profile_image.blob.id).to eq(existing_blob_id)
++  end
++
++  it "does not enqueue ActiveStorage::AnalyzeJob storms during copy" do
++    create_carrierwave_user(png_path)
++    create_carrierwave_organization(jpg_path)
++
++    expect do
++      Rake::Task["profile_images:copy"].invoke
++    end.not_to have_enqueued_job(ActiveStorage::AnalyzeJob)
++  end
++
++  it "refreshes Article cached_user and cached_organization and Notification json_data", :aggregate_failures do
++    user, user_uploader = create_carrierwave_user(png_path)
++    organization, org_uploader = create_carrierwave_organization(jpg_path)
++    article = create(:article, user: user, organization: organization)
++    recipient = create(:user)
++    notification = Notification.create!(
++      user: recipient,
++      notifiable: article,
++      action: "Published",
++      json_data: {
++        "article" => Notifications.article_data(article).stringify_keys,
++        "user" => Notifications.user_data(user).deep_stringify_keys,
++        "organization" => Notifications.organization_data(organization).deep_stringify_keys
++      },
++    )
++
++    expect(article.cached_user.profile_image_url).to eq(user_uploader.url)
++    expect(article.cached_organization.profile_image_url).to eq(org_uploader.url)
++    expect(notification.json_data.dig("user", "profile_image_90")).to eq(user_uploader.url)
++    expect(notification.json_data.dig("organization", "profile_image_90")).to eq(org_uploader.url)
++
++    Rake::Task["profile_images:copy"].invoke
++
++    user.reload
++    organization.reload
++    article.reload
++    notification.reload
++
++    expect(article.cached_user.profile_image_url).to eq(user.profile_image_url)
++    expect(article.cached_user.profile_image_90).to eq(user.profile_image_90)
++    expect(article.cached_organization.profile_image_url).to eq(organization.profile_image_url)
++    expect(article.cached_organization.profile_image_90).to eq(organization.profile_image_90)
++    expect(notification.json_data.dig("user", "profile_image_90")).to eq(user.profile_image_90)
++    expect(notification.json_data.dig("organization", "profile_image_90")).to eq(organization.profile_image_90)
++  end
++
++  it "is idempotent and resumes cleanly if interrupted partway through", :aggregate_failures do
++    user1, = create_carrierwave_user(png_path)
++    user2, user2_uploader = create_carrierwave_user(jpg_path)
++    organization, org_uploader = create_carrierwave_organization(webp_path)
++    article = create(:article, user: user2, organization: organization)
++
++    uploads = 0
++    allow(ActiveStorage::Blob.service).to receive(:upload).and_wrap_original do |method, *args, **kwargs|
++      uploads += 1
++      raise StandardError, "interrupted connection" if uploads == 2
++
++      method.call(*args, **kwargs)
++    end
++
++    expect do
++      Rake::Task["profile_images:copy"].invoke
++    end.to raise_error(StandardError, "interrupted connection")
++
++    # First record copied and served from Active Storage; remaining records still work via CarrierWave
++    expect(user1.reload.profile_image).to be_attached
++    user1_blob_id = user1.profile_image.blob.id
++    expect(user2.reload.profile_image).not_to be_attached
++    expect(user2.profile_image_url).to eq(user2_uploader.url)
++    expect(organization.reload.profile_image).not_to be_attached
++    expect(organization.profile_image_url).to eq(org_uploader.url)
++
++    allow(ActiveStorage::Blob.service).to receive(:upload).and_call_original
++    Rake::Task["profile_images:copy"].reenable
++    Rake::Task["profile_images:copy"].invoke
++
++    expect(user1.reload.profile_image.blob.id).to eq(user1_blob_id)
++    expect(user2.reload.profile_image).to be_attached
++    expect(user2.profile_image.download).to eq(File.binread(jpg_path))
++    expect(organization.reload.profile_image).to be_attached
++    expect(organization.profile_image.download).to eq(File.binread(webp_path))
++    expect(article.reload.cached_user.profile_image_url).to eq(user2.profile_image_url)
++    expect(article.cached_organization.profile_image_url).to eq(organization.profile_image_url)
++
++    # Running a third time creates zero extra blobs or attachments
++    Rake::Task["profile_images:copy"].reenable
++    expect do
++      Rake::Task["profile_images:copy"].invoke
++    end.to not_change(ActiveStorage::Blob, :count)
++      .and not_change(ActiveStorage::Attachment, :count)
++  end
++
++  it "cleans up unattached blob and preserves CarrierWave serving if interrupted mid-upload", :aggregate_failures do
++    user, user_uploader = create_carrierwave_user(png_path)
++    blob_count_before = ActiveStorage::Blob.count
++
++    allow(ActiveStorage::Blob.service).to receive(:upload).and_raise(StandardError, "S3 upload timeout")
++
++    expect do
++      Rake::Task["profile_images:copy"].invoke
++    end.to raise_error(StandardError, "S3 upload timeout")
++
++    expect(ActiveStorage::Blob.count).to eq(blob_count_before)
++    expect(user.reload.profile_image).not_to be_attached
++    expect(user.profile_image_url).to eq(user_uploader.url)
++
++    allow(ActiveStorage::Blob.service).to receive(:upload).and_call_original
++    Rake::Task["profile_images:copy"].reenable
++    Rake::Task["profile_images:copy"].invoke
++
++    expect(user.reload.profile_image).to be_attached
++    expect(user.profile_image.download).to eq(File.binread(png_path))
++  end
++
++  it "does not overwrite a newer Active Storage upload on a record that also has a legacy column value" do
++    user, = create_carrierwave_user(png_path)
++    user.update!(profile_image: fixture_file_upload("800x600.jpg", "image/jpeg"))
++    expected_blob_id = user.reload.profile_image.blob.id
++
++    Rake::Task["profile_images:copy"].invoke
++
++    expect(user.reload.profile_image.blob.id).to eq(expected_blob_id)
++    expect(user.profile_image.download).to eq(File.binread(jpg_path))
++  end
++
++  it "skips missing CarrierWave files and banished users while copying valid records", :aggregate_failures do
++    missing_user = create(:user, profile_image: nil)
++    missing_user.update_columns(profile_image: "nonexistent-avatar.png")
++
++    admin = create(:user, :super_admin)
++    banished_user = create(:user, profile_image: fixture_file_upload("800x600.png", "image/png"))
++    Moderator::BanishUser.call(admin: admin, user: banished_user)
++
++    valid_user, = create_carrierwave_user(jpg_path)
++
++    Rake::Task["profile_images:copy"].invoke
++
++    expect(missing_user.reload.profile_image).not_to be_attached
++    expect(banished_user.reload.profile_image).not_to be_attached
++    expect(banished_user.profile_image_url).to eq(Moderator::BanishUser::DEFAULT_PROFILE_IMAGE)
++    expect(valid_user.reload.profile_image).to be_attached
++    expect(valid_user.profile_image.download).to eq(File.binread(jpg_path))
++  end
++
++  it "leaves other CarrierWave uploads untouched", :aggregate_failures do
++    organization, = create_carrierwave_organization(png_path)
++    cover_uploader = CoverImageUploader.new(organization, :cover_image)
++    jpg_path.open { |file| cover_uploader.store!(file) }
++    cleanup_uploaders << cover_uploader
++    organization.update_columns(cover_image: cover_uploader.identifier)
++
++    tag = create(:tag)
++    tag_uploader = ProfileImageUploader.new(tag, :profile_image)
++    png_path.open { |file| tag_uploader.store!(file) }
++    cleanup_uploaders << tag_uploader
++    tag.update_columns(profile_image: tag_uploader.identifier)
++
++    Rake::Task["profile_images:copy"].invoke
++
++    expect(organization.reload.profile_image).to be_attached
++    expect(organization.cover_image).to be_a(CoverImageUploader)
++    expect(organization.cover_image.url).to eq(cover_uploader.url)
++    expect(ActiveStorage::Attachment.where(record: tag)).to be_empty
++    expect(tag.reload.profile_image).to be_a(ProfileImageUploader)
++    expect(tag.profile_image.url).to eq(tag_uploader.url)
++  end
++
++  it "heals stale Article and Notification caches if interrupted after attaching a blob", :aggregate_failures do
++    user, user_uploader = create_carrierwave_user(png_path)
++    article = create(:article, user: user)
++    recipient = create(:user)
++    follow = create(:follow, follower: user, followable: recipient)
++    notification = Notification.create!(
++      user: recipient,
++      notifiable: follow,
++      action: "Follow",
++      json_data: {
++        "user" => Notifications.user_data(user).deep_stringify_keys,
++        "aggregated_siblings" => [Notifications.user_data(user).deep_stringify_keys]
++      },
++    )
++
++    interrupted_copier = Images::ProfileImagesCopy.new
++    allow(Images::ProfileImagesCopy).to receive(:new).and_return(interrupted_copier)
++    allow(interrupted_copier).to receive(:refresh_record_dependents)
++      .and_raise(StandardError, "interrupted after attach")
++
++    expect do
++      Rake::Task["profile_images:copy"].invoke
++    end.to raise_error(StandardError, "interrupted after attach")
++
++    expect(user.reload.profile_image).to be_attached
++    expect(article.reload.cached_user.profile_image_url).to eq(user_uploader.url)
++    expect(notification.reload.json_data.dig("user", "profile_image_90")).to eq(user_uploader.url)
++
++    allow(Images::ProfileImagesCopy).to receive(:new).and_call_original
++    Rake::Task["profile_images:copy"].reenable
++    expect do
++      Rake::Task["profile_images:copy"].invoke
++    end.not_to change(ActiveStorage::Blob, :count)
++
++    expect(article.reload.cached_user.profile_image_url).to eq(user.profile_image_url)
++    expect(notification.reload.json_data.dig("user", "profile_image_90")).to eq(user.profile_image_90)
++    expect(notification.json_data.dig("aggregated_siblings", 0, "profile_image_90")).to eq(user.profile_image_90)
++  end
++
++  describe "Fog S3 CarrierWave to Active Storage FogService copy" do
++    let(:bucket_name) { "forem-copy-bucket" }
++    let(:credentials) do
++      {
++        provider: "AWS",
++        aws_access_key_id: "mock-key",
++        aws_secret_access_key: "mock-secret",
++        region: "us-east-1"
++      }
++    end
++    let(:fog_as_service) do
++      ActiveStorage::Service.configure(
++        :amazon,
++        amazon: {
++          service: "Fog",
++          bucket: bucket_name,
++          public: true,
++          fog_public: true,
++          cache_control: "public, max-age=31536000",
++          credentials: credentials
++        },
++      )
++    end
++
++    around do |example|
++      original_as_service = ActiveStorage::Blob.service
++      original_as_services = ActiveStorage::Blob.services
++      Fog.mock!
++      Fog::Mock.reset
++      fog_as_service.connection.directories.create(key: bucket_name, public: true)
++
++      CarrierWave.configure do |config|
++        config.storage = :fog
++        config.fog_directory = bucket_name
++        config.fog_public = true
++        config.fog_credentials = credentials
++      end
++      ProfileImageUploader.storage :fog
++
++      ActiveStorage::Blob.services = ActiveStorage::Service::Registry.new(
++        amazon: {
++          service: "Fog",
++          bucket: bucket_name,
++          public: true,
++          fog_public: true,
++          cache_control: "public, max-age=31536000",
++          credentials: credentials
++        },
++      )
++      ActiveStorage::Blob.service = ActiveStorage::Blob.services.fetch(:amazon)
++
++      example.run
++    ensure
++      ActiveStorage::Blob.services = original_as_services
++      ActiveStorage::Blob.service = original_as_service
++      ProfileImageUploader.storage :file
++      CarrierWaveInitializer.local_storage_config
++      Fog.unmock!
++    end
++
++    it "copies S3 CarrierWave objects into FogService and serves Active Storage URLs", :aggregate_failures do
++      user = create(:user, profile_image: nil)
++      uploader = ProfileImageUploader.new(user, :profile_image)
++      png_path.open { |file| uploader.store!(file) }
++      user.update_columns(profile_image: uploader.identifier)
++      user.reload
++
++      carrierwave_key = "uploads/user/profile_image/#{user.id}/#{uploader.identifier}"
++      expect(ActiveStorage::Blob.service.exist?(carrierwave_key)).to be(true)
++
++      Rake::Task["profile_images:copy"].invoke
++
++      user.reload
++      expect(user.profile_image).to be_attached
++      expect(user.profile_image.blob.service_name).to eq("amazon")
++      expect(user.profile_image.blob.key).to match(%r{\Auploads/user/profile_image/[a-z0-9]+\.png\z})
++      expect(user.profile_image.blob.key).not_to eq(carrierwave_key)
++      expect(ActiveStorage::Blob.service.exist?(user.profile_image.blob.key)).to be(true)
++      expect(ActiveStorage::Blob.service.exist?(carrierwave_key)).to be(true)
++      expect(user.profile_image.download).to eq(File.binread(png_path))
++
++      allow(Rails).to receive(:env).and_return(ActiveSupport::StringInquirer.new("production"))
++      expect(user.profile_image_url).to eq(
++        "https://#{bucket_name}.s3.amazonaws.com/#{user.profile_image.blob.key}",
++      )
++    end
++  end
++end

@@ -1,0 +1,315 @@
+diff --git a/app/controllers/books/publications_controller.rb b/app/controllers/books/publications_controller.rb
+index 8d4ad25..fd9df01 100644
+--- a/app/controllers/books/publications_controller.rb
++++ b/app/controllers/books/publications_controller.rb
+@@ -20,7 +20,7 @@ class Books::PublicationsController < ApplicationController
+ 
+   private
+     def book_params
+-      params.require(:book).permit(:published, :slug)
++      params.fetch(:book, {}).permit(:published, :slug)
+     end
+ 
+     def apply_page_changes
+diff --git a/app/models/book/announceable.rb b/app/models/book/announceable.rb
+index 442f5bc..f869548 100644
+--- a/app/models/book/announceable.rb
++++ b/app/models/book/announceable.rb
+@@ -2,10 +2,28 @@ module Book::Announceable
+   extend ActiveSupport::Concern
+ 
+   included do
+-    after_update_commit :announce_publication, if: :saved_change_to_published?
++    thread_mattr_accessor :publication_checks, instance_accessor: false
++
++    after_save :track_publication_change, if: :saved_change_to_published?
+   end
+ 
+   private
++    def track_publication_change
++      Book.publication_checks&.delete(id)
++      was_published = !previously_new_record? && published_before_last_save
++
++      Book.current_transaction.after_commit do
++        checks = (Book.publication_checks ||= Set.new)
++        if checks.add?(id)
++          begin
++            announce_publication if !was_published && Book.published.exists?(id)
++          ensure
++            checks.add(id)
++          end
++        end
++      end
++    end
++
+     def announce_publication
+       AnnouncePublicationJob.perform_later self
+     end
+diff --git a/test/controllers/books/publications_controller_test.rb b/test/controllers/books/publications_controller_test.rb
+index 8761ea8..a930723 100644
+--- a/test/controllers/books/publications_controller_test.rb
++++ b/test/controllers/books/publications_controller_test.rb
+@@ -8,8 +8,10 @@ class Books::PublicationsTest < ActionDispatch::IntegrationTest
+   end
+ 
+   test "publish a book" do
+-    assert_changes -> { @book.reload.published? }, from: false, to: true do
+-      patch book_publication_url(@book), params: { book: { published: "1" } }
++    assert_enqueued_jobs 1, only: AnnouncePublicationJob do
++      assert_changes -> { @book.reload.published? }, from: false, to: true do
++        patch book_publication_path(@book), params: { book: { published: "1" } }
++      end
+     end
+ 
+     @book.reload
+@@ -17,16 +19,92 @@ class Books::PublicationsTest < ActionDispatch::IntegrationTest
+     assert_equal "manual", @book.slug
+   end
+ 
+-  test "edit book slug" do
++  test "publish a book and modify pages in the same sitting announces once" do
++    book = books(:handbook)
++
++    assert_enqueued_jobs 1, only: AnnouncePublicationJob do
++      patch book_publication_path(book), params: {
++        book: { published: "1" },
++        added_pages: [ "Appendix" ],
++        trashed_page_ids: [ leaves(:summary_page).id ],
++        renamed_pages: { leaves(:welcome_page).id => "Updated Welcome" }
++      }
++    end
++
++    assert book.reload.published?
++    assert book.leaves.active.exists?(title: "Appendix")
++    assert leaves(:summary_page).reload.trashed?
++    assert_equal "Updated Welcome", leaves(:welcome_page).reload.title
++  end
++
++  test "unpublish a live book does not announce" do
++    @book.update! published: true
++
++    assert_no_enqueued_jobs only: AnnouncePublicationJob do
++      assert_changes -> { @book.reload.published? }, from: true, to: false do
++        patch book_publication_path(@book), params: { book: { published: "0" } }
++      end
++    end
++  end
++
++  test "edit book slug on already-live book does not announce" do
+     @book.update! published: true
+ 
+-    get edit_book_publication_url(@book)
++    get edit_book_publication_path(@book)
+     assert_response :success
+ 
+-    patch book_publication_url(@book), params: { book: { slug: "new-slug" } }
++    assert_no_enqueued_jobs only: AnnouncePublicationJob do
++      patch book_publication_path(@book), params: { book: { slug: "new-slug" } }
++    end
+ 
+     @book.reload
+     assert_redirected_to book_slug_url(@book)
+     assert_equal "new-slug", @book.slug
+   end
++
++  test "saving an already-live book with page changes does not announce" do
++    @book.update! published: true
++
++    assert_no_enqueued_jobs only: AnnouncePublicationJob do
++      patch book_publication_path(@book), params: {
++        book: { published: "1" },
++        added_pages: [ "Extra Chapter" ]
++      }
++    end
++
++    assert_no_enqueued_jobs only: AnnouncePublicationJob do
++      patch book_publication_path(@book), params: {
++        added_pages: [ "Second Extra Chapter" ]
++      }
++    end
++
++    assert @book.reload.published?
++    assert @book.leaves.active.exists?(title: "Extra Chapter")
++    assert @book.leaves.active.exists?(title: "Second Extra Chapter")
++  end
++
++  test "saving a draft book without going live does not announce" do
++    assert_no_enqueued_jobs only: AnnouncePublicationJob do
++      patch book_publication_path(@book), params: {
++        book: { published: "0", slug: "draft-manual" },
++        added_pages: [ "Draft Chapter" ]
++      }
++    end
++
++    assert_not @book.reload.published?
++    assert_equal "draft-manual", @book.slug
++    assert @book.leaves.active.exists?(title: "Draft Chapter")
++  end
++
++  test "sitting that fails after marking book live leaves a draft and does not announce" do
++    assert_no_enqueued_jobs only: AnnouncePublicationJob do
++      patch book_publication_path(@book), params: {
++        book: { published: "1" },
++        trashed_page_ids: [ 0 ]
++      }
++    end
++
++    assert_response :not_found
++    assert_not @book.reload.published?
++  end
+ end
+diff --git a/test/models/book/announceable_test.rb b/test/models/book/announceable_test.rb
+new file mode 100644
+index 0000000..3bcb679
+--- /dev/null
++++ b/test/models/book/announceable_test.rb
+@@ -0,0 +1,149 @@
++require "test_helper"
++
++class Book::AnnounceableTest < ActiveSupport::TestCase
++  include ActiveJob::TestHelper
++
++  setup do
++    @book = books(:handbook)
++  end
++
++  test "going live announces the book once" do
++    assert_enqueued_with job: AnnouncePublicationJob, args: [ @book ] do
++      assert_enqueued_jobs 1, only: AnnouncePublicationJob do
++        @book.update!(published: true)
++      end
++    end
++  end
++
++  test "going live and modifying pages in the same sitting announces once" do
++    assert_enqueued_jobs 1, only: AnnouncePublicationJob do
++      @book.transaction do
++        @book.update!(published: true)
++        @book.press Page.new(body: "Fresh page"), title: "Added Page"
++        leaves(:welcome_page).update!(title: "Renamed Welcome")
++        leaves(:summary_page).trashed!
++        Book.find(@book.id).update!(slug: "handbook-live")
++      end
++    end
++
++    assert @book.reload.published?
++  end
++
++  test "toggling published multiple times in a sitting that ends up live announces once" do
++    assert_enqueued_jobs 1, only: AnnouncePublicationJob do
++      @book.transaction do
++        @book.update!(published: true)
++        @book.update!(published: false)
++        @book.update!(published: true)
++      end
++    end
++
++    assert @book.reload.published?
++  end
++
++  test "taking multiple books live in the same sitting announces each once" do
++    other_book = books(:manual)
++
++    assert_enqueued_jobs 2, only: AnnouncePublicationJob do
++      Book.transaction do
++        @book.update!(published: true)
++        other_book.update!(published: true)
++      end
++    end
++
++    assert_enqueued_with job: AnnouncePublicationJob, args: [ @book ]
++    assert_enqueued_with job: AnnouncePublicationJob, args: [ other_book ]
++  end
++
++  test "saving an already-live book again does not announce" do
++    @book.update!(published: true)
++
++    assert_no_enqueued_jobs only: AnnouncePublicationJob do
++      @book.transaction do
++        @book.update!(slug: "handbook-updated", published: true)
++        @book.press Page.new(body: "More content"), title: "Another Page"
++      end
++    end
++
++    assert_no_enqueued_jobs only: AnnouncePublicationJob do
++      @book.transaction do
++        @book.update!(published: false)
++        @book.update!(published: true)
++      end
++    end
++  end
++
++  test "taking a live book back down does not announce" do
++    @book.update!(published: true)
++
++    assert_no_enqueued_jobs only: AnnouncePublicationJob do
++      @book.update!(published: false)
++    end
++
++    assert_not @book.reload.published?
++  end
++
++  test "saving a draft without taking it live does not announce" do
++    assert_no_enqueued_jobs only: AnnouncePublicationJob do
++      @book.transaction do
++        @book.update!(slug: "draft-handbook")
++        @book.press Page.new(body: "Draft body"), title: "Draft Page"
++      end
++    end
++
++    assert_no_enqueued_jobs only: AnnouncePublicationJob do
++      @book.transaction do
++        @book.update!(published: true)
++        @book.update!(published: false)
++      end
++    end
++
++    assert_no_enqueued_jobs only: AnnouncePublicationJob do
++      @book.transaction do
++        @book.transaction(requires_new: true) do
++          @book.update!(published: true)
++          raise ActiveRecord::Rollback
++        end
++        @book.update!(slug: "still-draft-after-savepoint")
++      end
++    end
++
++    assert_not @book.reload.published?
++  end
++
++  test "a sitting that fails after marking the book live leaves a draft and does not announce" do
++    assert_no_enqueued_jobs only: AnnouncePublicationJob do
++      assert_raises RuntimeError do
++        @book.transaction do
++          @book.update!(published: true)
++          raise "Sitting failed"
++        end
++      end
++    end
++
++    assert_not @book.reload.published?
++
++    assert_no_enqueued_jobs only: AnnouncePublicationJob do
++      @book.transaction do
++        @book.update!(published: true)
++        raise ActiveRecord::Rollback
++      end
++    end
++
++    assert_not @book.reload.published?
++
++    assert_no_enqueued_jobs only: AnnouncePublicationJob do
++      @book.update!(slug: "still-draft")
++    end
++
++    assert_enqueued_jobs 1, only: AnnouncePublicationJob do
++      @book.update!(published: true)
++    end
++  end
++
++  test "creating a book already live announces once" do
++    assert_enqueued_jobs 1, only: AnnouncePublicationJob do
++      Book.create!(title: "Born Live", published: true)
++    end
++  end
++end

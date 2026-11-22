@@ -1,0 +1,1917 @@
+diff --git a/.gitignore b/.gitignore
+index 15d09eb..dae9ddc 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -131,3 +131,7 @@ doc/
+ 
+ # Local plan/design documents
+ docs/plans/
++
++# Ignore Active Storage local uploads
++/storage/*
++!/storage/.keep
+diff --git a/app/controllers/api/v1/organizations_controller.rb b/app/controllers/api/v1/organizations_controller.rb
+index cf1e4ab..6f4da75 100644
+--- a/app/controllers/api/v1/organizations_controller.rb
++++ b/app/controllers/api/v1/organizations_controller.rb
+@@ -22,7 +22,8 @@ def index
+         num = [per_page, per_page_max].min
+         page = params[:page] || 1
+ 
+-        organizations = Organization.select(INDEX_ATTRIBUTES_FOR_SERIALIZATION).page(page).per(num)
++        organizations = Organization.preload(profile_image_attachment: :blob)
++          .select(INDEX_ATTRIBUTES_FOR_SERIALIZATION).page(page).per(num)
+ 
+         render json: organizations
+       end
+diff --git a/app/controllers/concerns/api/organizations_controller.rb b/app/controllers/concerns/api/organizations_controller.rb
+index 6ab8d44..04a6d3c 100644
+--- a/app/controllers/concerns/api/organizations_controller.rb
++++ b/app/controllers/concerns/api/organizations_controller.rb
+@@ -32,7 +32,8 @@ def users
+       num = [per_page, per_page_max].min
+       page = params[:page] || 1
+ 
+-      @users = @organization.users.joins(:profile).select(USERS_FOR_SERIALIZATION).page(page).per(num)
++      @users = @organization.users.preload(profile_image_attachment: :blob)
++        .joins(:profile).select(USERS_FOR_SERIALIZATION).page(page).per(num)
+     end
+ 
+     def listings
+diff --git a/app/controllers/stories/tagged_articles_controller.rb b/app/controllers/stories/tagged_articles_controller.rb
+index 9fc5e5f..0c3dac0 100644
+--- a/app/controllers/stories/tagged_articles_controller.rb
++++ b/app/controllers/stories/tagged_articles_controller.rb
+@@ -19,7 +19,7 @@ def index
+       if user_signed_in?
+         @moderators = User.with_role(:tag_moderator, @tag)
+           .order(badge_achievements_count: :desc)
+-          .select(:username, :profile_image, :id)
++          .preload(profile_image_attachment: :blob).select(:username, :profile_image, :id)
+       end
+ 
+       set_number_of_articles(tag: @tag)
+diff --git a/app/mailers/notify_mailer.rb b/app/mailers/notify_mailer.rb
+index 648f870..ed07cdd 100644
+--- a/app/mailers/notify_mailer.rb
++++ b/app/mailers/notify_mailer.rb
+@@ -62,7 +62,7 @@ def new_follower_email
+         "follower_profile_url" => URL.user(@follower),
+         # Mirrors the avatar and follower count new_follower_email.html.erb renders.
+         "follower_profile_image_url" => ApplicationController.helpers.optimized_image_url(
+-          URL.local_image(@follower.profile_image), width: 150
++          URL.local_image(@follower.profile_image_url || Images::Profile::BACKUP_LINK), width: 150
+         ),
+         "followers_count" => @user.good_standing_followers_count,
+         "community_name" => Settings::Community.community_name(subforem_id: @subforem_id),
+diff --git a/app/models/concerns/profile_image_attachable.rb b/app/models/concerns/profile_image_attachable.rb
+new file mode 100644
+index 0000000..80a2240
+--- /dev/null
++++ b/app/models/concerns/profile_image_attachable.rb
+@@ -0,0 +1,449 @@
++require "fastimage"
++require "ipaddr"
++require "marcel"
++require "net/http"
++require "resolv"
++
++# Provides Active Storage attachment handling for User and Organization profile
++# images while preserving read-fallback for existing CarrierWave uploads.
++module ProfileImageAttachable
++  extend ActiveSupport::Concern
++
++  ALLOWED_FASTIMAGE_TYPES = %i[jpeg png gif webp bmp ico tiff].freeze
++  MAX_PIXEL_DIMENSIONS = [4096, 4096].freeze
++  REMOTE_DOWNLOAD_MAX_REDIRECTS = 5
++  REMOTE_DOWNLOAD_TIMEOUT = 10
++
++  CONTENT_TYPE_TO_EXTENSION = {
++    "image/jpeg" => "jpg",
++    "image/jpg" => "jpg",
++    "image/pjpeg" => "jpg",
++    "image/png" => "png",
++    "image/gif" => "gif",
++    "image/webp" => "webp",
++    "image/bmp" => "bmp",
++    "image/x-ms-bmp" => "bmp",
++    "image/x-icon" => "ico",
++    "image/vnd.microsoft.icon" => "ico",
++    "image/x-adobe-dng" => "dng"
++  }.freeze
++
++  mattr_accessor :enable_processing, default: !Rails.env.test?
++
++  class AttachedOne < ActiveStorage::Attached::One
++    delegate :to_s, to: :url
++
++    def url
++      record.profile_image_url
++    end
++
++    def as_json(_options = nil)
++      { "url" => url }
++    end
++
++    def blank?
++      !attached? && !record.legacy_profile_image_present?
++    end
++  end
++
++  included do
++    has_one_attached :profile_image
++
++    generated_association_methods.class_eval do
++      def profile_image
++        @active_storage_attached ||= {}
++        @active_storage_attached[:profile_image] ||= ProfileImageAttachable::AttachedOne.new("profile_image", self)
++      end
++    end
++
++    attr_reader :remote_profile_image_url
++
++    validate :validate_profile_image_attachment
++
++    before_save :snapshot_profile_image_attachment_change
++    after_rollback :reset_profile_image_transient_state
++  end
++
++  def profile_image=(attachable)
++    @_profile_image_validation_errors = []
++
++    if attachable.nil? || attachable == ""
++      @_clearing_legacy_profile_image = true
++      self[:profile_image] = nil if has_attribute?(:profile_image)
++      super(attachable)
++      return
++    end
++
++    @_clearing_legacy_profile_image = false
++
++    if attachable.is_a?(String)
++      blob = find_signed_profile_image_blob(attachable)
++      return unless blob
++
++      validate_profile_image_blob(blob)
++      super(blob) if @_profile_image_validation_errors.empty?
++      return
++    end
++
++    if attachable.is_a?(ActiveStorage::Blob)
++      validate_profile_image_blob(attachable)
++      super(attachable) if @_profile_image_validation_errors.empty?
++      return
++    end
++
++    prepared = prepare_profile_image_attachable(attachable)
++    super(prepared) if prepared && @_profile_image_validation_errors.empty?
++  end
++
++  def remote_profile_image_url=(value)
++    @_profile_image_validation_errors = []
++
++    if value.blank?
++      @remote_profile_image_url = nil
++      return
++    end
++
++    unless value.is_a?(String)
++      @remote_profile_image_url = nil
++      self.profile_image = value
++      return
++    end
++
++    @remote_profile_image_url = value
++    downloaded = download_remote_profile_image(value)
++    return unless downloaded
++    return if @_profile_image_validation_errors.present?
++
++    self.profile_image = downloaded
++  end
++
++  def profile_image_url
++    if profile_image.attached?
++      permanent_profile_image_blob_url(profile_image.blob)
++    elsif legacy_profile_image_present?
++      legacy_profile_image_url
++    end
++  end
++
++  def legacy_profile_image_present?
++    return false if @_clearing_legacy_profile_image
++
++    legacy_profile_image_identifier.present?
++  end
++
++  def saved_profile_image_change?
++    column_changed = has_attribute?(:profile_image) && saved_change_to_attribute?(:profile_image)
++    column_changed || @_profile_image_attachment_changed == true
++  end
++
++  def reload(*)
++    reset_profile_image_transient_state
++    super
++  end
++
++  private
++
++  def initialize_dup(*)
++    super
++    reset_profile_image_transient_state
++  end
++
++  def snapshot_profile_image_attachment_change
++    return unless attachment_changes.key?("profile_image")
++
++    @_profile_image_attachment_changed = true
++    return unless persisted? && has_attribute?(:updated_at)
++
++    updated_at_will_change!
++    self.updated_at = Time.current
++  end
++
++  def clear_profile_image_attachment_change
++    @_profile_image_attachment_changed = false
++  end
++
++  def reset_profile_image_transient_state
++    @_profile_image_attachment_changed = false
++    @_clearing_legacy_profile_image = false
++    @_profile_image_validation_errors = nil
++    @remote_profile_image_url = nil
++  end
++
++  def validate_profile_image_attachment
++    return if @_profile_image_validation_errors.blank?
++
++    @_profile_image_validation_errors.each do |error_message|
++      errors.add(:profile_image, error_message)
++    end
++  end
++
++  def legacy_profile_image_identifier
++    return unless has_attribute?(:profile_image)
++
++    self[:profile_image]
++  end
++
++  def legacy_profile_image_url
++    identifier = legacy_profile_image_identifier
++    return if identifier.blank?
++    return identifier if identifier.start_with?("http://", "https://")
++
++    uploader = ProfileImageUploader.new(self, :profile_image)
++    uploader.retrieve_from_store!(identifier)
++    uploader.url
++  end
++
++  def permanent_profile_image_blob_url(blob)
++    return unless blob
++
++    unless blob.persisted?
++      return "/rails/active_storage/blobs/pending/#{blob.key}/#{ERB::Util.url_encode(blob.filename.to_s)}"
++    end
++
++    service = blob.service
++    if service.respond_to?(:permanent_url)
++      permanent = service.permanent_url(blob.key)
++      return permanent if permanent.present?
++    elsif service&.public?
++      return blob.url
++    end
++
++    path = Rails.application.routes.url_helpers.rails_storage_proxy_path(blob, only_path: true)
++    Rails.env.production? ? URL.url(path) : path
++  end
++
++  def find_signed_profile_image_blob(signed_id)
++    ActiveStorage::Blob.find_signed(signed_id, record: self)
++  rescue ActiveSupport::MessageVerifier::InvalidSignature
++    nil
++  end
++
++  def validate_profile_image_blob(blob)
++    ext = File.extname(blob.filename.to_s).delete_prefix(".").downcase
++    check_profile_image_extension(ext)
++    return if @_profile_image_validation_errors.present?
++
++    check_profile_image_byte_size(blob.byte_size)
++  end
++
++  def prepare_profile_image_attachable(attachable)
++    io, original_filename, declared_content_type = extract_attachable_io(attachable)
++    return unless io
++
++    io.rewind if io.respond_to?(:rewind)
++    file_size = io.size
++    if file_size > ProfileImageUploader::MAX_FILE_SIZE
++      check_profile_image_byte_size(file_size)
++      return
++    end
++
++    detected_type = Marcel::MimeType.for(io, name: original_filename, declared_type: declared_content_type)
++    io.rewind if io.respond_to?(:rewind)
++
++    ext = resolve_profile_image_extension(original_filename, detected_type)
++    check_profile_image_extension(ext)
++    return if @_profile_image_validation_errors.present?
++
++    check_profile_image_byte_size(file_size)
++    return if @_profile_image_validation_errors.present?
++
++    dimensions = check_profile_image_bomb_shelter(io)
++    io.rewind if io.respond_to?(:rewind)
++    return if @_profile_image_validation_errors.present?
++
++    data = process_profile_image_bytes(io, detected_type)
++    return if @_profile_image_validation_errors.present?
++
++    output_io = StringIO.new(data)
++    output_io.binmode
++    {
++      io: output_io,
++      filename: "#{SecureRandom.uuid}.#{ext}",
++      content_type: detected_type.presence || declared_content_type || "application/octet-stream",
++      metadata: { width: dimensions[0], height: dimensions[1], analyzed: true }
++    }
++  end
++
++  def extract_attachable_io(attachable)
++    case attachable
++    when ActionDispatch::Http::UploadedFile, Rack::Test::UploadedFile
++      io = attachable.respond_to?(:open) ? attachable.open : attachable.tempfile
++      [io, attachable.original_filename.to_s, attachable.content_type]
++    when Hash
++      sym = attachable.symbolize_keys
++      [sym[:io], sym[:filename].to_s, sym[:content_type]]
++    when File
++      [attachable, File.basename(attachable.path), nil]
++    when Pathname
++      [attachable.open, attachable.basename.to_s, nil]
++    else
++      record_profile_image_error(I18n.t("errors.messages.carrierwave_integrity_error"))
++      nil
++    end
++  end
++
++  def resolve_profile_image_extension(filename, detected_type)
++    ext = File.extname(filename.to_s).delete_prefix(".").downcase
++    return ext if ext.present?
++
++    CONTENT_TYPE_TO_EXTENSION[detected_type.to_s.downcase].to_s
++  end
++
++  def check_profile_image_byte_size(byte_size)
++    max_bytes = ProfileImageUploader::MAX_FILE_SIZE
++    if byte_size.to_i < 1
++      min_human = ApplicationController.helpers.number_to_human_size(1)
++      record_profile_image_error(I18n.t("errors.messages.min_size_error", min_size: min_human))
++    elsif byte_size.to_i > max_bytes
++      max_human = ApplicationController.helpers.number_to_human_size(max_bytes)
++      record_profile_image_error(I18n.t("errors.messages.max_size_error", max_size: max_human))
++    end
++  end
++
++  def check_profile_image_extension(ext)
++    allowed = BaseUploader::EXTENSION_ALLOWLIST
++    return if allowed.include?(ext)
++
++    record_profile_image_error(
++      I18n.t(
++        "errors.messages.extension_allowlist_error",
++        extension: ext.inspect,
++        allowed_types: allowed.join(", "),
++      ),
++    )
++  end
++
++  def check_profile_image_bomb_shelter(io)
++    image = FastImage.new(io)
++    unless image.type && ALLOWED_FASTIMAGE_TYPES.include?(image.type)
++      record_profile_image_error(I18n.t("errors.messages.unsupported_image_type"))
++      return
++    end
++
++    max_w, max_h = MAX_PIXEL_DIMENSIONS
++    return image.size if image.size && image.size[0] <= max_w && image.size[1] <= max_h
++
++    record_profile_image_error(
++      I18n.t("errors.messages.pixel_dimensions_error", x_size: max_w, y_size: max_h),
++    )
++    nil
++  end
++
++  def process_profile_image_bytes(io, content_type)
++    raw = io.read
++    io.rewind if io.respond_to?(:rewind)
++    return raw unless ProfileImageAttachable.enable_processing
++    return raw if content_type.to_s.include?("svg")
++
++    Tempfile.create(["profile_image", ".img"], binmode: true) do |tempfile|
++      tempfile.write(raw)
++      tempfile.flush
++
++      validate_profile_image_frame_count(tempfile.path)
++      return nil if @_profile_image_validation_errors.present?
++
++      strip_profile_image_exif(tempfile.path)
++      File.binread(tempfile.path)
++    end
++  end
++
++  def validate_profile_image_frame_count(path)
++    frame_count = MiniMagick::Image.new(path).frames.count
++    return unless frame_count > BaseUploader::FRAME_MAX
++
++    record_profile_image_error(
++      I18n.t("uploaders.base_uploader.too_many_frames", frame_max: BaseUploader::FRAME_MAX),
++    )
++  rescue Timeout::Error
++    record_profile_image_error(I18n.t("uploaders.base_uploader.timeout"))
++  rescue MiniMagick::Error
++    record_profile_image_error(I18n.t("errors.messages.processing_error"))
++  end
++
++  def strip_profile_image_exif(path)
++    image = MiniMagick::Image.new(path)
++    frame_count = image.frames.count
++    image.auto_orient
++    image.strip unless frame_count > BaseUploader::FRAME_STRIP_MAX
++    image.write(path)
++  rescue StandardError => e
++    Rails.logger.error("Error stripping EXIF data: #{e}")
++  end
++
++  def download_remote_profile_image(url, redirects_remaining = REMOTE_DOWNLOAD_MAX_REDIRECTS)
++    uri = URI.parse(url)
++    unless uri.is_a?(URI::HTTP) && uri.host.present?
++      record_profile_image_error(I18n.t("errors.messages.carrierwave_download_error"))
++      return
++    end
++
++    if ssrf_blocked_uri?(uri)
++      record_profile_image_error(I18n.t("errors.messages.carrierwave_download_error"))
++      return
++    end
++
++    response = perform_remote_http_get(uri)
++    case response
++    when Net::HTTPSuccess
++      body = response.body.to_s.b
++      return if body.empty?
++
++      content_type = response["content-type"].to_s.split(";").first&.strip
++      filename = filename_from_remote_uri(uri, content_type)
++      io = StringIO.new(body)
++      io.binmode
++      { io: io, filename: filename, content_type: content_type }
++    when Net::HTTPRedirection
++      if redirects_remaining <= 0 || response["location"].blank?
++        record_profile_image_error(I18n.t("errors.messages.carrierwave_download_error"))
++        return
++      end
++      redirect_url = URI.join(uri.to_s, response["location"]).to_s
++      download_remote_profile_image(redirect_url, redirects_remaining - 1)
++    else
++      record_profile_image_error(I18n.t("errors.messages.carrierwave_download_error"))
++      nil
++    end
++  rescue URI::InvalidURIError, SocketError, Timeout::Error, Errno::ECONNREFUSED,
++         Errno::EHOSTUNREACH, Errno::ENETUNREACH, OpenSSL::SSL::SSLError, Net::HTTPError
++    record_profile_image_error(I18n.t("errors.messages.carrierwave_download_error"))
++    nil
++  end
++
++  def perform_remote_http_get(uri)
++    http = Net::HTTP.new(uri.host, uri.port)
++    http.use_ssl = uri.scheme == "https"
++    http.open_timeout = REMOTE_DOWNLOAD_TIMEOUT
++    http.read_timeout = REMOTE_DOWNLOAD_TIMEOUT
++    request = Net::HTTP::Get.new(uri.request_uri)
++    http.request(request)
++  end
++
++  def filename_from_remote_uri(uri, content_type)
++    basename = File.basename(uri.path.to_s)
++    ext = File.extname(basename).delete_prefix(".").downcase
++    return basename if ext.present? && BaseUploader::EXTENSION_ALLOWLIST.include?(ext)
++
++    inferred_ext = CONTENT_TYPE_TO_EXTENSION[content_type.to_s.downcase]
++    inferred_ext ? "#{basename.presence || 'avatar'}.#{inferred_ext}" : basename.presence || "avatar"
++  end
++
++  def ssrf_blocked_uri?(uri)
++    return false unless Rails.env.production?
++    return false if uri.host == Settings::General.app_domain
++    return true if uri.host.casecmp("localhost").zero?
++
++    addresses = Resolv.getaddresses(uri.host)
++    addresses.any? do |addr|
++      ip = IPAddr.new(addr)
++      ip.loopback? || ip.private? || ip.link_local?
++    end
++  rescue Resolv::ResolvError, IPAddr::InvalidAddressError
++    true
++  end
++
++  def record_profile_image_error(message)
++    @_profile_image_validation_errors ||= []
++    @_profile_image_validation_errors << message
++  end
++end
+diff --git a/app/models/organization.rb b/app/models/organization.rb
+index 9697e5b..34655cb 100644
+--- a/app/models/organization.rb
++++ b/app/models/organization.rb
+@@ -4,6 +4,7 @@ class Organization < ApplicationRecord
+   include PgSearch::Model
+   include AlgoliaSearchable
+ 
++  include ProfileImageAttachable
+   include Images::Profile.for(:profile_image_url)
+ 
+   extend UniqueAcrossModels
+@@ -45,6 +46,7 @@ class Organization < ApplicationRecord
+   after_save :generate_social_images
+ 
+   after_update_commit :conditionally_update_articles
++  after_commit :clear_profile_image_attachment_change
+   after_update_commit :recompile_pages, if: -> { saved_change_to_name? || saved_change_to_slug? || saved_change_to_summary? }
+   after_save_commit :manage_fastly_tls_subscription
+   after_destroy_commit :bust_cache
+@@ -98,7 +100,6 @@ class Organization < ApplicationRecord
+ 
+   unique_across_models :slug, length: { in: 2..30 }
+ 
+-  mount_uploader :profile_image, ProfileImageUploader
+   mount_uploader :cover_image, CoverImageUploader
+ 
+   alias_attribute :username, :slug
+@@ -319,7 +320,7 @@ def validate_social_links
+   end
+ 
+   def generate_social_images
+-    change = saved_change_to_attribute?(:name) || saved_change_to_attribute?(:profile_image)
++    change = saved_change_to_attribute?(:name) || saved_profile_image_change?
+     return unless change && articles.published.from_subforem.size.positive?
+ 
+     Images::SocialImageWorker.perform_async(id, self.class.name)
+@@ -401,7 +402,9 @@ def manage_fastly_tls_subscription
+   end
+ 
+   def conditionally_update_articles
+-    return unless Article::ATTRIBUTES_CACHED_FOR_RELATED_ENTITY.detect { |attr| saved_change_to_attribute?(attr) }
++    changed = saved_profile_image_change? ||
++      Article::ATTRIBUTES_CACHED_FOR_RELATED_ENTITY.any? { |attr| saved_change_to_attribute?(attr) }
++    return unless changed
+ 
+     article_ids = articles.ids.map { |id| [id] }
+     Organizations::SaveArticleWorker.perform_bulk(article_ids)
+diff --git a/app/models/user.rb b/app/models/user.rb
+index 3722018..5901995 100644
+--- a/app/models/user.rb
++++ b/app/models/user.rb
+@@ -4,6 +4,7 @@ class User < ApplicationRecord
+ 
+   include CloudinaryHelper
+ 
++  include ProfileImageAttachable
+   include Images::Profile.for(:profile_image_url)
+   include AlgoliaSearchable
+   include Trackable
+@@ -168,8 +169,6 @@ def cached_recent_user_ids
+     end
+   end
+ 
+-  mount_uploader :profile_image, ProfileImageUploader
+-
+   devise :invitable, :omniauthable, :registerable, :database_authenticatable, :confirmable, :rememberable,
+          :recoverable, :lockable, :trackable
+ 
+@@ -326,6 +325,7 @@ def cached_recent_user_ids
+   after_commit :bust_profile_identity_cache, on: :update, if: :profile_identity_changed_for_cache?
+   after_commit :bust_profile_details_cache, on: :update, if: :profile_details_changed_for_cache?
+   after_commit :bust_profile_image_cache, on: :update, if: :profile_image_changed_for_cache?
++  after_commit :clear_profile_image_attachment_change
+   after_commit :enqueue_profile_spam_check, on: :update, if: :name_contains_spam_trigger_terms?
+ 
+   def self.average_articles_count
+@@ -1068,7 +1068,7 @@ def send_devise_notification(notification, *args)
+   private
+ 
+   def generate_social_images
+-    change = saved_change_to_attribute?(:name) || saved_change_to_attribute?(:profile_image)
++    change = saved_change_to_attribute?(:name) || saved_profile_image_change?
+     return unless change && articles.published.from_subforem.size.positive?
+ 
+     Images::SocialImageWorker.perform_async(id, self.class.name)
+@@ -1145,7 +1145,7 @@ def profile_details_changed_for_cache?
+   end
+ 
+   def profile_image_changed_for_cache?
+-    saved_change_to_profile_image? ||
++    saved_profile_image_change? ||
+       (respond_to?(:saved_change_to_profile_image_url?) && saved_change_to_profile_image_url?)
+   end
+ 
+diff --git a/app/services/moderator/banish_user.rb b/app/services/moderator/banish_user.rb
+index e53aaf8..6e7c7b4 100644
+--- a/app/services/moderator/banish_user.rb
++++ b/app/services/moderator/banish_user.rb
+@@ -53,6 +53,7 @@ def reassign_and_bust_username
+ 
+     def remove_profile_info
+       user.profile.clear!
++      user.profile_image.purge_later if user.profile_image.attached?
+       user.update_columns(profile_image: DEFAULT_PROFILE_IMAGE)
+     end
+ 
+diff --git a/app/services/search/organization.rb b/app/services/search/organization.rb
+index 2be7ad1..6ad738c 100644
+--- a/app/services/search/organization.rb
++++ b/app/services/search/organization.rb
+@@ -23,7 +23,7 @@ def self.search_documents(
+       page = page.to_i + 1
+       per_page = [(per_page || DEFAULT_PER_PAGE).to_i, MAX_PER_PAGE].min
+ 
+-      relation = ::Organization.all
++      relation = ::Organization.preload(profile_image_attachment: :blob)
+ 
+       relation = relation.search_organizations(term) if term.present?
+ 
+diff --git a/app/services/search/user.rb b/app/services/search/user.rb
+index c0d3020..cd5c8fd 100644
+--- a/app/services/search/user.rb
++++ b/app/services/search/user.rb
+@@ -29,7 +29,7 @@ def self.search_documents(term: nil, sort_by: :nil, sort_direction: :desc, page:
+ 
+       relation = relation.search_by_name_and_username(term) if term.present?
+ 
+-      relation = relation.select(*ATTRIBUTES)
++      relation = relation.preload(profile_image_attachment: :blob).select(*ATTRIBUTES)
+ 
+       relation = sort(relation, sort_by, sort_direction)
+ 
+diff --git a/app/services/search/username.rb b/app/services/search/username.rb
+index c429961..7455e6f 100644
+--- a/app/services/search/username.rb
++++ b/app/services/search/username.rb
+@@ -77,7 +77,7 @@ def search(term, limit)
+     private
+ 
+     def scope_without_context
+-      ::User.select(*ATTRIBUTES)
++      ::User.preload(profile_image_attachment: :blob).select(*ATTRIBUTES)
+     end
+ 
+     private_class_method :serialize
+diff --git a/app/services/users/suggest_for_sidebar.rb b/app/services/users/suggest_for_sidebar.rb
+index f8917d2..bbeed73 100644
+--- a/app/services/users/suggest_for_sidebar.rb
++++ b/app/services/users/suggest_for_sidebar.rb
+@@ -18,7 +18,9 @@ def suggest
+       suggested_user_ids = Rails.cache.fetch(generate_cache_name, expires_in: 120.hours) do
+         (reputable_user_ids + random_user_ids).uniq
+       end
+-      User.select(:id, :name, :username, :profile_image).where(id: suggested_user_ids)
++      User.preload(profile_image_attachment: :blob)
++        .select(:id, :name, :username, :profile_image)
++        .where(id: suggested_user_ids)
+     end
+ 
+     private
+diff --git a/app/views/admin/audience_segments/show.html.erb b/app/views/admin/audience_segments/show.html.erb
+index cb51dd3..5d5b5cd 100644
+--- a/app/views/admin/audience_segments/show.html.erb
++++ b/app/views/admin/audience_segments/show.html.erb
+@@ -112,8 +112,8 @@ <h2 class="crayons-subtitle-2">Segment Members (<%= @segmented_users.total_count
+                 </td>
+                 <td>
+                   <div class="flex items-center gap-2">
+-                    <% if user.profile_image.present? %>
+-                      <img src="<%= user.profile_image %>" class="w-6 h-6 rounded-full" alt="" />
++                    <% if user.profile_image_url.present? %>
++                      <img src="<%= user.profile_image_url %>" class="w-6 h-6 rounded-full" alt="" />
+                     <% end %>
+                     <div>
+                       <span class="font-medium"><%= user.name %></span>
+diff --git a/app/views/admin/organizations/show.html.erb b/app/views/admin/organizations/show.html.erb
+index 051f5b1..c867927 100644
+--- a/app/views/admin/organizations/show.html.erb
++++ b/app/views/admin/organizations/show.html.erb
+@@ -2,7 +2,7 @@
+ <header>
+   <section class="crayons-card flex flex-col l:flex-row gap-2 m:gap-4 l:gap-6 mb-2 m:mb-3 p-3 s:p-4 m:p-7">
+     <span class="crayons-logo crayons-logo--3xl">
+-      <img src="<%= @organization.profile_image %>" width="100%" height="100%" alt="<%= @organization.name %> profile picture">
++      <img src="<%= @organization.profile_image_url %>" width="100%" height="100%" alt="<%= @organization.name %> profile picture">
+     </span>
+     <div class="grid gap-2 flex-1">
+       <div class="s:flex items-center gap-5">
+diff --git a/app/views/mailers/notify_mailer/new_follower_email.html.erb b/app/views/mailers/notify_mailer/new_follower_email.html.erb
+index 5a63224..2343000 100644
+--- a/app/views/mailers/notify_mailer/new_follower_email.html.erb
++++ b/app/views/mailers/notify_mailer/new_follower_email.html.erb
+@@ -11,7 +11,7 @@ <h1 style="margin: 0; font-size: 24px; color: #333;">
+     <tr>
+       <td align="center">
+         <img style="border-radius:100%;" width="150px"
+-          src="<%= optimized_image_url(URL.local_image(@follower.profile_image), width: 150)%>"
++          src="<%= optimized_image_url(URL.local_image(@follower.profile_image_url || Images::Profile::BACKUP_LINK), width: 150)%>"
+           alt="<%= @follower.name %> profile image">
+       </td>
+     </tr>
+diff --git a/config/application.rb b/config/application.rb
+index 3618d3e..cbe6593 100644
+--- a/config/application.rb
++++ b/config/application.rb
+@@ -3,9 +3,9 @@
+ require "rails"
+ # Pick the frameworks you want:
+ require "active_model/railtie"
+-# require "active_job/railtie"
++require "active_job/railtie"
+ require "active_record/railtie"
+-# require "active_storage/engine"
++require "active_storage/engine"
+ require "action_controller/railtie"
+ require "action_mailer/railtie"
+ # require "action_mailbox/engine"
+@@ -37,6 +37,9 @@ class Application < Rails::Application
+     # See: https://guides.rubyonrails.org/configuring.html#results-of-config-load-defaults
+     config.load_defaults 8.0
+ 
++    config.active_storage.variant_processor = :mini_magick
++    config.active_storage.resolve_model_to_route = :rails_storage_proxy
++
+     # Set AhoyEmail secret token early to prevent it from accessing deprecated Rails.application.secrets
+     config.before_initialize do
+       AhoyEmail.secret_token = config.secret_key_base if defined?(AhoyEmail)
+diff --git a/config/environments/development.rb b/config/environments/development.rb
+index 92134ee..51cf284 100644
+--- a/config/environments/development.rb
++++ b/config/environments/development.rb
+@@ -130,6 +130,7 @@
+   end
+ 
+   config.public_file_server.enabled = true
++  config.active_storage.service = :local
+ 
+   # Use an evented file watcher to asynchronously detect changes in source code,
+   # routes, locales, etc. This feature depends on the listen gem.
+@@ -177,6 +178,12 @@
+     Bullet.add_safelist(type: :unused_eager_loading, class_name: "Article", association: :reactions)
+     Bullet.add_safelist(type: :unused_eager_loading, class_name: "Reaction", association: :user)
+     Bullet.add_safelist(type: :unused_eager_loading, class_name: "Tag", association: :badge)
++    Bullet.add_safelist(type: :unused_eager_loading, class_name: "User", association: :profile_image_attachment)
++    Bullet.add_safelist(type: :unused_eager_loading, class_name: "Organization", association: :profile_image_attachment)
++    Bullet.add_safelist(type: :unused_eager_loading, class_name: "ActiveStorage::Attachment", association: :blob)
++    Bullet.add_safelist(type: :n_plus_one_query, class_name: "User", association: :profile_image_attachment)
++    Bullet.add_safelist(type: :n_plus_one_query, class_name: "Organization", association: :profile_image_attachment)
++    Bullet.add_safelist(type: :n_plus_one_query, class_name: "ActiveStorage::Attachment", association: :blob)
+ 
+     # Check if there are any data update scripts to run during startup
+     if %w[Console Server DBConsole].any? { |const| Rails.const_defined?(const) } && DataUpdateScript.scripts_to_run?
+diff --git a/config/environments/production.rb b/config/environments/production.rb
+index 1b60a74..0866caa 100644
+--- a/config/environments/production.rb
++++ b/config/environments/production.rb
+@@ -117,6 +117,7 @@
+ 
+   # Do not dump schema after migrations.
+   config.active_record.dump_schema_after_migration = false
++  config.active_storage.service = :local
+ 
+   protocol = ENV.fetch("APP_PROTOCOL", "http://")
+ 
+diff --git a/config/environments/test.rb b/config/environments/test.rb
+index 2495690..ba97277 100644
+--- a/config/environments/test.rb
++++ b/config/environments/test.rb
+@@ -35,6 +35,7 @@
+   config.consider_all_requests_local       = true
+   config.action_controller.perform_caching = false
+   config.cache_store = :null_store
++  config.active_storage.service = :test
+ 
+   # Raise exceptions instead of rendering exception templates.
+   config.action_dispatch.show_exceptions = :none
+@@ -93,6 +94,12 @@
+     # @mstruve: These occur during setting updates, not sure how since we are only dealing with single setting records
+     Bullet.add_safelist(type: :n_plus_one_query, class_name: "Users::Setting", association: :user)
+     Bullet.add_safelist(type: :n_plus_one_query, class_name: "Users::NotificationSetting", association: :user)
++    Bullet.add_safelist(type: :unused_eager_loading, class_name: "User", association: :profile_image_attachment)
++    Bullet.add_safelist(type: :unused_eager_loading, class_name: "Organization", association: :profile_image_attachment)
++    Bullet.add_safelist(type: :unused_eager_loading, class_name: "ActiveStorage::Attachment", association: :blob)
++    Bullet.add_safelist(type: :n_plus_one_query, class_name: "User", association: :profile_image_attachment)
++    Bullet.add_safelist(type: :n_plus_one_query, class_name: "Organization", association: :profile_image_attachment)
++    Bullet.add_safelist(type: :n_plus_one_query, class_name: "ActiveStorage::Attachment", association: :blob)
+   end
+ end
+ # rubocop:enable Metrics/BlockLength
+diff --git a/config/fastly/snippets/safe_params_list.vcl b/config/fastly/snippets/safe_params_list.vcl
+index 8cc9411..a1f22bb 100644
+--- a/config/fastly/snippets/safe_params_list.vcl
++++ b/config/fastly/snippets/safe_params_list.vcl
+@@ -1,7 +1,7 @@
+ import querystring;
+ sub vcl_recv {
+     # return this URL with only the parameters that match this regular expression
+-    if (req.url !~ "/ahoy/" && req.url !~ "/admin/" && req.url !~ "/search/" && req.url !~ "/bulk_show" && !(req.url ~ "^/api" && req.http.api-key)) {
++    if (req.url !~ "/ahoy/" && req.url !~ "/admin/" && req.url !~ "/search/" && req.url !~ "/bulk_show" && req.url !~ "^/rails/active_storage/" && !(req.url ~ "^/api" && req.http.api-key)) {
+       set req.url = querystring.regfilter_except(req.url, "^(a_id|args|article_id|article_ids|articles|asc|callback_url|category|client_id|code|collection_id|commentable_id|commentable_type|confirmation_token|continuation|created_at|end|email|filter|followable_id|followable_type|forem_owner_secret|fork_id|form_ids|i|key|message_offset|name|oauth_token|oauth_verifier|offset|onboarding|org_id|organization_id|p|page|per_page|p_id|placement_area|prefill|preview|purchaser|q|reactable_ids|redirect_uri|reported_url|reporter_username|response_type|scope|search|signature|sort|source_id|source_type|start|state|status|tag|tag_list|top|type_of|url|username|invitation_token|reset_password_token|ut|verb|invitation_slug|period|comments_sort|billboard|controller_action|bb_test_placement_area|cookies_allowed|members|bb_test_id|item|mode|month|page_id|token|passed_domain)$");
+     }
+ }
+diff --git a/config/initializers/active_storage.rb b/config/initializers/active_storage.rb
+new file mode 100644
+index 0000000..bd7a37b
+--- /dev/null
++++ b/config/initializers/active_storage.rb
+@@ -0,0 +1,68 @@
++module ActiveStorageInitializer
++  def self.service_name
++    if Rails.env.production? && ENV["FILE_STORAGE_LOCATION"] != "file"
++      if ENV["FOREM_CONTEXT"] == "forem_cloud"
++        :forem_cloud
++      elsif ApplicationConfig["AWS_ID"].present?
++        :amazon
++      else
++        :local
++      end
++    elsif Rails.env.test?
++      :test
++    else
++      :local
++    end
++  end
++
++  def self.build_configurations
++    {
++      test: {
++        service: "Disk",
++        root: Rails.root.join("tmp/storage")
++      },
++      local: {
++        service: "Disk",
++        root: Rails.root.join("storage")
++      },
++      amazon: {
++        service: "Fog",
++        bucket: ApplicationConfig["AWS_BUCKET_NAME"],
++        public: true,
++        upload: { "Cache-Control" => "public, max-age=#{365.days.to_i}" },
++        credentials: {
++          provider: "AWS",
++          aws_access_key_id: ApplicationConfig["AWS_ID"],
++          aws_secret_access_key: ApplicationConfig["AWS_SECRET"],
++          region: ApplicationConfig["AWS_UPLOAD_REGION"].presence ||
++            ApplicationConfig["AWS_DEFAULT_REGION"].presence ||
++            "us-east-1"
++        }
++      },
++      forem_cloud: {
++        service: "Fog",
++        bucket: ApplicationConfig["AWS_BUCKET_NAME"],
++        public: false,
++        remote_images_proxy: true,
++        credentials: {
++          provider: "AWS",
++          use_iam_profile: true,
++          region: "us-east-2"
++        }
++      }
++    }
++  end
++
++  def self.initialize!
++    service = service_name
++    Rails.application.config.active_storage.service = service
++    return unless defined?(ActiveStorage::Blob)
++
++    ActiveStorage::Blob.services = ActiveStorage::Service::Registry.new(build_configurations)
++    ActiveStorage::Blob.service = ActiveStorage::Blob.services.fetch(service)
++  end
++end
++
++Rails.application.reloader.to_prepare do
++  ActiveStorageInitializer.initialize!
++end
+diff --git a/config/initializers/zeitwerk.rb b/config/initializers/zeitwerk.rb
+index 4da82d4..732174c 100644
+--- a/config/initializers/zeitwerk.rb
++++ b/config/initializers/zeitwerk.rb
+@@ -16,3 +16,4 @@
+ Rails.autoloaders.main.ignore(Rails.root.join("lib/generators/service"))
+ Rails.autoloaders.main.ignore(Rails.root.join("lib/generators/settings_model"))
+ Rails.autoloaders.main.ignore(Rails.root.join("lib/cypress-rails"))
++Rails.autoloaders.main.ignore(Rails.root.join("lib/active_storage"))
+diff --git a/config/routes.rb b/config/routes.rb
+index b78e0e6..a3afa43 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -635,11 +635,13 @@
+                       constraints: { format: /html/ }
+     get "/:slug", to: "pages#show",
+                   constraints: { format: /txt/ }
+-    get "/:slug_0/:slug_1", to: "pages#show", as: :page_0_1
+-    get "/:slug_0/:slug_1/:slug_2", to: "pages#show", as: :page_0_1_2
+-    get "/:slug_0/:slug_1/:slug_2/:slug_3", to: "pages#show", as: :page_0_1_2_3
+-    get "/:slug_0/:slug_1/:slug_2/:slug_3/:slug_4", to: "pages#show", as: :page_0_1_2_3_4
+-    get "/:slug_0/:slug_1/:slug_2/:slug_3/:slug_4/:slug_5", to: "pages#show", as: :page_0_1_2_3_4_5
++    constraints(slug_0: %r{(?!rails\z)[^/.]+}) do
++      get "/:slug_0/:slug_1", to: "pages#show", as: :page_0_1
++      get "/:slug_0/:slug_1/:slug_2", to: "pages#show", as: :page_0_1_2
++      get "/:slug_0/:slug_1/:slug_2/:slug_3", to: "pages#show", as: :page_0_1_2_3
++      get "/:slug_0/:slug_1/:slug_2/:slug_3/:slug_4", to: "pages#show", as: :page_0_1_2_3_4
++      get "/:slug_0/:slug_1/:slug_2/:slug_3/:slug_4/:slug_5", to: "pages#show", as: :page_0_1_2_3_4_5
++    end
+     root "stories#index"
+   end
+ end
+diff --git a/config/storage.yml b/config/storage.yml
+index d32f76e..fe1f77b 100644
+--- a/config/storage.yml
++++ b/config/storage.yml
+@@ -6,29 +6,24 @@ local:
+   service: Disk
+   root: <%= Rails.root.join("storage") %>
+ 
+-# Use rails credentials:edit to set the AWS secrets (as aws:access_key_id|secret_access_key)
+-# amazon:
+-#   service: S3
+-#   access_key_id: <%= Rails.application.credentials.dig(:aws, :access_key_id) %>
+-#   secret_access_key: <%= Rails.application.credentials.dig(:aws, :secret_access_key) %>
+-#   region: us-east-1
+-#   bucket: your_own_bucket
++amazon:
++  service: Fog
++  bucket: <%= ApplicationConfig["AWS_BUCKET_NAME"] %>
++  public: true
++  upload:
++    Cache-Control: <%= "public, max-age=#{365.days.to_i}" %>
++  credentials:
++    provider: AWS
++    aws_access_key_id: <%= ApplicationConfig["AWS_ID"] %>
++    aws_secret_access_key: <%= ApplicationConfig["AWS_SECRET"] %>
++    region: <%= ApplicationConfig["AWS_UPLOAD_REGION"].presence || ApplicationConfig["AWS_DEFAULT_REGION"].presence || "us-east-1" %>
+ 
+-# Remember not to checkin your GCS keyfile to a repository
+-# google:
+-#   service: GCS
+-#   project: your_project
+-#   credentials: <%= Rails.root.join("path/to/gcs.keyfile") %>
+-#   bucket: your_own_bucket
+-
+-# Use rails credentials:edit to set the Azure Storage secret (as azure_storage:storage_access_key)
+-# microsoft:
+-#   service: AzureStorage
+-#   storage_account_name: your_account_name
+-#   storage_access_key: <%= Rails.application.credentials.dig(:azure_storage, :storage_access_key) %>
+-#   container: your_container_name
+-
+-# mirror:
+-#   service: Mirror
+-#   primary: local
+-#   mirrors: [ amazon, google, microsoft ]
++forem_cloud:
++  service: Fog
++  bucket: <%= ApplicationConfig["AWS_BUCKET_NAME"] %>
++  public: false
++  remote_images_proxy: true
++  credentials:
++    provider: AWS
++    use_iam_profile: true
++    region: us-east-2
+diff --git a/db/migrate/20260916120000_create_active_storage_tables.rb b/db/migrate/20260916120000_create_active_storage_tables.rb
+new file mode 100644
+index 0000000..a5acfdf
+--- /dev/null
++++ b/db/migrate/20260916120000_create_active_storage_tables.rb
+@@ -0,0 +1,54 @@
++class CreateActiveStorageTables < ActiveRecord::Migration[8.0]
++  def change
++    safety_assured do
++      create_blobs_table
++      create_attachments_table
++      create_variant_records_table
++    end
++  end
++
++  private
++
++  def create_blobs_table
++    create_table :active_storage_blobs do |t|
++      t.string   :key,          null: false
++      t.string   :filename,     null: false
++      t.string   :content_type
++      t.text     :metadata
++      t.string   :service_name, null: false
++      t.bigint   :byte_size,    null: false
++      t.string   :checksum
++      t.datetime :created_at, null: false
++
++      t.index [:key], unique: true
++    end
++  end
++
++  def create_attachments_table
++    create_table :active_storage_attachments do |t|
++      t.string     :name,     null: false
++      t.references :record,   null: false, polymorphic: true, index: false
++      t.references :blob,     null: false
++      t.datetime   :created_at, null: false
++
++      t.index %i[record_type record_id name blob_id],
++              name: :index_active_storage_attachments_uniqueness,
++              unique: true
++      t.foreign_key :active_storage_blobs, column: :blob_id
++    end
++  end
++
++  def create_variant_records_table
++    # rubocop:disable Rails/CreateTableWithTimestamps
++    create_table :active_storage_variant_records do |t|
++      t.belongs_to :blob, null: false, index: false
++      t.string     :variation_digest, null: false
++
++      t.index %i[blob_id variation_digest],
++              name: :index_active_storage_variant_records_uniqueness,
++              unique: true
++      t.foreign_key :active_storage_blobs, column: :blob_id
++    end
++    # rubocop:enable Rails/CreateTableWithTimestamps
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 4894dbd..636d0f8 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.0].define(version: 2026_09_15_160000) do
++ActiveRecord::Schema[8.0].define(version: 2026_09_16_120000) do
+   # These are extensions that must be enabled in order to support this database
+   enable_extension "citext"
+   enable_extension "ltree"
+@@ -20,6 +20,34 @@
+   enable_extension "unaccent"
+   enable_extension "vector"
+ 
++  create_table "active_storage_attachments", force: :cascade do |t|
++    t.bigint "blob_id", null: false
++    t.datetime "created_at", null: false
++    t.string "name", null: false
++    t.bigint "record_id", null: false
++    t.string "record_type", null: false
++    t.index ["blob_id"], name: "index_active_storage_attachments_on_blob_id"
++    t.index ["record_type", "record_id", "name", "blob_id"], name: "index_active_storage_attachments_uniqueness", unique: true
++  end
++
++  create_table "active_storage_blobs", force: :cascade do |t|
++    t.bigint "byte_size", null: false
++    t.string "checksum"
++    t.string "content_type"
++    t.datetime "created_at", null: false
++    t.string "filename", null: false
++    t.string "key", null: false
++    t.text "metadata"
++    t.string "service_name", null: false
++    t.index ["key"], name: "index_active_storage_blobs_on_key", unique: true
++  end
++
++  create_table "active_storage_variant_records", force: :cascade do |t|
++    t.bigint "blob_id", null: false
++    t.string "variation_digest", null: false
++    t.index ["blob_id", "variation_digest"], name: "index_active_storage_variant_records_uniqueness", unique: true
++  end
++
+   create_table "agent_sessions", force: :cascade do |t|
+     t.datetime "created_at", null: false
+     t.jsonb "curated_data", default: {}, null: false
+@@ -2199,6 +2227,8 @@
+     t.datetime "updated_at", null: false
+   end
+ 
++  add_foreign_key "active_storage_attachments", "active_storage_blobs", column: "blob_id"
++  add_foreign_key "active_storage_variant_records", "active_storage_blobs", column: "blob_id"
+   add_foreign_key "agent_sessions", "users", on_delete: :cascade
+   add_foreign_key "ahoy_events", "ahoy_visits", column: "visit_id", on_delete: :cascade
+   add_foreign_key "ahoy_events", "users", on_delete: :cascade
+diff --git a/lib/active_storage/service/fog_service.rb b/lib/active_storage/service/fog_service.rb
+new file mode 100644
+index 0000000..dfea708
+--- /dev/null
++++ b/lib/active_storage/service/fog_service.rb
+@@ -0,0 +1,208 @@
++require "active_storage/service"
++require "fog/aws"
++require "active_support/core_ext/numeric/bytes"
++
++module ActiveStorage
++  class Service
++    # Active Storage service backed by fog-aws, matching Forem's S3 credentials
++    # and URL conventions (both public S3 buckets and Forem Cloud /remoteimages).
++    class FogService < Service
++      DEFAULT_S3_REGION = "us-east-1".freeze
++      SUBDOMAIN_BUCKET_REGEX = /\A(?:[a-z]|\d(?!\d{0,2}(?:\.\d{1,3}){3}\z))(?:[a-z0-9.]|(?<!-)-(?!\.)){1,61}[a-z0-9]\z/
++
++      attr_reader :bucket, :credentials, :upload_options
++
++      def initialize(bucket:, credentials: {}, upload: {}, public: false, remote_images_proxy: false, **_options)
++        super()
++        @bucket = bucket
++        @credentials = credentials.deep_symbolize_keys
++        @upload_options = upload.stringify_keys
++        @public = public
++        @remote_images_proxy = remote_images_proxy
++      end
++
++      def connection
++        @connection ||= ::Fog::Storage.new({ provider: "AWS" }.merge(credentials))
++      end
++
++      def upload(key, io, checksum: nil, content_type: nil, disposition: nil, filename: nil, custom_metadata: {}, **)
++        instrument :upload, key: key, checksum: checksum do
++          io.rewind if io.respond_to?(:rewind)
++          body = io.read
++          io.rewind if io.respond_to?(:rewind)
++
++          headers = upload_options.merge(
++            "x-amz-acl" => public? ? "public-read" : "private",
++            **custom_metadata_headers(custom_metadata),
++          )
++          headers["Content-MD5"] = checksum if checksum.present?
++          headers["Content-Type"] = content_type if content_type.present?
++          if disposition && filename
++            headers["Content-Disposition"] = content_disposition_with(type: disposition, filename: filename)
++          end
++
++          connection.put_object(bucket, key, body, headers)
++        rescue Excon::Errors::BadRequest => e
++          raise ActiveStorage::IntegrityError, e.message if e.message.to_s.match?(/BadDigest|Content-MD5/i)
++
++          raise
++        end
++      end
++
++      def download(key, &block)
++        if block
++          instrument :streaming_download, key: key do
++            stream(key, &block)
++          end
++        else
++          instrument :download, key: key do
++            response = connection.get_object(bucket, key)
++            response.body.to_s.dup.force_encoding(Encoding::BINARY)
++          rescue Excon::Errors::NotFound
++            raise ActiveStorage::FileNotFoundError
++          end
++        end
++      end
++
++      def download_chunk(key, range)
++        instrument :download_chunk, key: key, range: range do
++          range_end = range.exclude_end? ? range.end - 1 : range.end
++          response = connection.get_object(bucket, key, "Range" => "bytes=#{range.begin}-#{range_end}")
++          response.body.to_s.dup.force_encoding(Encoding::BINARY)
++        rescue Excon::Errors::NotFound
++          raise ActiveStorage::FileNotFoundError
++        end
++      end
++
++      def delete(key)
++        instrument :delete, key: key do
++          connection.delete_object(bucket, key)
++        rescue Excon::Errors::NotFound
++          nil
++        end
++      end
++
++      def delete_prefixed(prefix)
++        instrument :delete_prefixed, prefix: prefix do
++          directory = connection.directories.new(key: bucket)
++          directory.files.all(prefix: prefix).reverse_each(&:destroy)
++        end
++      end
++
++      def exist?(key)
++        instrument :exist, key: key do |payload|
++          connection.head_object(bucket, key)
++          payload[:exist] = true
++          true
++        rescue Excon::Errors::NotFound
++          payload[:exist] = false
++          false
++        end
++      end
++
++      def url_for_direct_upload(key, expires_in:, content_type:, content_length:, checksum:, custom_metadata: {})
++        instrument :url, key: key do |payload|
++          headers = headers_for_direct_upload(
++            key,
++            content_type: content_type,
++            content_length: content_length,
++            checksum: checksum,
++            custom_metadata: custom_metadata,
++          )
++          expires_at = Time.now.utc + expires_in.to_i
++          generated_url = connection.put_object_url(bucket, key, expires_at, headers)
++          payload[:url] = generated_url
++          generated_url
++        end
++      end
++
++      def headers_for_direct_upload(
++        _key, content_type:, checksum:, filename: nil, disposition: nil, custom_metadata: {}, **
++      )
++        content_disposition = content_disposition_with(type: disposition, filename: filename) if filename
++        {
++          "Content-Type" => content_type,
++          "Content-MD5" => checksum,
++          "Content-Disposition" => content_disposition,
++          **custom_metadata_headers(custom_metadata)
++        }.compact
++      end
++
++      def compose(source_keys, destination_key, filename: nil, content_type: nil, disposition: nil, custom_metadata: {})
++        buffer = StringIO.new
++        buffer.binmode
++        source_keys.each do |source_key|
++          stream(source_key) { |chunk| buffer.write(chunk) }
++        end
++        buffer.rewind
++        upload(
++          destination_key,
++          buffer,
++          filename: filename,
++          content_type: content_type,
++          disposition: disposition,
++          custom_metadata: custom_metadata,
++        )
++      end
++
++      def permanent_url(key)
++        if remote_images_proxy?
++          "https://#{Settings::General.app_domain}/remoteimages/#{encode_key(key)}"
++        elsif public?
++          s3_public_url(key)
++        end
++      end
++
++      def remote_images_proxy?
++        @remote_images_proxy == true
++      end
++
++      private
++
++      def private_url(key, expires_in:, filename:, disposition:, content_type:, **)
++        return permanent_url(key) if remote_images_proxy?
++
++        expires_at = Time.now.utc + expires_in.to_i
++        query = {
++          "response-content-disposition" => content_disposition_with(type: disposition, filename: filename),
++          "response-content-type" => content_type
++        }.compact
++        connection.get_object_https_url(bucket, key, expires_at, query: query)
++      end
++
++      def public_url(key, **)
++        s3_public_url(key)
++      end
++
++      def s3_public_url(key)
++        encoded_key = encode_key(key)
++        return "#{credentials[:endpoint]}/#{bucket}/#{encoded_key}" if credentials[:endpoint].present?
++
++        region = credentials[:region].to_s
++        regional_host = [DEFAULT_S3_REGION, ""].include?(region) ? "s3.amazonaws.com" : "s3.#{region}.amazonaws.com"
++
++        if bucket.to_s.match?(SUBDOMAIN_BUCKET_REGEX) && bucket.to_s.exclude?(".")
++          "https://#{bucket}.#{regional_host}/#{encoded_key}"
++        else
++          "https://#{regional_host}/#{bucket}/#{encoded_key}"
++        end
++      end
++
++      def encode_key(key)
++        key.to_s.split("/").map { |segment| ERB::Util.url_encode(segment) }.join("/")
++      end
++
++      def stream(key)
++        connection.get_object(bucket, key) do |chunk, _remaining_bytes, _total_bytes|
++          yield chunk.dup.force_encoding(Encoding::BINARY)
++        end
++      rescue Excon::Errors::NotFound
++        raise ActiveStorage::FileNotFoundError
++      end
++
++      def custom_metadata_headers(metadata)
++        metadata.to_h.transform_keys { |k| "x-amz-meta-#{k}" }
++      end
++    end
++  end
++end
+diff --git a/spec/initializers/active_storage_initializer_spec.rb b/spec/initializers/active_storage_initializer_spec.rb
+new file mode 100644
+index 0000000..c876503
+--- /dev/null
++++ b/spec/initializers/active_storage_initializer_spec.rb
+@@ -0,0 +1,64 @@
++require "rails_helper"
++
++RSpec.describe ActiveStorageInitializer do
++  after do
++    described_class.initialize!
++  end
++
++  describe ".service_name" do
++    context "when in production environment" do
++      before do
++        allow(Rails).to receive(:env).and_return(ActiveSupport::StringInquirer.new("production"))
++      end
++
++      it "returns :forem_cloud when FOREM_CONTEXT is forem_cloud" do
++        allow(ENV).to receive(:[]).and_call_original
++        allow(ENV).to receive(:[]).with("FILE_STORAGE_LOCATION").and_return(nil)
++        allow(ENV).to receive(:[]).with("FOREM_CONTEXT").and_return("forem_cloud")
++
++        expect(described_class.service_name).to eq(:forem_cloud)
++      end
++
++      it "returns :amazon when AWS_ID is present" do
++        allow(ENV).to receive(:[]).and_call_original
++        allow(ENV).to receive(:[]).with("FILE_STORAGE_LOCATION").and_return(nil)
++        allow(ENV).to receive(:[]).with("FOREM_CONTEXT").and_return(nil)
++        allow(ApplicationConfig).to receive(:[]).and_call_original
++        allow(ApplicationConfig).to receive(:[]).with("AWS_ID").and_return("aws-id")
++
++        expect(described_class.service_name).to eq(:amazon)
++      end
++
++      it "returns :local when FILE_STORAGE_LOCATION is file" do
++        allow(ENV).to receive(:[]).and_call_original
++        allow(ENV).to receive(:[]).with("FILE_STORAGE_LOCATION").and_return("file")
++
++        expect(described_class.service_name).to eq(:local)
++      end
++
++      it "returns :local when AWS_ID is blank" do
++        allow(ENV).to receive(:[]).and_call_original
++        allow(ENV).to receive(:[]).with("FILE_STORAGE_LOCATION").and_return(nil)
++        allow(ENV).to receive(:[]).with("FOREM_CONTEXT").and_return(nil)
++        allow(ApplicationConfig).to receive(:[]).and_call_original
++        allow(ApplicationConfig).to receive(:[]).with("AWS_ID").and_return(nil)
++
++        expect(described_class.service_name).to eq(:local)
++      end
++    end
++
++    context "when in test environment" do
++      it "returns :test" do
++        expect(described_class.service_name).to eq(:test)
++      end
++    end
++
++    context "when in development environment" do
++      it "returns :local" do
++        allow(Rails).to receive(:env).and_return(ActiveSupport::StringInquirer.new("development"))
++
++        expect(described_class.service_name).to eq(:local)
++      end
++    end
++  end
++end
+diff --git a/spec/initializers/framework_defaults_spec.rb b/spec/initializers/framework_defaults_spec.rb
+index ac203e1..9a76d6d 100644
+--- a/spec/initializers/framework_defaults_spec.rb
++++ b/spec/initializers/framework_defaults_spec.rb
+@@ -147,8 +147,8 @@
+     it "handles remaining Rails 7.2 configurations (preserving Rails 7.1 defaults where appropriate)" do
+       config = Rails.application.config
+ 
+-      # Active Storage isn't loaded in Forem, so config.active_storage remains undefined
+-      expect(config.respond_to?(:active_storage)).to be(false)
++      expect(config.respond_to?(:active_storage)).to be(true)
++      expect(config.active_storage.variant_processor).to eq(:mini_magick)
+       expect(config.respond_to?(:yjit)).to be(true)
+       expect(config.yjit).to be(true)
+     end
+diff --git a/spec/lib/active_storage/service/fog_service_spec.rb b/spec/lib/active_storage/service/fog_service_spec.rb
+new file mode 100644
+index 0000000..e61d84e
+--- /dev/null
++++ b/spec/lib/active_storage/service/fog_service_spec.rb
+@@ -0,0 +1,89 @@
++require "rails_helper"
++require "active_storage/service/fog_service"
++
++RSpec.describe ActiveStorage::Service::FogService do
++  let(:bucket_name) { "forem-test-uploads" }
++  let(:credentials) do
++    {
++      provider: "AWS",
++      aws_access_key_id: "mock-access-key",
++      aws_secret_access_key: "mock-secret-key",
++      region: "us-east-1"
++    }
++  end
++  let(:service) do
++    described_class.new(
++      bucket: bucket_name,
++      credentials: credentials,
++      public: true,
++      upload: { "Cache-Control" => "public, max-age=31536000" },
++    )
++  end
++
++  around do |example|
++    Fog.mock!
++    Fog::Mock.reset
++    service.connection.directories.create(key: bucket_name, public: true)
++    example.run
++  ensure
++    Fog.unmock!
++  end
++
++  it "uploads, checks existence, downloads, streams, chunks, and deletes objects", :aggregate_failures do
++    payload = "hello active storage fog world".b
++    checksum = OpenSSL::Digest::MD5.base64digest(payload)
++    key = "avatars/test-key.png"
++
++    expect(service.exist?(key)).to be(false)
++
++    service.upload(key, StringIO.new(payload), checksum: checksum, content_type: "image/png")
++
++    expect(service.exist?(key)).to be(true)
++    expect(service.download(key)).to eq(payload)
++    expect(service.download_chunk(key, 0...5)).to eq("hello")
++    expect(service.download_chunk(key, 6..11)).to eq("active")
++
++    streamed = +"".b
++    service.download(key) { |chunk| streamed << chunk }
++    expect(streamed).to eq(payload)
++
++    service.delete(key)
++    expect(service.exist?(key)).to be(false)
++    expect { service.download(key) }.to raise_error(ActiveStorage::FileNotFoundError)
++  end
++
++  it "deletes prefixed keys and composes multiple objects", :aggregate_failures do
++    service.upload("parts/1", StringIO.new("part-one-"))
++    service.upload("parts/2", StringIO.new("part-two"))
++    service.compose(%w[parts/1 parts/2], "parts/combined", content_type: "text/plain")
++
++    expect(service.download("parts/combined")).to eq("part-one-part-two")
++
++    service.delete_prefixed("parts/")
++    expect(service.exist?("parts/combined")).to be(false)
++  end
++
++  it "generates permanent public S3 URLs matching Forem optimizer expectations", :aggregate_failures do
++    expect(service.permanent_url("abc123")).to eq("https://#{bucket_name}.s3.amazonaws.com/abc123")
++
++    eu_service = described_class.new(
++      bucket: bucket_name,
++      credentials: credentials.merge(region: "eu-west-1"),
++      public: true,
++    )
++    expect(eu_service.permanent_url("abc123")).to eq("https://#{bucket_name}.s3.eu-west-1.amazonaws.com/abc123")
++  end
++
++  it "generates Forem Cloud /remoteimages permanent URLs using Settings::General.app_domain", :aggregate_failures do
++    allow(Settings::General).to receive(:app_domain).and_return("community.forem.cloud")
++
++    cloud_service = described_class.new(
++      bucket: bucket_name,
++      credentials: credentials,
++      public: false,
++      remote_images_proxy: true,
++    )
++
++    expect(cloud_service.permanent_url("blobkey123")).to eq("https://community.forem.cloud/remoteimages/blobkey123")
++  end
++end
+diff --git a/spec/models/concerns/profile_image_attachable_spec.rb b/spec/models/concerns/profile_image_attachable_spec.rb
+new file mode 100644
+index 0000000..b9753ed
+--- /dev/null
++++ b/spec/models/concerns/profile_image_attachable_spec.rb
+@@ -0,0 +1,260 @@
++require "rails_helper"
++require "exifr/jpeg"
++
++RSpec.describe ProfileImageAttachable do
++  let(:jpg_fixture) { Rails.root.join("spec/fixtures/files/800x600.jpg") }
++  let(:png_fixture) { Rails.root.join("spec/fixtures/files/800x600.png") }
++  let(:webp_fixture) { Rails.root.join("spec/fixtures/files/800x600.webp") }
++  let(:pdf_fixture) { Rails.root.join("spec/fixtures/files/800x600.pdf") }
++  let(:gps_fixture) { Rails.root.join("spec/fixtures/files/image_gps_data.jpg") }
++  let(:high_frame_gif) { Rails.root.join("spec/fixtures/files/high_frame_count.gif") }
++  let(:bomb_image) { Rails.root.join("spec/support/fixtures/images/bad-image.jpg") }
++
++  def build_legacy_carrierwave_user(filename: "legacy-avatar.jpg")
++    user = create(:user, profile_image: nil)
++    user.update_columns(profile_image: filename)
++    user.reload
++  end
++
++  def build_legacy_carrierwave_organization(filename: "legacy-org.png")
++    org = create(:organization)
++    org.profile_image.purge
++    org.update_columns(profile_image: filename)
++    org.reload
++  end
++
++  describe "new profile pictures go to Active Storage" do
++    it "stores new User profile images in Active Storage without writing to CarrierWave", :aggregate_failures do
++      uploaded = Rack::Test::UploadedFile.new(png_fixture, "image/png")
++      user = create(:user, profile_image: uploaded)
++
++      expect(user.profile_image).to be_attached
++      expect(user.read_attribute(:profile_image)).to be_nil
++      expect(user.profile_image_url).to start_with("/rails/active_storage/blobs/proxy/")
++      expect(user.profile_image.download).to eq(File.binread(png_fixture))
++      expect(user.profile_image.filename.to_s).to match(/\A[0-9a-f-]{36}\.png\z/)
++    end
++
++    it "stores new Organization profile images in Active Storage without writing to CarrierWave", :aggregate_failures do
++      uploaded = Rack::Test::UploadedFile.new(webp_fixture, "image/webp")
++      org = create(:organization, profile_image: uploaded)
++
++      expect(org.profile_image).to be_attached
++      expect(org.read_attribute(:profile_image)).to be_nil
++      expect(org.profile_image_url).to start_with("/rails/active_storage/blobs/proxy/")
++      expect(org.profile_image.download).to eq(File.binread(webp_fixture))
++      expect(org.profile_image.filename.to_s).to match(/\A[0-9a-f-]{36}\.webp\z/)
++    end
++
++    it "accepts signed Active Storage blob IDs", :aggregate_failures do
++      blob = ActiveStorage::Blob.create_and_upload!(
++        io: png_fixture.open,
++        filename: "direct.png",
++        content_type: "image/png",
++      )
++      user = create(:user, profile_image: nil)
++      user.update!(profile_image: blob.signed_id)
++
++      expect(user.reload.profile_image).to be_attached
++      expect(user.profile_image.blob).to eq(blob)
++    end
++  end
++
++  describe "existing CarrierWave profile pictures continue to work untouched" do
++    it "serves existing CarrierWave User profile pictures without migrating them", :aggregate_failures do
++      user = build_legacy_carrierwave_user(filename: "existing-user-pic.jpg")
++      expected_path = "/uploads/user/profile_image/#{user.id}/existing-user-pic.jpg"
++
++      expect(user.profile_image).not_to be_attached
++      expect(user.profile_image).to be_present
++      expect(user.profile_image).not_to be_blank
++      expect(user.profile_image_url).to eq(expected_path)
++      expect(user.profile_image.url).to eq(expected_path)
++      expect(user.profile_image.to_s).to eq(expected_path)
++      expect(user.as_json["profile_image"]).to eq("url" => expected_path)
++
++      user.update!(name: "Updated Legacy User")
++      expect(user.reload.profile_image).not_to be_attached
++      expect(user.read_attribute(:profile_image)).to eq("existing-user-pic.jpg")
++      expect(user.profile_image_url).to eq(expected_path)
++    end
++
++    it "serves existing CarrierWave Organization images and passes validation", :aggregate_failures do
++      org = build_legacy_carrierwave_organization(filename: "existing-org-pic.png")
++      expected_path = "/uploads/organization/profile_image/#{org.id}/existing-org-pic.png"
++
++      expect(org.profile_image).not_to be_attached
++      expect(org.profile_image).to be_present
++      expect(org).to be_valid
++      expect(org.profile_image_url).to eq(expected_path)
++      expect(org.as_json["profile_image"]).to eq("url" => expected_path)
++
++      org.update!(summary: "Updated summary without touching profile image")
++      expect(org.reload.profile_image).not_to be_attached
++      expect(org.read_attribute(:profile_image)).to eq("existing-org-pic.png")
++      expect(org.profile_image_url).to eq(expected_path)
++    end
++
++    it "prefers Active Storage when a legacy CarrierWave User uploads a new image", :aggregate_failures do
++      user = build_legacy_carrierwave_user(filename: "old-carrierwave.jpg")
++      old_url = user.profile_image_url
++
++      sidekiq_assert_enqueued_with(job: Users::BustProfileImageCacheWorker, args: [user.id]) do
++        user.update!(profile_image: Rack::Test::UploadedFile.new(png_fixture, "image/png"))
++      end
++
++      user.reload
++      expect(user.profile_image).to be_attached
++      expect(user.profile_image_url).not_to eq(old_url)
++      expect(user.profile_image_url).to start_with("/rails/active_storage/blobs/proxy/")
++    end
++
++    it "updates cached_organization when a legacy Organization uploads a new image", :aggregate_failures do
++      org = build_legacy_carrierwave_organization(filename: "old-org.png")
++      article = create(:article, organization: org)
++      expected_legacy = "/uploads/organization/profile_image/#{org.id}/old-org.png"
++      expect(article.cached_organization.profile_image_url).to eq(expected_legacy)
++
++      sidekiq_perform_enqueued_jobs do
++        org.update!(profile_image: Rack::Test::UploadedFile.new(jpg_fixture, "image/jpeg"))
++      end
++
++      expect(org.reload.profile_image).to be_attached
++      expect(article.reload.cached_organization.profile_image_url).to eq(org.profile_image_url)
++    end
++  end
++
++  describe "other uploads stay on CarrierWave" do
++    it "keeps Tag, Podcast, Organization#cover_image, and Badge on CarrierWave", :aggregate_failures do
++      tag = create(:tag, profile_image: Rack::Test::UploadedFile.new(png_fixture, "image/png"))
++      org = create(:organization, cover_image: Rack::Test::UploadedFile.new(jpg_fixture, "image/jpeg"))
++
++      expect(tag.profile_image).to be_a(ProfileImageUploader)
++      expect(org.cover_image).to be_a(CoverImageUploader)
++      expect(org.profile_image).to be_a(ProfileImageAttachable::AttachedOne)
++    end
++  end
++
++  describe "remote_profile_image_url=" do
++    it "downloads remote images (including extensionless avatar URLs) into Active Storage", :aggregate_failures do
++      avatar_url = "https://avatars.example.com/u/98765?v=4"
++      png_bytes = File.binread(png_fixture)
++      stub_request(:get, avatar_url).to_return(
++        status: 200,
++        body: png_bytes,
++        headers: { "Content-Type" => "image/png" },
++      )
++
++      user = create(:user, profile_image: nil)
++      user.remote_profile_image_url = avatar_url
++      user.save!
++
++      expect(user.remote_profile_image_url).to eq(avatar_url)
++      expect(user.reload.profile_image).to be_attached
++      expect(user.read_attribute(:profile_image)).to be_nil
++      expect(user.profile_image.download).to eq(png_bytes)
++      expect(user.profile_image.filename.to_s).to end_with(".png")
++    end
++
++    it "follows HTTP redirects when downloading remote profile images" do
++      initial_url = "https://avatars.example.com/initial"
++      final_url = "https://cdn.example.com/avatar.jpg"
++      jpg_bytes = File.binread(jpg_fixture)
++      stub_request(:get, initial_url).to_return(status: 302, headers: { "Location" => final_url })
++      stub_request(:get, final_url).to_return(
++        status: 200,
++        body: jpg_bytes,
++        headers: { "Content-Type" => "image/jpeg" },
++      )
++
++      user = create(:user, profile_image: nil)
++      user.update!(remote_profile_image_url: initial_url)
++
++      expect(user.reload.profile_image).to be_attached
++      expect(user.profile_image.download).to eq(jpg_bytes)
++    end
++
++    it "adds a validation error when remote download fails with HTTP 404", :aggregate_failures do
++      failing_url = "https://avatars.example.com/missing.png"
++      stub_request(:get, failing_url).to_return(status: 404, body: "Not Found")
++
++      user = build(:user, profile_image: nil)
++      user.remote_profile_image_url = failing_url
++
++      expect(user).not_to be_valid
++      expect(user.errors[:profile_image]).to include(I18n.t("errors.messages.carrierwave_download_error"))
++    end
++
++    it "blocks SSRF requests to private/metadata IPs in production", :aggregate_failures do
++      allow(Rails).to receive(:env).and_return(ActiveSupport::StringInquirer.new("production"))
++
++      user = build(:user, profile_image: nil)
++      user.remote_profile_image_url = "http://169.254.169.254/latest/meta-data/"
++
++      expect(user).not_to be_valid
++      expect(user.errors[:profile_image]).to include(I18n.t("errors.messages.carrierwave_download_error"))
++    end
++  end
++
++  describe "validations and image processing" do
++    it "rejects disallowed extensions like PDF", :aggregate_failures do
++      user = build(:user, profile_image: Rack::Test::UploadedFile.new(pdf_fixture, "application/pdf"))
++
++      expect(user).not_to be_valid
++      expect(user.errors[:profile_image].join).to include("allowed types")
++    end
++
++    it "rejects images exceeding 4096x4096 pixel dimensions", :aggregate_failures do
++      user = build(:user, profile_image: Rack::Test::UploadedFile.new(bomb_image, "image/jpeg"))
++
++      expect(user).not_to be_valid
++      expect(user.errors[:profile_image].join).to include("4096x4096")
++    end
++
++    context "when image processing is enabled" do
++      around do |example|
++        previous = described_class.enable_processing
++        described_class.enable_processing = true
++        example.run
++      ensure
++        described_class.enable_processing = previous
++      end
++
++      it "strips EXIF and GPS metadata before storing in Active Storage", :aggregate_failures do
++        expect(EXIFR::JPEG.new(gps_fixture.to_s).exif?).to be(true)
++        expect(EXIFR::JPEG.new(gps_fixture.to_s).gps).to be_present
++
++        user = create(:user, profile_image: Rack::Test::UploadedFile.new(gps_fixture, "image/jpeg"))
++        stored_io = StringIO.new(user.profile_image.download)
++
++        expect(EXIFR::JPEG.new(stored_io).exif?).to be(false)
++        stored_io.rewind
++        expect(EXIFR::JPEG.new(stored_io).gps).to be_nil
++      end
++
++      it "rejects GIFs exceeding maximum frame count", :aggregate_failures do
++        stub_const("BaseUploader::FRAME_MAX", 20)
++        user = build(:user, profile_image: Rack::Test::UploadedFile.new(high_frame_gif, "image/gif"))
++
++        expect(user).not_to be_valid
++        expect(user.errors[:profile_image].join).to include("too many frames")
++      end
++    end
++  end
++
++  describe "banishing a user with an Active Storage profile image" do
++    it "purges the Active Storage attachment and sets default banished avatar", :aggregate_failures do
++      admin = create(:user, :super_admin)
++      spam_user = create(:user, profile_image: Rack::Test::UploadedFile.new(png_fixture, "image/png"))
++      expect(spam_user.profile_image).to be_attached
++
++      sidekiq_perform_enqueued_jobs do
++        Moderator::BanishUser.call(admin: admin, user: spam_user)
++      end
++
++      spam_user.reload
++      expect(spam_user.profile_image).not_to be_attached
++      expect(spam_user.profile_image_url).to eq(Moderator::BanishUser::DEFAULT_PROFILE_IMAGE)
++    end
++  end
++end
+diff --git a/spec/requests/profile_images_active_storage_spec.rb b/spec/requests/profile_images_active_storage_spec.rb
+new file mode 100644
+index 0000000..e6b5c54
+--- /dev/null
++++ b/spec/requests/profile_images_active_storage_spec.rb
+@@ -0,0 +1,82 @@
++require "rails_helper"
++
++RSpec.describe "ProfileImagesActiveStorage" do
++  let(:png_path) { Rails.root.join("spec/fixtures/files/800x600.png") }
++  let(:jpg_path) { Rails.root.join("spec/fixtures/files/800x600.jpg") }
++
++  describe "serving Active Storage profile image URLs over HTTP" do
++    it "serves 200 OK from the proxy route without hitting catch-all pages#show", :aggregate_failures do
++      user = create(:user, profile_image: Rack::Test::UploadedFile.new(png_path, "image/png"))
++
++      get user.profile_image_url
++
++      expect(response).to have_http_status(:ok)
++      expect(response.media_type).to eq("image/png")
++      expect(response.body.b).to eq(File.binread(png_path))
++    end
++
++    it "serves Active Storage redirect route cleanly", :aggregate_failures do
++      org = create(:organization, profile_image: Rack::Test::UploadedFile.new(jpg_path, "image/jpeg"))
++      redirect_path = Rails.application.routes.url_helpers.rails_service_blob_path(
++        org.profile_image.blob.signed_id,
++        org.profile_image.blob.filename,
++      )
++
++      get redirect_path
++      expect(response).to have_http_status(:found)
++
++      follow_redirect!
++      expect(response).to have_http_status(:ok)
++      expect(response.body.b).to eq(File.binread(jpg_path))
++    end
++  end
++
++  describe "updating user profile pictures through controllers" do
++    it "uploads to Active Storage via PATCH /profiles", :aggregate_failures do
++      user = create(:user, profile_image: nil)
++      user.update_columns(profile_image: "legacy-before-update.jpg")
++      sign_in user
++
++      patch profile_path(user.profile.id), params: {
++        user: { profile_image: Rack::Test::UploadedFile.new(png_path, "image/png") }
++      }
++
++      expect(response).to redirect_to(user_settings_path)
++      expect(user.reload.profile_image).to be_attached
++      expect(user.profile_image.download).to eq(File.binread(png_path))
++    end
++
++    it "returns user.profile_image.url in JSON response for PUT /users/:id (onboarding upload)", :aggregate_failures do
++      user = create(:user, profile_image: nil)
++      sign_in user
++
++      put "/users/#{user.id}",
++          params: { user: { profile_image: Rack::Test::UploadedFile.new(png_path, "image/png") } },
++          headers: { "Accept" => "application/json" }
++
++      expect(response).to have_http_status(:ok)
++      expect(user.reload.profile_image).to be_attached
++      expect(response.parsed_body.dig("user", "profile_image", "url")).to eq(user.profile_image_url)
++    end
++  end
++
++  describe "API profile_images endpoint with both CarrierWave and Active Storage records" do
++    it "returns working URLs for legacy CarrierWave users and organizations", :aggregate_failures do
++      legacy_user = create(:user, profile_image: nil)
++      legacy_user.update_columns(profile_image: "legacy-u.jpg")
++
++      legacy_org = create(:organization)
++      legacy_org.profile_image.purge
++      legacy_org.update_columns(profile_image: "legacy-o.png")
++
++      get api_profile_image_path(legacy_user.username)
++      expect(response).to have_http_status(:ok)
++      expect(response.parsed_body["profile_image"]).to eq("/uploads/user/profile_image/#{legacy_user.id}/legacy-u.jpg")
++
++      get api_profile_image_path(legacy_org.slug)
++      expect(response).to have_http_status(:ok)
++      expected_org_path = "/uploads/organization/profile_image/#{legacy_org.id}/legacy-o.png"
++      expect(response.parsed_body["profile_image"]).to eq(expected_org_path)
++    end
++  end
++end
+diff --git a/spec/requests/registrations_spec.rb b/spec/requests/registrations_spec.rb
+index c0ef356..e7e97a1 100644
+--- a/spec/requests/registrations_spec.rb
++++ b/spec/requests/registrations_spec.rb
+@@ -140,7 +140,8 @@
+             profile_image: Rack::Test::UploadedFile.new(image_path, "image/jpeg")
+           }
+         }
+-        expect(File.read(User.last.profile_image.file.file)).to eq(File.read(image_path))
++        expect(User.last.profile_image).to be_attached
++        expect(User.last.profile_image.download).to eq(File.binread(image_path))
+       end
+ 
+       it "creates a user with a random profile image if none was uploaded" do
+diff --git a/spec/uploaders/profile_image_uploader_spec.rb b/spec/uploaders/profile_image_uploader_spec.rb
+index aead40f..b1994ce 100644
+--- a/spec/uploaders/profile_image_uploader_spec.rb
++++ b/spec/uploaders/profile_image_uploader_spec.rb
+@@ -12,11 +12,11 @@
+   let(:image_pdf) { fixture_file_upload("800x600.pdf", "application/pdf") }
+   let(:image_with_gps) { fixture_file_upload("image_gps_data.jpg", "image/jpeg") }
+ 
+-  let(:user) { create(:user) }
++  let(:tag) { create(:tag) }
+ 
+   # we need a new uploader before each test, and since the uploader is not a model
+   # we can recreate it quickly in memory with `let!`
+-  let!(:uploader) { described_class.new(user, mounted_as) }
++  let!(:uploader) { described_class.new(tag, mounted_as) }
+ 
+   before do
+     described_class.include CarrierWave::MiniMagick # needed for processing
+@@ -29,7 +29,7 @@
+   end
+ 
+   it "stores files in the correct directory" do
+-    expect(uploader.store_dir).to eq("uploads/user/profile_image/#{user.id}")
++    expect(uploader.store_dir).to eq("uploads/tag/profile_image/#{tag.id}")
+   end
+ 
+   describe "filename" do
+@@ -39,7 +39,7 @@
+ 
+     it "contains a secure token" do
+       uploader.store!(image_jpg)
+-      token = user.instance_variable_get(:"@#{mounted_as}_secure_token")
++      token = tag.instance_variable_get(:"@#{mounted_as}_secure_token")
+       expect(uploader.filename).to include(token)
+     end
+ 
+@@ -78,10 +78,10 @@
+     it "removes EXIF and GPS data on upload" do
+       expect(EXIFR::JPEG.new(image_with_gps.path).exif?).to be(true)
+       expect(EXIFR::JPEG.new(image_with_gps.path).gps.present?).to be(true)
+-      user.profile_image = image_with_gps
+-      user.save!
+-      expect(EXIFR::JPEG.new(user.profile_image.path).exif?).to be(false)
+-      expect(EXIFR::JPEG.new(user.profile_image.path).gps.present?).to be(false)
++      tag.profile_image = image_with_gps
++      tag.save!
++      expect(EXIFR::JPEG.new(tag.profile_image.path).exif?).to be(false)
++      expect(EXIFR::JPEG.new(tag.profile_image.path).gps.present?).to be(false)
+     end
+   end
+ end
+diff --git a/storage/.keep b/storage/.keep
+new file mode 100644
+index 0000000..e69de29

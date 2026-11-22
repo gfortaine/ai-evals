@@ -1,0 +1,1353 @@
+diff --git a/app/jobs/storage/materialize_job.rb b/app/jobs/storage/materialize_job.rb
+new file mode 100644
+index 0000000..8134c5b
+--- /dev/null
++++ b/app/jobs/storage/materialize_job.rb
+@@ -0,0 +1,9 @@
++class Storage::MaterializeJob < ApplicationJob
++  limits_concurrency to: 1, key: ->(owner) { owner }
++
++  discard_on ActiveJob::DeserializationError
++
++  def perform(owner)
++    owner.materialize_storage
++  end
++end
+diff --git a/app/models/account.rb b/app/models/account.rb
+index 18d4f42..90e1690 100644
+--- a/app/models/account.rb
++++ b/app/models/account.rb
+@@ -1,5 +1,5 @@
+ class Account < ApplicationRecord
+-  include Cancellable, Entropic, Incineratable, MultiTenantable, Searchable, Seedeable
++  include Cancellable, Entropic, Incineratable, MultiTenantable, Searchable, Seedeable, Storage::Account
+ 
+   has_one :join_code, dependent: :destroy
+   has_many :users, dependent: :destroy
+diff --git a/app/models/account/import.rb b/app/models/account/import.rb
+index feb41c4..0a1c2cf 100644
+--- a/app/models/account/import.rb
++++ b/app/models/account/import.rb
+@@ -49,6 +49,7 @@ class Account::Import < ApplicationRecord
+ 
+     add_importer_to_all_access_boards
+     reconcile_cards_count
++    account.reconcile_storage
+ 
+     mark_completed
+   rescue Account::DataTransfer::RecordSet::ConflictError => e
+@@ -89,5 +90,4 @@ class Account::Import < ApplicationRecord
+         board.accesses.grant_to(importer)
+       end
+     end
+-
+ end
+diff --git a/app/models/board.rb b/app/models/board.rb
+index 9f1bcd5..94e8174 100644
+--- a/app/models/board.rb
++++ b/app/models/board.rb
+@@ -1,5 +1,5 @@
+ class Board < ApplicationRecord
+-  include Accessible, AutoPostponing, Broadcastable, Cards, Entropic, Filterable, Publishable, Triageable
++  include Accessible, AutoPostponing, Broadcastable, Cards, Entropic, Filterable, Publishable, Storage::Board, Triageable
+ 
+   belongs_to :creator, class_name: "User", default: -> { Current.user }
+   belongs_to :account, default: -> { creator.account }
+diff --git a/app/models/card.rb b/app/models/card.rb
+index 19c3fc2..87871eb 100644
+--- a/app/models/card.rb
++++ b/app/models/card.rb
+@@ -1,7 +1,7 @@
+ class Card < ApplicationRecord
+   include Accessible, Assignable, Attachments, Broadcastable, Closeable, Colored, Commentable,
+     Entropic, Eventable, Exportable, Golden, Mentions, Multistep, Pinnable, Postponable, Promptable,
+-    Readable, Searchable, Stallable, Statuses, Taggable, Triageable, Watchable
++    Readable, Searchable, Stallable, Statuses, Storage::Card, Taggable, Triageable, Watchable
+ 
+   belongs_to :account, default: -> { board.account }
+   belongs_to :board
+diff --git a/app/models/storage.rb b/app/models/storage.rb
+new file mode 100644
+index 0000000..1fa68e5
+--- /dev/null
++++ b/app/models/storage.rb
+@@ -0,0 +1,124 @@
++module Storage
++  class << self
++    def table_name_prefix
++      "storage_"
++    end
++
++    def suppressing_entries_for_account(account_id)
++      suppressed_account_ids.add(account_id)
++      yield
++    ensure
++      suppressed_account_ids.delete(account_id)
++    end
++
++    def suppressing_entries_for_board(board_id)
++      suppressed_board_ids.add(board_id)
++      yield
++    ensure
++      suppressed_board_ids.delete(board_id)
++    end
++
++    def suppressed?(account_id:, board_id: nil)
++      suppressed_account_ids.include?(account_id) || (board_id.present? && suppressed_board_ids.include?(board_id))
++    end
++
++    def enqueue_materialization_for_board(account_id:, board_id:)
++      return if suppressed?(account_id: account_id, board_id: board_id)
++
++      enqueue_once_after_commit([ "Board", board_id ]) do
++        unless suppressed?(account_id: account_id, board_id: board_id)
++          ::Board.find_by(id: board_id)&.materialize_storage_later
++        end
++      end
++    end
++
++    def enqueue_materialization_for_account(account_id)
++      return if suppressed?(account_id: account_id)
++
++      enqueue_once_after_commit([ "Account", account_id ]) do
++        unless suppressed?(account_id: account_id)
++          ::Account.find_by(id: account_id)&.materialize_storage_later
++        end
++      end
++    end
++
++    def record_attachment_delta(attachment, multiplier)
++      return if attachment.account_id.present? && suppressed?(account_id: attachment.account_id)
++
++      if location = resolve_counted_attachment_location(attachment)
++        return if suppressed?(account_id: location[:account_id], board_id: location[:board_id])
++
++        bytes = attachment.blob&.byte_size
++        if bytes && bytes > 0
++          Storage::Entry.record(
++            account_id: location[:account_id],
++            board_id: location[:board_id],
++            delta: bytes * multiplier
++          )
++        end
++      end
++    end
++
++    private
++      def suppressed_account_ids
++        ActiveSupport::IsolatedExecutionState[:storage_suppressed_account_ids] ||= Set.new
++      end
++
++      def suppressed_board_ids
++        ActiveSupport::IsolatedExecutionState[:storage_suppressed_board_ids] ||= Set.new
++      end
++
++      def pending_materializations_by_transaction
++        ActiveSupport::IsolatedExecutionState[:storage_pending_materializations] ||= ObjectSpace::WeakKeyMap.new
++      end
++
++      def enqueue_once_after_commit(key, &block)
++        transaction = ApplicationRecord.connection.current_transaction
++
++        if transaction.open? && transaction.joinable?
++          pending_keys = (pending_materializations_by_transaction[transaction] ||= Set.new)
++          if pending_keys.add?(key)
++            transaction.after_commit(&block)
++          end
++        else
++          yield
++        end
++      end
++
++      def resolve_counted_attachment_location(attachment)
++        case [ attachment.record_type, attachment.name ]
++        when [ "Card", "image" ]
++          resolve_card_location(attachment.record || ::Card.find_by(id: attachment.record_id))
++        when [ "ActionText::RichText", "embeds" ]
++          resolve_rich_text_location(attachment.record || ::ActionText::RichText.find_by(id: attachment.record_id))
++        end
++      end
++
++      def resolve_rich_text_location(rich_text)
++        return unless rich_text
++
++        case [ rich_text.record_type, rich_text.name ]
++        when [ "Board", "public_description" ]
++          resolve_board_location(rich_text.record || ::Board.find_by(id: rich_text.record_id))
++        when [ "Card", "description" ]
++          resolve_card_location(rich_text.record || ::Card.find_by(id: rich_text.record_id))
++        when [ "Comment", "body" ]
++          comment = rich_text.record || ::Comment.find_by(id: rich_text.record_id)
++          resolve_card_location(comment.card || ::Card.find_by(id: comment.card_id)) if comment
++        end
++      end
++
++      def resolve_board_location(board)
++        if board
++          { account_id: board.account_id, board_id: board.id }
++        end
++      end
++
++      def resolve_card_location(card)
++        if card && !suppressed?(account_id: card.account_id, board_id: card.board_id)
++          board_id = ::Card.where(id: card.id).lock.pick(:board_id) || card.board_id
++          { account_id: card.account_id, board_id: board_id }
++        end
++      end
++  end
++end
+diff --git a/app/models/storage/account.rb b/app/models/storage/account.rb
+new file mode 100644
+index 0000000..bdd3a4e
+--- /dev/null
++++ b/app/models/storage/account.rb
+@@ -0,0 +1,110 @@
++module Storage::Account
++  extend ActiveSupport::Concern
++
++  included do
++    include Storage::Totaled
++
++    around_destroy :cleanup_storage
++  end
++
++  def materialize_storage
++    pending_board_ids = Storage::Entry.where(account_id: id).distinct.pluck(:board_id)
++    if pending_board_ids.any?
++      boards.where(id: pending_board_ids).find_each(&:materialize_storage)
++      Storage::Entry.where(account_id: id).where.not(board_id: boards.select(:id)).delete_all
++    end
++
++    refresh_storage_total
++  end
++
++  def refresh_storage_total
++    Storage::Total.transaction do
++      total = Storage::Total.for_locked(self)
++      board_bytes = Storage::Total
++        .joins("INNER JOIN boards ON boards.id = storage_totals.owner_id")
++        .where(account_id: id, owner_type: "Board")
++        .lock("FOR SHARE")
++        .sum(:bytes_used)
++
++      total.update_columns(bytes_used: board_bytes, updated_at: Time.current)
++    end
++  end
++
++  def reconcile_storage
++    board_bytes = calculate_storage_bytes_by_board
++
++    boards.find_each do |board|
++      bytes = board_bytes.fetch(board.id, 0)
++      if bytes > 0 || Storage::Total.exists?(owner: board)
++        Storage::Total.transaction do
++          total = Storage::Total.for_locked(board)
++          Storage::Entry.where(board_id: board.id).delete_all
++          total.update_columns(bytes_used: bytes, updated_at: Time.current)
++        end
++      end
++    end
++
++    Storage::Entry.where(account_id: id).where.not(board_id: boards.select(:id)).delete_all
++    Storage::Total.where(account_id: id, owner_type: "Board").where.not(owner_id: boards.select(:id)).delete_all
++
++    refresh_storage_total
++  end
++
++  private
++    def cleanup_storage
++      Storage.suppressing_entries_for_account(id) do
++        yield
++        Storage::Entry.where(account_id: id).delete_all
++        Storage::Total.where(account_id: id).delete_all
++      end
++    end
++
++    def calculate_storage_bytes_by_board
++      totals = Hash.new(0)
++
++      [ card_image_bytes_by_board, board_description_embed_bytes_by_board, card_description_embed_bytes_by_board, comment_embed_bytes_by_board ].each do |counts|
++        counts.each { |board_id, bytes| totals[board_id] += bytes }
++      end
++
++      totals
++    end
++
++    def card_image_bytes_by_board
++      ::ActiveStorage::Attachment.joins(:blob)
++        .joins("INNER JOIN cards ON cards.id = active_storage_attachments.record_id")
++        .where(account_id: id, record_type: "Card", name: "image")
++        .group("cards.board_id")
++        .sum("active_storage_blobs.byte_size")
++    end
++
++    def board_description_embed_bytes_by_board
++      ::ActiveStorage::Attachment.joins(:blob)
++        .joins("INNER JOIN action_text_rich_texts ON action_text_rich_texts.id = active_storage_attachments.record_id")
++        .joins("INNER JOIN boards ON boards.id = action_text_rich_texts.record_id")
++        .where(account_id: id, record_type: "ActionText::RichText", name: "embeds")
++        .where(action_text_rich_texts: { record_type: "Board", name: "public_description" })
++        .group("boards.id")
++        .sum("active_storage_blobs.byte_size")
++    end
++
++    def card_description_embed_bytes_by_board
++      ::ActiveStorage::Attachment.joins(:blob)
++        .joins("INNER JOIN action_text_rich_texts ON action_text_rich_texts.id = active_storage_attachments.record_id")
++        .joins("INNER JOIN cards ON cards.id = action_text_rich_texts.record_id")
++        .where(account_id: id, record_type: "ActionText::RichText", name: "embeds")
++        .where(action_text_rich_texts: { record_type: "Card", name: "description" })
++        .group("cards.board_id")
++        .sum("active_storage_blobs.byte_size")
++    end
++
++    def comment_embed_bytes_by_board
++      ::ActiveStorage::Attachment.joins(:blob)
++        .joins("INNER JOIN action_text_rich_texts ON action_text_rich_texts.id = active_storage_attachments.record_id")
++        .joins("INNER JOIN comments ON comments.id = action_text_rich_texts.record_id")
++        .joins("INNER JOIN cards ON cards.id = comments.card_id")
++        .where(account_id: id, record_type: "ActionText::RichText", name: "embeds")
++        .where(action_text_rich_texts: { record_type: "Comment", name: "body" })
++        .group("cards.board_id")
++        .sum("active_storage_blobs.byte_size")
++    end
++end
+diff --git a/app/models/storage/board.rb b/app/models/storage/board.rb
+new file mode 100644
+index 0000000..2719787
+--- /dev/null
++++ b/app/models/storage/board.rb
+@@ -0,0 +1,102 @@
++module Storage::Board
++  extend ActiveSupport::Concern
++
++  BATCH_SIZE = 1_000
++
++  included do
++    include Storage::Totaled
++
++    around_destroy :cleanup_storage
++  end
++
++  def materialize_storage
++    changed = false
++
++    while consume_storage_entries_batch > 0
++      changed = true
++    end
++
++    account.refresh_storage_total if changed
++  end
++
++  def reconcile_storage
++    Storage::Total.transaction do
++      return unless ::Board.where(id: id).lock("FOR SHARE").exists?
++
++      total = Storage::Total.for_locked(self)
++      Storage::Entry.where(board_id: id).delete_all
++      total.update_columns(bytes_used: calculate_storage_bytes, updated_at: Time.current)
++    end
++
++    account.refresh_storage_total
++  end
++
++  private
++    def cleanup_storage
++      Storage.suppressing_entries_for_board(id) do
++        yield
++        Storage::Entry.where(board_id: id).delete_all
++        Storage::Total.where(owner: self).delete_all
++        Storage.enqueue_materialization_for_account(account_id)
++      end
++    end
++
++    def consume_storage_entries_batch
++      return 0 unless Storage::Entry.where(board_id: id).exists?
++
++      Storage::Total.transaction do
++        unless ::Board.where(id: id).lock("FOR SHARE").exists?
++          Storage::Entry.where(board_id: id).delete_all
++          return 0
++        end
++
++        total = Storage::Total.for_locked(self)
++        entries = Storage::Entry.where(board_id: id).order(:id).limit(BATCH_SIZE).lock.pluck(:id, :delta)
++        return 0 if entries.empty?
++
++        Storage::Entry.where(id: entries.map(&:first)).delete_all
++        new_bytes = [ total.bytes_used + entries.sum(&:last), 0 ].max
++        total.update_columns(bytes_used: new_bytes, updated_at: Time.current)
++
++        entries.size
++      end
++    end
++
++    def calculate_storage_bytes
++      card_image_bytes + board_description_embed_bytes + card_description_embed_bytes + comment_embed_bytes
++    end
++
++    def card_image_bytes
++      ::ActiveStorage::Attachment.joins(:blob)
++        .joins("INNER JOIN cards ON cards.id = active_storage_attachments.record_id")
++        .where(record_type: "Card", name: "image", cards: { board_id: id })
++        .sum("active_storage_blobs.byte_size")
++    end
++
++    def board_description_embed_bytes
++      ::ActiveStorage::Attachment.joins(:blob)
++        .joins("INNER JOIN action_text_rich_texts ON action_text_rich_texts.id = active_storage_attachments.record_id")
++        .where(record_type: "ActionText::RichText", name: "embeds")
++        .where(action_text_rich_texts: { record_type: "Board", record_id: id, name: "public_description" })
++        .sum("active_storage_blobs.byte_size")
++    end
++
++    def card_description_embed_bytes
++      ::ActiveStorage::Attachment.joins(:blob)
++        .joins("INNER JOIN action_text_rich_texts ON action_text_rich_texts.id = active_storage_attachments.record_id")
++        .joins("INNER JOIN cards ON cards.id = action_text_rich_texts.record_id")
++        .where(record_type: "ActionText::RichText", name: "embeds")
++        .where(action_text_rich_texts: { record_type: "Card", name: "description" }, cards: { board_id: id })
++        .sum("active_storage_blobs.byte_size")
++    end
++
++    def comment_embed_bytes
++      ::ActiveStorage::Attachment.joins(:blob)
++        .joins("INNER JOIN action_text_rich_texts ON action_text_rich_texts.id = active_storage_attachments.record_id")
++        .joins("INNER JOIN comments ON comments.id = action_text_rich_texts.record_id")
++        .joins("INNER JOIN cards ON cards.id = comments.card_id")
++        .where(record_type: "ActionText::RichText", name: "embeds")
++        .where(action_text_rich_texts: { record_type: "Comment", name: "body" }, cards: { board_id: id })
++        .sum("active_storage_blobs.byte_size")
++    end
++end
+diff --git a/app/models/storage/card.rb b/app/models/storage/card.rb
+new file mode 100644
+index 0000000..3cb6d73
+--- /dev/null
++++ b/app/models/storage/card.rb
+@@ -0,0 +1,49 @@
++module Storage::Card
++  extend ActiveSupport::Concern
++
++  included do
++    after_update :transfer_storage_to_new_board, if: :saved_change_to_board_id?
++  end
++
++  private
++    def transfer_storage_to_new_board
++      old_board = ::Board.find_by(id: board_id_before_last_save)
++      return unless old_board
++
++      bytes = card_storage_bytes
++      if bytes > 0
++        Storage::Entry.record(account_id: old_board.account_id, board_id: old_board.id, delta: -bytes)
++        Storage::Entry.record(account_id: account_id, board_id: board_id, delta: bytes)
++      end
++    end
++
++    def card_storage_bytes
++      card_image_bytes + card_description_embed_bytes + card_comment_embed_bytes
++    end
++
++    def card_image_bytes
++      ::ActiveStorage::Attachment.joins(:blob)
++        .where(record_type: "Card", record_id: id, name: "image")
++        .lock("FOR SHARE")
++        .sum("active_storage_blobs.byte_size")
++    end
++
++    def card_description_embed_bytes
++      ::ActiveStorage::Attachment.joins(:blob)
++        .joins("INNER JOIN action_text_rich_texts ON action_text_rich_texts.id = active_storage_attachments.record_id")
++        .where(record_type: "ActionText::RichText", name: "embeds")
++        .where(action_text_rich_texts: { record_type: "Card", record_id: id, name: "description" })
++        .lock("FOR SHARE")
++        .sum("active_storage_blobs.byte_size")
++    end
++
++    def card_comment_embed_bytes
++      ::ActiveStorage::Attachment.joins(:blob)
++        .joins("INNER JOIN action_text_rich_texts ON action_text_rich_texts.id = active_storage_attachments.record_id")
++        .joins("INNER JOIN comments ON comments.id = action_text_rich_texts.record_id")
++        .where(record_type: "ActionText::RichText", name: "embeds")
++        .where(action_text_rich_texts: { record_type: "Comment", name: "body" }, comments: { card_id: id })
++        .lock("FOR SHARE")
++        .sum("active_storage_blobs.byte_size")
++    end
++end
+diff --git a/app/models/storage/entry.rb b/app/models/storage/entry.rb
+new file mode 100644
+index 0000000..6c0ffec
+--- /dev/null
++++ b/app/models/storage/entry.rb
+@@ -0,0 +1,13 @@
++class Storage::Entry < ApplicationRecord
++  belongs_to :account, optional: true
++  belongs_to :board, optional: true
++
++  class << self
++    def record(account_id:, board_id:, delta:)
++      return if delta.zero? || Storage.suppressed?(account_id: account_id, board_id: board_id)
++
++      create!(account_id: account_id, board_id: board_id, delta: delta)
++      Storage.enqueue_materialization_for_board(account_id: account_id, board_id: board_id)
++    end
++  end
++end
+diff --git a/app/models/storage/total.rb b/app/models/storage/total.rb
+new file mode 100644
+index 0000000..22dc86f
+--- /dev/null
++++ b/app/models/storage/total.rb
+@@ -0,0 +1,33 @@
++class Storage::Total < ApplicationRecord
++  belongs_to :account, optional: true
++  belongs_to :owner, polymorphic: true, optional: true
++
++  class << self
++    def for_locked(owner)
++      if total = lock.find_by(owner: owner)
++        total
++      else
++        now = Time.current
++        insert({
++          id: ActiveRecord::Type::Uuid.generate,
++          account_id: account_id_for(owner),
++          owner_type: owner.class.name,
++          owner_id: owner.id,
++          bytes_used: 0,
++          created_at: now,
++          updated_at: now
++        })
++        lock.find_by!(owner: owner)
++      end
++    end
++
++    private
++      def account_id_for(owner)
++        if owner.is_a?(::Account)
++          owner.id
++        else
++          owner.account_id
++        end
++      end
++  end
++end
+diff --git a/app/models/storage/totaled.rb b/app/models/storage/totaled.rb
+new file mode 100644
+index 0000000..209ad63
+--- /dev/null
++++ b/app/models/storage/totaled.rb
+@@ -0,0 +1,21 @@
++module Storage::Totaled
++  extend ActiveSupport::Concern
++
++  included do
++    has_one :storage_total, class_name: "Storage::Total", as: :owner
++  end
++
++  def bytes_used
++    if new_record? || destroyed?
++      0
++    else
++      Storage::Total.where(owner: self).pick(:bytes_used) || 0
++    end
++  end
++
++  def materialize_storage_later
++    Current.with_account(account) do
++      Storage::MaterializeJob.perform_later(self)
++    end
++  end
++end
+diff --git a/config/initializers/action_text.rb b/config/initializers/action_text.rb
+index 6bbdb3e..1d58c5c 100644
+--- a/config/initializers/action_text.rb
++++ b/config/initializers/action_text.rb
+@@ -10,6 +10,10 @@ module ActionText
+             attachable.variant variant_name, **variant_options, process: :immediately
+           end
+         end
++
++        before_validation do
++          self.embeds = [] if persisted? && body.blank?
++        end
+       end
+ 
+       def accessible_to?(user)
+diff --git a/config/initializers/active_storage.rb b/config/initializers/active_storage.rb
+index f85a27a..7bdded5 100644
+--- a/config/initializers/active_storage.rb
++++ b/config/initializers/active_storage.rb
+@@ -56,3 +56,44 @@ Rails.application.config.to_prepare do
+   ActiveStorage::BaseController.include ActiveStorageControllerExtensions
+   ActiveStorage::DirectUploadsController.include ActiveStorageDirectUploadsControllerExtensions
+ end
++
++module ActiveStorageAttachmentStorageTracking
++  extend ActiveSupport::Concern
++
++  included do
++    after_create :record_storage_addition
++    after_destroy :record_storage_removal, if: :storage_row_deleted?
++  end
++
++  def delete
++    if persisted?
++      rows_deleted = self.class._delete_record(_query_constraints_hash)
++      record_storage_removal if rows_deleted > 0
++    end
++    @destroyed = true
++    freeze
++  end
++
++  private
++    def destroy_row
++      super.tap do |rows_deleted|
++        @storage_row_deleted = rows_deleted > 0
++      end
++    end
++
++    def storage_row_deleted?
++      @storage_row_deleted
++    end
++
++    def record_storage_addition
++      Storage.record_attachment_delta(self, +1)
++    end
++
++    def record_storage_removal
++      Storage.record_attachment_delta(self, -1)
++    end
++end
++
++ActiveSupport.on_load(:active_storage_attachment) do
++  include ActiveStorageAttachmentStorageTracking
++end
+diff --git a/db/migrate/20261120000000_create_storage_tables.rb b/db/migrate/20261120000000_create_storage_tables.rb
+new file mode 100644
+index 0000000..360f481
+--- /dev/null
++++ b/db/migrate/20261120000000_create_storage_tables.rb
+@@ -0,0 +1,24 @@
++class CreateStorageTables < ActiveRecord::Migration[8.2]
++  def change
++    create_table :storage_entries, id: :uuid do |t|
++      t.uuid :account_id, null: false
++      t.uuid :board_id, null: false
++      t.bigint :delta, null: false
++      t.datetime :created_at, null: false
++
++      t.index [ :board_id, :id ]
++      t.index [ :account_id, :board_id ]
++    end
++
++    create_table :storage_totals, id: :uuid do |t|
++      t.uuid :account_id, null: false
++      t.uuid :owner_id, null: false
++      t.string :owner_type, null: false
++      t.bigint :bytes_used, default: 0, null: false
++      t.timestamps
++
++      t.index [ :owner_type, :owner_id ], unique: true
++      t.index [ :account_id, :owner_type, :bytes_used ], name: "index_storage_totals_on_account_owner_bytes"
++    end
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 81a3526..4d48261 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
++ActiveRecord::Schema[8.2].define(version: 2026_11_20_000000) do
+   create_table "accesses", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+     t.datetime "accessed_at"
+     t.uuid "account_id", null: false
+@@ -731,6 +731,26 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.index ["card_id"], name: "index_steps_on_card_id"
+   end
+ 
++  create_table "storage_entries", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
++    t.uuid "account_id", null: false
++    t.uuid "board_id", null: false
++    t.bigint "delta", null: false
++    t.datetime "created_at", null: false
++    t.index ["account_id", "board_id"], name: "index_storage_entries_on_account_id_and_board_id"
++    t.index ["board_id", "id"], name: "index_storage_entries_on_board_id_and_id"
++  end
++
++  create_table "storage_totals", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
++    t.uuid "account_id", null: false
++    t.uuid "owner_id", null: false
++    t.string "owner_type", null: false
++    t.bigint "bytes_used", default: 0, null: false
++    t.datetime "created_at", null: false
++    t.datetime "updated_at", null: false
++    t.index ["account_id", "owner_type", "bytes_used"], name: "index_storage_totals_on_account_owner_bytes"
++    t.index ["owner_type", "owner_id"], name: "index_storage_totals_on_owner_type_and_owner_id", unique: true
++  end
++
+   create_table "taggings", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+     t.uuid "account_id", null: false
+     t.uuid "card_id", null: false
+diff --git a/db/schema_sqlite.rb b/db/schema_sqlite.rb
+index 1c89abe..0ed08e2 100644
+--- a/db/schema_sqlite.rb
++++ b/db/schema_sqlite.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
++ActiveRecord::Schema[8.2].define(version: 2026_11_20_000000) do
+   create_table "accesses", id: :uuid, force: :cascade do |t|
+     t.datetime "accessed_at"
+     t.uuid "account_id", null: false
+@@ -504,6 +504,26 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.index ["card_id"], name: "index_steps_on_card_id"
+   end
+ 
++  create_table "storage_entries", id: :uuid, force: :cascade do |t|
++    t.uuid "account_id", null: false
++    t.uuid "board_id", null: false
++    t.bigint "delta", null: false
++    t.datetime "created_at", null: false
++    t.index ["account_id", "board_id"], name: "index_storage_entries_on_account_id_and_board_id"
++    t.index ["board_id", "id"], name: "index_storage_entries_on_board_id_and_id"
++  end
++
++  create_table "storage_totals", id: :uuid, force: :cascade do |t|
++    t.uuid "account_id", null: false
++    t.uuid "owner_id", null: false
++    t.string "owner_type", limit: 255, null: false
++    t.bigint "bytes_used", default: 0, null: false
++    t.datetime "created_at", null: false
++    t.datetime "updated_at", null: false
++    t.index ["account_id", "owner_type", "bytes_used"], name: "index_storage_totals_on_account_owner_bytes"
++    t.index ["owner_type", "owner_id"], name: "index_storage_totals_on_owner_type_and_owner_id", unique: true
++  end
++
+   create_table "taggings", id: :uuid, force: :cascade do |t|
+     t.uuid "account_id", null: false
+     t.uuid "card_id", null: false
+diff --git a/test/integration/storage_tracking_test.rb b/test/integration/storage_tracking_test.rb
+new file mode 100644
+index 0000000..fe98eb5
+--- /dev/null
++++ b/test/integration/storage_tracking_test.rb
+@@ -0,0 +1,85 @@
++require "test_helper"
++
++class StorageTrackingTest < ActionDispatch::IntegrationTest
++  setup do
++    sign_in_as :kevin
++    clear_enqueued_jobs
++    @account = accounts("37s")
++    @board = boards(:writebook)
++    @other_board = boards(:private)
++    @card = cards(:logo)
++  end
++
++  test "tracks storage across controller actions for boards, cards, images, and comments" do
++    moon_size = file_fixture("moon.jpg").size
++
++    # Upload card image via controller
++    patch card_path(@card), as: :turbo_stream, params: {
++      card: { image: fixture_file_upload("moon.jpg", "image/jpeg") }
++    }
++    assert_response :success
++    perform_enqueued_jobs
++
++    assert_equal moon_size, @board.bytes_used
++    assert_equal moon_size, @account.bytes_used
++
++    # Embed file in board public description via controller
++    blob = Current.with_account(@account) do
++      ActiveStorage::Blob.create_and_upload!(
++        io: StringIO.new("board-embed" * 100),
++        filename: "guide.txt",
++        content_type: "text/plain"
++      )
++    end
++    patch board_path(@board), params: {
++      board: { name: @board.name, public_description: "<p>#{ActionText::Attachment.from_attachable(blob).to_html}</p>" }
++    }
++    assert_response :redirect
++    perform_enqueued_jobs
++
++    assert_equal moon_size + blob.byte_size, @board.bytes_used
++    assert_equal moon_size + blob.byte_size, @account.bytes_used
++
++    # Post comment with embedded file via controller
++    comment_blob = Current.with_account(@account) do
++      ActiveStorage::Blob.create_and_upload!(
++        io: StringIO.new("comment-embed" * 50),
++        filename: "Attachment.txt",
++        content_type: "text/plain"
++      )
++    end
++    post card_comments_path(@card), as: :turbo_stream, params: {
++      comment: { body: "<p>#{ActionText::Attachment.from_attachable(comment_blob).to_html}</p>" }
++    }
++    assert_response :success
++    perform_enqueued_jobs
++
++    assert_equal moon_size + blob.byte_size + comment_blob.byte_size, @board.bytes_used
++    assert_equal moon_size + blob.byte_size + comment_blob.byte_size, @account.bytes_used
++
++    # Move card to another board via controller
++    patch card_board_path(@card), params: { board_id: @other_board.id }
++    assert_response :redirect
++    perform_enqueued_jobs
++
++    assert_equal blob.byte_size, @board.bytes_used
++    assert_equal moon_size + comment_blob.byte_size, @other_board.bytes_used
++    assert_equal moon_size + blob.byte_size + comment_blob.byte_size, @account.bytes_used
++
++    # Delete card image via controller
++    delete card_image_path(@card)
++    assert_response :redirect
++    perform_enqueued_jobs
++
++    assert_equal blob.byte_size, @board.bytes_used
++    assert_equal comment_blob.byte_size, @other_board.bytes_used
++    assert_equal blob.byte_size + comment_blob.byte_size, @account.bytes_used
++
++    # Destroy board via controller
++    delete board_path(@board)
++    assert_response :redirect
++    perform_enqueued_jobs
++
++    assert_equal comment_blob.byte_size, @account.bytes_used
++  end
++end
+diff --git a/test/models/storage_test.rb b/test/models/storage_test.rb
+new file mode 100644
+index 0000000..dfbb766
+--- /dev/null
++++ b/test/models/storage_test.rb
+@@ -0,0 +1,520 @@
++require "test_helper"
++
++class StorageTest < ActiveSupport::TestCase
++  setup do
++    @account = accounts("37s")
++    @board = boards(:writebook)
++    @other_board = boards(:private)
++    @card = cards(:logo)
++    Current.session = sessions(:david)
++  end
++
++  test "account and board start with zero bytes used" do
++    assert_equal 0, Account.new.bytes_used
++    assert_equal 0, Board.new.bytes_used
++    assert_equal 0, @account.bytes_used
++    assert_equal 0, @board.bytes_used
++  end
++
++  test "bytes_used is calculated in the background" do
++    blob = create_blob("card image content", filename: "card.png", content_type: "image/png")
++
++    assert_enqueued_with(job: Storage::MaterializeJob, args: [ @board ]) do
++      @card.image.attach(blob)
++    end
++
++    assert_equal 0, @board.bytes_used
++    assert_equal 0, @account.bytes_used
++
++    perform_enqueued_jobs
++
++    assert_equal blob.byte_size, @board.bytes_used
++    assert_equal blob.byte_size, @account.bytes_used
++  end
++
++  test "counts card images on published and drafted cards across attach, replace, purge_later, purge, detach, and nil" do
++    blob1 = create_blob("a" * 1_200, filename: "one.png", content_type: "image/png")
++    blob2 = create_blob("b" * 2_500, filename: "two.png", content_type: "image/png")
++    draft_blob = create_blob("c" * 800, filename: "draft.png", content_type: "image/png")
++
++    perform_enqueued_jobs do
++      @card.image.attach(blob1)
++    end
++    assert_equal 1_200, @board.bytes_used
++    assert_equal 1_200, @account.bytes_used
++
++    # Replace card image
++    perform_enqueued_jobs do
++      @card.image.attach(blob2)
++    end
++    assert_equal 2_500, @board.bytes_used
++    assert_equal 2_500, @account.bytes_used
++
++    # Attach image on a drafted card, then publish it (no double count)
++    draft = @board.cards.create!(creator: users(:david), status: :drafted)
++    perform_enqueued_jobs do
++      draft.image.attach(draft_blob)
++    end
++    assert_equal 3_300, @board.bytes_used
++    assert_equal 3_300, @account.bytes_used
++
++    perform_enqueued_jobs do
++      draft.publish
++    end
++    assert_equal 3_300, @board.bytes_used
++    assert_equal 3_300, @account.bytes_used
++
++    # Remove via purge_later (controller path)
++    perform_enqueued_jobs do
++      @card.image.purge_later
++    end
++    assert_equal 800, @board.bytes_used
++    assert_equal 800, @account.bytes_used
++
++    # Remove via detach
++    perform_enqueued_jobs do
++      draft.image.detach
++    end
++    assert_equal 0, @board.bytes_used
++    assert_equal 0, @account.bytes_used
++
++    # Re-attach and remove via purge and update!(image: nil)
++    b3 = create_blob("d" * 400, filename: "three.png", content_type: "image/png")
++    b4 = create_blob("e" * 600, filename: "four.png", content_type: "image/png")
++    perform_enqueued_jobs do
++      @card.image.attach(b3)
++      draft.image.attach(b4)
++    end
++    assert_equal 1_000, @board.bytes_used
++
++    perform_enqueued_jobs do
++      @card.image.purge
++    end
++    assert_equal 600, @board.bytes_used
++
++    perform_enqueued_jobs do
++      draft.update!(image: nil)
++    end
++    assert_equal 0, @board.bytes_used
++    assert_equal 0, @account.bytes_used
++  end
++
++  test "double destroy of the same attachment instance only subtracts once" do
++    blob1 = create_blob("x" * 1_000)
++    blob2 = create_blob("y" * 500)
++    other_card = cards(:layout)
++
++    perform_enqueued_jobs do
++      @card.image.attach(blob1)
++      other_card.image.attach(blob2)
++    end
++    assert_equal 1_500, @board.bytes_used
++
++    att_copy_1 = ActiveStorage::Attachment.find(@card.image.attachment.id)
++    att_copy_2 = ActiveStorage::Attachment.find(@card.image.attachment.id)
++
++    perform_enqueued_jobs do
++      att_copy_1.destroy
++      att_copy_2.destroy
++    end
++
++    assert_equal 500, @board.bytes_used
++    assert_equal 500, @account.bytes_used
++  end
++
++  test "counts files embedded in board descriptions without counting generated image variants" do
++    moon_blob = ActiveStorage::Blob.create_and_upload!(
++      io: file_fixture("moon.jpg").open,
++      filename: "moon.jpg",
++      content_type: "image/jpeg"
++    )
++    pdf_blob = create_blob("pdf-bytes" * 100, filename: "spec.pdf", content_type: "application/pdf")
++
++    @board.update!(public_description: "<p>Welcome #{embed_html(moon_blob)} #{embed_html(pdf_blob)}</p>")
++    perform_enqueued_jobs
++
++    assert_operator ActiveStorage::VariantRecord.where(blob: moon_blob).count, :>, 0
++    expected = moon_blob.byte_size + pdf_blob.byte_size
++    assert_equal expected, @board.bytes_used
++    assert_equal expected, @account.bytes_used
++
++    # Remove one embed
++    perform_enqueued_jobs do
++      @board.update!(public_description: "<p>Welcome #{embed_html(pdf_blob)}</p>")
++    end
++    assert_equal pdf_blob.byte_size, @board.bytes_used
++    assert_equal pdf_blob.byte_size, @account.bytes_used
++
++    # Clear description to empty string
++    perform_enqueued_jobs do
++      @board.update!(public_description: "")
++    end
++    assert_equal 0, @board.bytes_used
++    assert_equal 0, @account.bytes_used
++  end
++
++  test "counts files embedded in card descriptions and ignores remote media and mentions" do
++    file_blob = create_blob("card-doc" * 200, filename: "notes.txt", content_type: "text/plain")
++    mention_html = ActionText::Attachment.from_attachable(users(:jz)).to_html
++    remote_video = <<~HTML
++      <action-text-attachment url="https://example.com/demo.mp4" content-type="video/mp4" filename="demo.mp4"></action-text-attachment>
++      <action-text-attachment url="https://example.com/pic.png" content-type="image/png" filename="pic.png"></action-text-attachment>
++    HTML
++
++    perform_enqueued_jobs do
++      @card.update!(description: "<p>Hi #{mention_html} #{embed_html(file_blob)} #{remote_video}</p>")
++    end
++
++    assert_equal file_blob.byte_size, @board.bytes_used
++    assert_equal file_blob.byte_size, @account.bytes_used
++
++    # Clear to nil
++    perform_enqueued_jobs do
++      @card.update!(description: nil)
++    end
++
++    assert_equal 0, @board.bytes_used
++    assert_equal 0, @account.bytes_used
++  end
++
++  test "counts files embedded in comments across create, update, and destroy" do
++    c1_blob = create_blob("comment-1" * 150)
++    c2_blob = create_blob("comment-2" * 300)
++
++    comment = nil
++    perform_enqueued_jobs do
++      comment = @card.comments.create!(body: "<p>See #{embed_html(c1_blob)}</p>")
++    end
++    assert_equal c1_blob.byte_size, @board.bytes_used
++    assert_equal c1_blob.byte_size, @account.bytes_used
++
++    perform_enqueued_jobs do
++      comment.update!(body: "<p>Updated #{embed_html(c1_blob)} and #{embed_html(c2_blob)}</p>")
++    end
++    assert_equal c1_blob.byte_size + c2_blob.byte_size, @board.bytes_used
++    assert_equal c1_blob.byte_size + c2_blob.byte_size, @account.bytes_used
++
++    perform_enqueued_jobs do
++      comment.destroy!
++    end
++    assert_equal 0, @board.bytes_used
++    assert_equal 0, @account.bytes_used
++  end
++
++  test "aggregates board usage across board and cards, and account usage across all boards in isolation" do
++    board_1_blob = create_blob("b1" * 500)
++    board_2_blob = create_blob("b2" * 700)
++    other_account = accounts(:initech)
++    other_account_board = boards(:miltons_wish_list)
++    other_account_card = cards(:unfinished_thoughts)
++
++    other_account_blob = Current.with_account(other_account) do
++      create_blob("initech" * 400)
++    end
++
++    perform_enqueued_jobs do
++      @board.update!(public_description: "<p>#{embed_html(board_1_blob)}</p>")
++      other_board_card = @other_board.cards.create!(title: "Private card", creator: users(:david), status: :published)
++      other_board_card.image.attach(board_2_blob)
++      other_account_card.image.attach(other_account_blob)
++    end
++
++    assert_equal 1_000, @board.bytes_used
++    assert_equal 1_400, @other_board.bytes_used
++    assert_equal 2_400, @account.bytes_used
++
++    assert_equal 2_800, other_account_board.bytes_used
++    assert_equal 2_800, other_account.bytes_used
++  end
++
++  test "moving a card between boards transfers card image, description, and comment bytes" do
++    img_blob = create_blob("i" * 1_000)
++    desc_blob = create_blob("d" * 2_000)
++    comm_blob = create_blob("c" * 3_000)
++    stay_blob = create_blob("s" * 500)
++
++    perform_enqueued_jobs do
++      @board.update!(public_description: "<p>#{embed_html(stay_blob)}</p>")
++      @card.image.attach(img_blob)
++      @card.update!(description: "<p>#{embed_html(desc_blob)}</p>")
++      @card.comments.create!(body: "<p>#{embed_html(comm_blob)}</p>")
++    end
++
++    assert_equal 6_500, @board.bytes_used
++    assert_equal 0, @other_board.bytes_used
++    assert_equal 6_500, @account.bytes_used
++
++    perform_enqueued_jobs do
++      @card.move_to(@other_board)
++    end
++
++    assert_equal 500, @board.bytes_used
++    assert_equal 6_000, @other_board.bytes_used
++    assert_equal 6_500, @account.bytes_used
++  end
++
++  test "attaching and moving a card in the same transaction or across multiple moves stays exact" do
++    b1 = create_blob("m" * 900)
++    third_board = @account.boards.create!(name: "Third", creator: users(:david))
++
++    perform_enqueued_jobs do
++      Card.transaction do
++        @card.image.attach(b1)
++        @card.move_to(@other_board)
++      end
++    end
++
++    assert_equal 0, @board.bytes_used
++    assert_equal 900, @other_board.bytes_used
++    assert_equal 0, third_board.bytes_used
++    assert_equal 900, @account.bytes_used
++
++    # Chained moves before jobs run: other_board -> board -> third_board
++    @card.move_to(@board)
++    @card.move_to(third_board)
++    perform_enqueued_jobs
++
++    assert_equal 0, @board.bytes_used
++    assert_equal 0, @other_board.bytes_used
++    assert_equal 900, third_board.bytes_used
++    assert_equal 900, @account.bytes_used
++  end
++
++  test "destroying a card removes its image, description, and comment bytes" do
++    img_blob = create_blob("i" * 1_100)
++    desc_blob = create_blob("d" * 2_200)
++    comm_blob = create_blob("c" * 3_300)
++
++    perform_enqueued_jobs do
++      @card.image.attach(img_blob)
++      @card.update!(description: "<p>#{embed_html(desc_blob)}</p>")
++      @card.comments.create!(body: "<p>#{embed_html(comm_blob)}</p>")
++    end
++    assert_equal 6_600, @board.bytes_used
++    assert_equal 6_600, @account.bytes_used
++
++    perform_enqueued_jobs do
++      @card.destroy!
++    end
++    assert_equal 0, @board.bytes_used
++    assert_equal 0, @account.bytes_used
++  end
++
++  test "destroying a board updates account bytes in the background without per-attachment entry churn" do
++    b1_blob = create_blob("1" * 1_500)
++    b1_unmaterialized_blob = create_blob("u" * 750)
++    b2_blob = create_blob("2" * 2_000)
++
++    other_card = @other_board.cards.create!(title: "Other", creator: users(:david), status: :published)
++
++    perform_enqueued_jobs do
++      @card.image.attach(b1_blob)
++      other_card.image.attach(b2_blob)
++    end
++    assert_equal 3_500, @account.bytes_used
++
++    # Also add an unmaterialized attachment on @board right before destroying @board
++    @board.update!(public_description: "<p>#{embed_html(b1_unmaterialized_blob)}</p>")
++    clear_enqueued_jobs
++
++    assert_enqueued_with(job: Storage::MaterializeJob, args: [ @account ]) do
++      @board.destroy!
++    end
++
++    assert_equal 0, @board.bytes_used
++    assert_equal 0, Storage::Entry.where(board_id: @board.id).count
++    # Account still reflects previous materialized value until background job runs
++    assert_equal 3_500, @account.bytes_used
++
++    perform_enqueued_jobs
++
++    assert_equal 2_000, @account.bytes_used
++  end
++
++  test "destroying an account cleans up all storage records without enqueueing storage jobs" do
++    temp_account = Account.create_with_owner(
++      account: { name: "Temp Account" },
++      owner: { name: "David", identity: identities(:david) }
++    )
++    owner = temp_account.users.find_by!(role: :owner)
++
++    Current.set(account: temp_account, user: owner) do
++      board = temp_account.boards.create!(name: "Temp Board")
++      card = board.cards.create!(title: "Temp Card", status: :published)
++      blob = create_blob("temp" * 500)
++
++      perform_enqueued_jobs do
++        card.image.attach(blob)
++      end
++      assert_equal 2_000, temp_account.bytes_used
++
++      assert_no_enqueued_jobs(only: Storage::MaterializeJob) do
++        temp_account.destroy!
++      end
++
++      assert_equal 0, temp_account.bytes_used
++      assert_equal 0, Storage::Entry.where(account_id: temp_account.id).count
++      assert_equal 0, Storage::Total.where(account_id: temp_account.id).count
++    end
++  end
++
++  test "ignores user avatars, exports, imports, and unattached blobs" do
++    users(:david).avatar.attach(io: file_fixture("avatar.png").open, filename: "avatar.png", content_type: "image/png")
++
++    export = Account::Export.create!(account: @account, user: users(:david))
++    export.file.attach(io: StringIO.new("zip" * 1_000), filename: "export.zip", content_type: "application/zip")
++
++    import = Account::Import.create!(account: @account, identity: identities(:david))
++    import.file.attach(io: StringIO.new("imp" * 1_000), filename: "import.zip", content_type: "application/zip")
++
++    create_blob("unattached" * 500)
++
++    perform_enqueued_jobs
++
++    assert_equal 0, @board.bytes_used
++    assert_equal 0, @account.bytes_used
++  end
++
++  test "coalesces multiple attachment changes in a single transaction into one job per board and respects rollbacks" do
++    blobs = 5.times.map { |i| create_blob("f#{i}" * 100, filename: "f#{i}.txt") }
++
++    assert_enqueued_jobs 1, only: Storage::MaterializeJob do
++      ApplicationRecord.transaction do
++        @card.image.attach(blobs[0])
++        @card.update!(description: "<p>#{embed_html(blobs[1])} #{embed_html(blobs[2])}</p>")
++        @card.comments.create!(body: "<p>#{embed_html(blobs[3])} #{embed_html(blobs[4])}</p>")
++      end
++    end
++
++    perform_enqueued_jobs
++    expected = blobs.sum(&:byte_size)
++    assert_equal expected, @board.bytes_used
++    assert_equal expected, @account.bytes_used
++
++    # Rolled-back transaction does not enqueue or alter usage
++    rollback_blob = create_blob("rolled-back" * 300)
++    assert_no_enqueued_jobs(only: Storage::MaterializeJob) do
++      ApplicationRecord.transaction do
++        cards(:layout).image.attach(rollback_blob)
++        raise ActiveRecord::Rollback
++      end
++    end
++
++    assert_equal expected, @board.bytes_used
++    assert_equal expected, @account.bytes_used
++  end
++
++  test "processes large entry queues across multiple batches" do
++    blobs = 5.times.map { |i| create_blob("batch" * 100, filename: "b#{i}.txt") }
++
++    blobs.each_with_index do |blob, index|
++      card = @board.cards.create!(title: "Card #{index}", creator: users(:david), status: :published)
++      card.image.attach(blob)
++    end
++
++    clear_enqueued_jobs
++    assert_equal 5, Storage::Entry.where(board_id: @board.id).count
++
++    stub_const(Storage::Board, :BATCH_SIZE, 2) do
++      @board.materialize_storage
++    end
++
++    assert_equal 0, Storage::Entry.where(board_id: @board.id).count
++    assert_equal blobs.sum(&:byte_size), @board.bytes_used
++    assert_equal blobs.sum(&:byte_size), @account.bytes_used
++  end
++
++  test "reconcile_storage and account import restore exact board and account totals" do
++    img_blob = create_blob("img" * 400)
++    desc_blob = create_blob("desc" * 600)
++
++    perform_enqueued_jobs do
++      @card.image.attach(img_blob)
++      @board.update!(public_description: "<p>#{embed_html(desc_blob)}</p>")
++    end
++
++    expected_board_bytes = img_blob.byte_size + desc_blob.byte_size
++    assert_equal expected_board_bytes, @board.bytes_used
++    assert_equal expected_board_bytes, @account.bytes_used
++
++    # Corrupt totals and reconcile
++    Storage::Total.where(account_id: @account.id).update_all(bytes_used: 999_999)
++    @account.reconcile_storage
++
++    assert_equal expected_board_bytes, @board.bytes_used
++    assert_equal expected_board_bytes, @account.bytes_used
++
++    # Export and import round-trip
++    exporter = users(:david)
++    identity = exporter.identity
++    export = Account::Export.create!(account: @account, user: exporter)
++    export.build
++
++    export_tempfile = Tempfile.new([ "export", ".zip" ])
++    export.file.open { |f| FileUtils.cp(f.path, export_tempfile.path) }
++
++    board_id = @board.id
++    ActiveStorage::Blob.where(account: @account).delete_all
++    @account.destroy!
++
++    target_account = Account.create_with_owner(account: { name: "Imported" }, owner: { identity: identity, name: exporter.name })
++    import = Account::Import.create!(identity: identity, account: target_account)
++    Current.set(account: target_account) do
++      import.file.attach(io: File.open(export_tempfile.path), filename: "export.zip", content_type: "application/zip")
++    end
++
++    import.check
++    import.process
++
++    imported_board = target_account.boards.find(board_id)
++    assert_equal expected_board_bytes, imported_board.bytes_used
++    assert_equal expected_board_bytes, target_account.bytes_used
++  ensure
++    export_tempfile&.close
++    export_tempfile&.unlink
++  end
++
++  test "updating card board, image, and description simultaneously keeps board and account totals exact" do
++    old_img = create_blob("1" * 1_000)
++    old_desc = create_blob("2" * 2_000)
++    new_img = create_blob("3" * 3_500)
++    new_desc = create_blob("4" * 4_500)
++
++    perform_enqueued_jobs do
++      @card.update!(image: old_img, description: "<p>#{embed_html(old_desc)}</p>")
++    end
++    assert_equal 3_000, @board.bytes_used
++    assert_equal 0, @other_board.bytes_used
++    assert_equal 3_000, @account.bytes_used
++
++    perform_enqueued_jobs do
++      @card.update!(board: @other_board, image: new_img, description: "<p>#{embed_html(new_desc)}</p>")
++    end
++    assert_equal 0, @board.bytes_used
++    assert_equal 8_000, @other_board.bytes_used
++    assert_equal 8_000, @account.bytes_used
++  end
++
++  private
++    def create_blob(content, filename: "file.txt", content_type: "text/plain")
++      ActiveStorage::Blob.create_and_upload!(
++        io: StringIO.new(content),
++        filename: filename,
++        content_type: content_type
++      )
++    end
++
++    def embed_html(blob)
++      ActionText::Attachment.from_attachable(blob).to_html
++    end
++
++    def stub_const(mod, const_name, value)
++      original = mod.const_get(const_name)
++      mod.send(:remove_const, const_name)
++      mod.const_set(const_name, value)
++      yield
++    ensure
++      mod.send(:remove_const, const_name)
++      mod.const_set(const_name, original)
++    end
++end

@@ -1,0 +1,5001 @@
+diff --git a/app/controllers/api/v1/tickets_controller.rb b/app/controllers/api/v1/tickets_controller.rb
+index fdfda67..dc62a7e 100644
+--- a/app/controllers/api/v1/tickets_controller.rb
++++ b/app/controllers/api/v1/tickets_controller.rb
+@@ -4,7 +4,7 @@ module Api
+       before_action :authenticate_user!
+       before_action :require_active_account!
+       before_action :require_staff!
+-      before_action :load_ticket!, only: [:show, :update]
++      before_action :load_ticket!, only: [:show, :update, :merge]
+ 
+       def index
+         scope = current_account.tickets.includes(:requester, :assignee, :group).recently_active
+@@ -135,8 +135,40 @@ module Api
+         render json: { ticket: @ticket.as_ticket_json }, status: :ok
+       end
+ 
++      def merge
++        merge_params = require_object_param(:merge)
++        source_comment_attrs = extract_merge_comment_attrs(merge_params, :source_comment)
++        target_comment_attrs = extract_merge_comment_attrs(merge_params, :target_comment)
++
++        source, target = @ticket.merge_into!(
++          author: current_user,
++          raw_target_id: merge_params[:target_id],
++          source_comment_attrs: source_comment_attrs,
++          target_comment_attrs: target_comment_attrs
++        )
++
++        render json: {
++          source: source.as_ticket_json,
++          target: target.as_ticket_json
++        }, status: :ok
++      end
++
+       private
+ 
++      def extract_merge_comment_attrs(merge_params, key)
++        return { has_body: false, body: nil, public: false } unless merge_params.key?(key)
++
++        raw_comment = merge_params[key]
++        return { has_body: true, body: nil, public: false } unless raw_comment.is_a?(ActionController::Parameters)
++
++        has_body = raw_comment.key?(:body)
++        {
++          has_body: has_body,
++          body: has_body ? scalar_string(raw_comment[:body]) : nil,
++          public: extract_boolean_param(raw_comment, :public, default: false)
++        }
++      end
++
+       def load_ticket!
+         id = parse_record_id(params[:id])
+         @ticket = id && current_account.tickets.includes(:requester, :assignee, :group).find_by(id: id)
+diff --git a/app/models/comment.rb b/app/models/comment.rb
+index 149492a..a30c1f5 100644
+--- a/app/models/comment.rb
++++ b/app/models/comment.rb
+@@ -3,7 +3,7 @@ class Comment < ApplicationRecord
+   belongs_to :ticket
+   belongs_to :author, class_name: "User"
+ 
+-  validates :body, presence: true
++  validates :body, presence: true, format: { without: /\u0000/ }
+   validates :public, inclusion: { in: [true, false] }
+ 
+   scope :chronological, -> { order(created_at: :asc, id: :asc) }
+diff --git a/app/models/ticket.rb b/app/models/ticket.rb
+index 93ae5bb..4eb1f56 100644
+--- a/app/models/ticket.rb
++++ b/app/models/ticket.rb
+@@ -1,7 +1,8 @@
+ class Ticket < ApplicationRecord
+   class InvalidEmailDelivery < StandardError; end
+ 
+-  STATUSES = %w[open pending solved].freeze
++  STATUSES = %w[open pending solved closed].freeze
++  STAFF_EDITABLE_STATUSES = %w[open pending solved].freeze
+   PRIORITIES = %w[normal high].freeze
+   MAX_BIGINT = (1 << 63) - 1
+ 
+@@ -9,6 +10,8 @@ class Ticket < ApplicationRecord
+   belongs_to :requester, class_name: "User"
+   belongs_to :group, optional: true
+   belongs_to :assignee, class_name: "User", optional: true
++  belongs_to :merged_into, class_name: "Ticket", optional: true
++  has_many :merged_tickets, class_name: "Ticket", foreign_key: :merged_into_id, dependent: :nullify
+   has_many :processed_inbound_emails, dependent: :delete_all
+   has_many :comments, dependent: :delete_all
+ 
+@@ -21,6 +24,7 @@ class Ticket < ApplicationRecord
+   validates :status, presence: true, inclusion: { in: STATUSES }
+   validates :priority, presence: true, inclusion: { in: PRIORITIES }
+   validates :reply_token, presence: true, uniqueness: true
++  validate :validate_merge_state
+ 
+   scope :recently_active, -> { order(updated_at: :desc, id: :desc) }
+   scope :customer_recently_active, -> { order(customer_updated_at: :desc, id: :desc) }
+@@ -49,6 +53,10 @@ class Ticket < ApplicationRecord
+     end
+   }
+ 
++  def closed?
++    status == "closed"
++  end
++
+   def self.open_request!(account:, requester:, subject:, comment_body:)
+     now = Time.current
+     ticket = new(
+@@ -145,7 +153,7 @@ class Ticket < ApplicationRecord
+             new_user
+           end
+ 
+-          now = Time.current
++          now = Time.current.floor(6)
+           ticket = new(
+             account: account,
+             requester: requester,
+@@ -215,10 +223,12 @@ class Ticket < ApplicationRecord
+           if ProcessedInboundEmail.exists?(message_id: dedup_message_id)
+             outcome = :duplicate
+           else
++            raise InvalidEmailDelivery if closed?
++
+             req = account.users.find_by(id: requester_id)
+             raise InvalidEmailDelivery unless req && req.customer? && !req.suspended? && req.email == normalized_email
+ 
+-            now = Time.current
++            now = Time.current.floor(6)
+             comment = Comment.new(
+               account: account,
+               ticket: self,
+@@ -262,6 +272,107 @@ class Ticket < ApplicationRecord
+     "#{account.subdomain}+#{reply_token}@#{HelpdeskConfig.support_domain}"
+   end
+ 
++  def merge_into!(author:, raw_target_id:, source_comment_attrs:, target_comment_attrs:)
++    target = nil
++
++    account.with_lock do
++      reload
++      errors.clear
++
++      if closed?
++        errors.add(:base, "Ticket is already closed")
++      end
++
++      if raw_target_id.nil? || raw_target_id == ""
++        errors.add(:target_id, "can't be blank")
++      else
++        parsed_target_id = parse_record_id_value(raw_target_id)
++        if parsed_target_id.nil?
++          errors.add(:target_id, "is invalid")
++        elsif parsed_target_id == id
++          errors.add(:target_id, "cannot be the same ticket")
++        else
++          found_target = account.tickets.includes(:requester, :assignee, :group).find_by(id: parsed_target_id)
++          if found_target.nil?
++            errors.add(:target_id, "is invalid")
++          elsif found_target.requester_id != requester_id
++            errors.add(:target_id, "must belong to the same customer")
++          elsif found_target.closed?
++            errors.add(:target_id, "cannot be a closed ticket")
++          else
++            target = found_target
++          end
++        end
++      end
++
++      source_body = if source_comment_attrs[:has_body]
++        source_comment_attrs[:body]
++      else
++        target ? "Merged into ticket ##{target.id}." : "Merged into ticket."
++      end
++
++      target_body = if target_comment_attrs[:has_body]
++        target_comment_attrs[:body]
++      else
++        "Merged from ticket ##{id}."
++      end
++
++      source_note = Comment.new(
++        account: account,
++        ticket: self,
++        author: author,
++        body: source_body,
++        public: source_comment_attrs[:public]
++      )
++
++      target_note = Comment.new(
++        account: account,
++        ticket: target || self,
++        author: author,
++        body: target_body,
++        public: target_comment_attrs[:public]
++      )
++
++      unless source_note.valid?
++        source_note.errors.each do |error|
++          next if error.attribute == :ticket
++          errors.add(:"source_comment.#{error.attribute}", error.message)
++        end
++      end
++
++      unless target_note.valid?
++        target_note.errors.each do |error|
++          next if error.attribute == :ticket
++          errors.add(:"target_comment.#{error.attribute}", error.message)
++        end
++      end
++
++      raise ActiveRecord::RecordInvalid.new(self) if errors.any?
++
++      now = Time.current.floor(6)
++
++      source_note.created_at = now
++      source_note.updated_at = now
++      source_note.save!
++
++      target_note.created_at = now
++      target_note.updated_at = now
++      target_note.save!
++
++      self.status = "closed"
++      self.merged_into = target
++      self.updated_at = now
++      self.customer_updated_at = now
++      save!
++
++      target.updated_at = now
++      target.customer_updated_at = now if target_note.public?
++      target.save!
++    end
++
++    [self, target]
++  end
++
+   def apply_staff_update!(
+     author:,
+     has_comment:,
+@@ -275,16 +386,30 @@ class Ticket < ApplicationRecord
+     has_group: false,
+     raw_group_id: nil
+   )
+-    unless has_comment || has_status || has_assignee || has_priority || has_group
+-      errors.add(:base, "Comment, status, assignee, priority, or group is required")
+-      raise ActiveRecord::RecordInvalid.new(self)
+-    end
+-
+     reply_comment_to_deliver = nil
+ 
+     account.with_lock do
+       reload
+-      self.status = status if has_status
++      errors.clear
++
++      if closed?
++        errors.add(:base, "Closed tickets cannot be edited")
++        raise ActiveRecord::RecordInvalid.new(self)
++      end
++
++      unless has_comment || has_status || has_assignee || has_priority || has_group
++        errors.add(:base, "Comment, status, assignee, priority, or group is required")
++        raise ActiveRecord::RecordInvalid.new(self)
++      end
++
++      status_disallowed = false
++      if has_status
++        if status.present? && !STAFF_EDITABLE_STATUSES.include?(status)
++          status_disallowed = true
++        else
++          self.status = status
++        end
++      end
+       self.priority = priority if has_priority
+ 
+       group_invalid = false
+@@ -376,6 +501,10 @@ class Ticket < ApplicationRecord
+       end
+ 
+       ticket_valid = valid?
++      if status_disallowed
++        errors.add(:status, :inclusion)
++        ticket_valid = false
++      end
+       if group_invalid
+         errors.add(:group_id, "is invalid")
+         ticket_valid = false
+@@ -400,7 +529,7 @@ class Ticket < ApplicationRecord
+ 
+       customer_visible_change = (comment.present? && comment.public?) || will_save_change_to_status?
+ 
+-      now = Time.current
++      now = Time.current.floor(6)
+       if comment
+         comment.created_at = now
+         comment.updated_at = now
+@@ -424,48 +553,54 @@ class Ticket < ApplicationRecord
+   end
+ 
+   def apply_customer_update!(author:, has_comment:, comment_body:, has_status:, status:)
+-    unless has_comment || has_status
+-      errors.add(:base, "Comment or status is required")
+-      raise ActiveRecord::RecordInvalid.new(self)
+-    end
++    account.with_lock do
++      reload
++      errors.clear
++
++      if closed?
++        errors.add(:base, "Closed tickets cannot be edited")
++        raise ActiveRecord::RecordInvalid.new(self)
++      end
+ 
+-    errors.clear
++      unless has_comment || has_status
++        errors.add(:base, "Comment or status is required")
++        raise ActiveRecord::RecordInvalid.new(self)
++      end
+ 
+-    target_status = if has_status
+-      if status.blank?
+-        errors.add(:status, :blank)
+-        nil
+-      elsif status == "solved" || (has_comment && status == "open")
+-        status
++      target_status = if has_status
++        if status.blank?
++          errors.add(:status, :blank)
++          nil
++        elsif status == "solved" || (has_comment && status == "open")
++          status
++        else
++          errors.add(:status, :inclusion)
++          nil
++        end
+       else
+-        errors.add(:status, :inclusion)
+-        nil
++        "open"
+       end
+-    else
+-      "open"
+-    end
+ 
+-    comment = if has_comment
+-      Comment.new(
+-        account: account,
+-        ticket: self,
+-        author: author,
+-        body: comment_body,
+-        public: true
+-      )
+-    end
++      comment = if has_comment
++        Comment.new(
++          account: account,
++          ticket: self,
++          author: author,
++          body: comment_body,
++          public: true
++        )
++      end
+ 
+-    if comment && !comment.valid?
+-      comment.errors.each do |error|
+-        next if error.attribute == :ticket
+-        errors.add(:"comment.#{error.attribute}", error.message)
++      if comment && !comment.valid?
++        comment.errors.each do |error|
++          next if error.attribute == :ticket
++          errors.add(:"comment.#{error.attribute}", error.message)
++        end
+       end
+-    end
+ 
+-    raise ActiveRecord::RecordInvalid.new(self) if errors.any?
++      raise ActiveRecord::RecordInvalid.new(self) if errors.any?
+ 
+-    self.class.transaction do
+-      now = Time.current
++      now = Time.current.floor(6)
+       self.status = target_status
+       if comment
+         comment.created_at = now
+@@ -488,6 +623,7 @@ class Ticket < ApplicationRecord
+       subject: subject,
+       status: status,
+       requester_id: requester_id,
++      merged_into_id: merged_into_id,
+       created_at: created_at,
+       updated_at: customer_updated_at
+     }
+@@ -499,6 +635,7 @@ class Ticket < ApplicationRecord
+       subject: subject,
+       status: status,
+       priority: priority,
++      merged_into_id: merged_into_id,
+       requester_id: requester_id,
+       requester: {
+         id: requester.id,
+@@ -530,6 +667,16 @@ class Ticket < ApplicationRecord
+     self.customer_updated_at ||= updated_at || created_at || Time.current
+   end
+ 
++  def validate_merge_state
++    if status == "closed" && merged_into_id.nil? && merged_into.nil?
++      errors.add(:merged_into_id, :blank)
++    elsif status != "closed" && (merged_into_id.present? || merged_into.present?)
++      errors.add(:merged_into_id, :invalid)
++    elsif merged_into_id.present? && id.present? && merged_into_id == id
++      errors.add(:merged_into_id, :invalid)
++    end
++  end
++
+   def parse_record_id_value(raw_id)
+     id = if raw_id.is_a?(String)
+       return nil unless /\A\d+\z/.match?(raw_id)
+diff --git a/config/routes.rb b/config/routes.rb
+index 6166eeb..6ac6302 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -51,6 +51,9 @@ Rails.application.routes.draw do
+       end
+ 
+       resources :tickets, only: [:index, :show, :update] do
++        member do
++          post :merge
++        end
+         resources :comments, only: [:index], controller: "ticket_comments"
+       end
+     end
+diff --git a/db/migrate/20261120190000_add_merged_into_to_tickets.rb b/db/migrate/20261120190000_add_merged_into_to_tickets.rb
+new file mode 100644
+index 0000000..76407c1
+--- /dev/null
++++ b/db/migrate/20261120190000_add_merged_into_to_tickets.rb
+@@ -0,0 +1,7 @@
++class AddMergedIntoToTickets < ActiveRecord::Migration[8.1]
++  def change
++    add_reference :tickets, :merged_into, null: true, foreign_key: { to_table: :tickets, on_delete: :nullify }
++    add_index :tickets, [:account_id, :merged_into_id]
++    add_check_constraint :tickets, "merged_into_id IS NULL OR merged_into_id <> id", name: "tickets_not_merged_into_self"
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 67c8658..8fcda1e 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.1].define(version: 2026_11_20_180000) do
++ActiveRecord::Schema[8.1].define(version: 2026_11_20_190000) do
+   # These are extensions that must be enabled in order to support this database
+   enable_extension "pg_catalog.plpgsql"
+ 
+@@ -184,8 +184,10 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_20_180000) do
+     t.boolean "email_origin", default: false, null: false
+     t.string "email_message_id"
+     t.bigint "group_id"
++    t.bigint "merged_into_id"
+     t.index ["account_id", "assignee_id"], name: "index_tickets_on_account_id_and_assignee_id"
+     t.index ["account_id", "group_id"], name: "index_tickets_on_account_id_and_group_id"
++    t.index ["account_id", "merged_into_id"], name: "index_tickets_on_account_id_and_merged_into_id"
+     t.index ["account_id", "priority"], name: "index_tickets_on_account_id_and_priority"
+     t.index ["account_id", "requester_id", "customer_updated_at", "id"], name: "idx_on_account_id_requester_id_customer_updated_at__330312a7ef"
+     t.index ["account_id", "requester_id", "status"], name: "index_tickets_on_account_id_and_requester_id_and_status"
+@@ -195,8 +197,10 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_20_180000) do
+     t.index ["account_id"], name: "index_tickets_on_account_id"
+     t.index ["assignee_id"], name: "index_tickets_on_assignee_id"
+     t.index ["group_id"], name: "index_tickets_on_group_id"
++    t.index ["merged_into_id"], name: "index_tickets_on_merged_into_id"
+     t.index ["reply_token"], name: "index_tickets_on_reply_token", unique: true
+     t.index ["requester_id"], name: "index_tickets_on_requester_id"
++    t.check_constraint "merged_into_id IS NULL OR merged_into_id <> id", name: "tickets_not_merged_into_self"
+   end
+ 
+   create_table "users", force: :cascade do |t|
+@@ -239,6 +243,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_20_180000) do
+   add_foreign_key "sessions", "users", on_delete: :cascade
+   add_foreign_key "tickets", "accounts", on_delete: :cascade
+   add_foreign_key "tickets", "groups", on_delete: :nullify
++  add_foreign_key "tickets", "tickets", column: "merged_into_id", on_delete: :nullify
+   add_foreign_key "tickets", "users", column: "assignee_id", on_delete: :nullify
+   add_foreign_key "tickets", "users", column: "requester_id", on_delete: :cascade
+   add_foreign_key "users", "accounts", on_delete: :cascade
+diff --git a/test/integration/priority_and_inbox_filters_test.rb b/test/integration/priority_and_inbox_filters_test.rb
+index 42d596a..2457ec4 100644
+--- a/test/integration/priority_and_inbox_filters_test.rb
++++ b/test/integration/priority_and_inbox_filters_test.rb
+@@ -472,7 +472,7 @@ class PriorityAndInboxFiltersTest < ActionDispatch::IntegrationTest
+ 
+     # Invalid filter params return 422 (never 500)
+     [
+-      { status: "closed" },
++      { status: "archived" },
+       { status: ["open"] },
+       { priority: "urgent" },
+       { priority: ["high"] },
+diff --git a/test/integration/ticket_merging_test.rb b/test/integration/ticket_merging_test.rb
+new file mode 100644
+index 0000000..c901090
+--- /dev/null
++++ b/test/integration/ticket_merging_test.rb
+@@ -0,0 +1,876 @@
++require "test_helper"
++require "rake"
++
++class TicketMergingTest < ActionDispatch::IntegrationTest
++  RELAY_PATH = "/rails/action_mailbox/relay/inbound_emails"
++  INGRESS_PASSWORD = "test-inbound-secret-password"
++
++  setup do
++    ActionMailer::Base.deliveries.clear
++    @orig_env = %w[
++      HELPDESK_FRONTEND_URL
++      HELPDESK_MAIL_FROM
++      HELPDESK_SUPPORT_DOMAIN
++      RAILS_INBOUND_EMAIL_PASSWORD
++    ].index_with { |k| ENV[k] }
++
++    ENV.delete("HELPDESK_FRONTEND_URL")
++    ENV.delete("HELPDESK_MAIL_FROM")
++    ENV.delete("HELPDESK_SUPPORT_DOMAIN")
++    ENV["RAILS_INBOUND_EMAIL_PASSWORD"] = INGRESS_PASSWORD
++  end
++
++  teardown do
++    @orig_env.each do |k, v|
++      v.nil? ? ENV.delete(k) : ENV[k] = v
++    end
++  end
++
++  def json_body
++    JSON.parse(response.body)
++  end
++
++  def extract_token(mail)
++    uri = URI.parse(mail.body.decoded[%r{https?://[^\s"<>]+}])
++    URI.decode_www_form(uri.query).to_h.fetch("token")
++  end
++
++  def relay_auth_header(username: "actionmailbox", password: INGRESS_PASSWORD)
++    ActionController::HttpAuthentication::Basic.encode_credentials(username, password)
++  end
++
++  def post_inbound_raw(raw_rfc822, auth: relay_auth_header, content_type: "message/rfc822")
++    headers = {}
++    headers["Authorization"] = auth if auth
++    headers["Content-Type"] = content_type if content_type
++    post RELAY_PATH, params: raw_rfc822, headers: headers
++  end
++
++  def build_raw_email(
++    from: "Avery Stone <avery@example.test>",
++    to: "acme@support.example.test",
++    cc: nil,
++    subject: "Need help with order",
++    body: "My package arrived damaged.",
++    message_id: "<#{SecureRandom.uuid}@example.test>",
++    extra_headers: {}
++  )
++    mail = Mail.new
++    mail.from = from if from
++    mail.to = to if to
++    mail.cc = cc if cc
++    mail.subject = subject unless subject.nil?
++    mail.message_id = message_id if message_id
++    extra_headers.each { |k, v| mail[k] = v }
++    mail.body = body unless body.nil?
++    mail.to_s
++  end
++
++  def setup_business!(subdomain: "acme", name: "Acme", admin_name: "Jo", email: "jo@acme.test", password: "my-first-password")
++    post "/api/v1/account/create",
++      params: {
++        account: {
++          name: name,
++          subdomain: subdomain,
++          admin: { name: admin_name, email: email, password: password }
++        }
++      },
++      as: :json
++    assert_response :created
++    owner = json_body.fetch("user")
++    token = extract_token(ActionMailer::Base.deliveries.last)
++
++    post "/api/v1/email_verifications/confirm",
++      params: { email_verification: { token: token } },
++      headers: { "X-Helpdesk-Account" => subdomain },
++      as: :json
++    assert_response :ok
++    ActionMailer::Base.deliveries.clear
++    owner
++  end
++
++  def invite_and_accept_staff!(subdomain:, owner_headers:, email:, name:, role: "agent", password: "staff-password")
++    post "/api/v1/invitations",
++      params: { invitation: { email: email, role: role } },
++      headers: owner_headers,
++      as: :json
++    assert_response :created
++    token = extract_token(ActionMailer::Base.deliveries.last)
++
++    post "/api/v1/invitation_acceptances",
++      params: { invitation_acceptance: { token: token, name: name, password: password } },
++      headers: { "X-Helpdesk-Account" => subdomain },
++      as: :json
++    assert_response :created
++    ActionMailer::Base.deliveries.clear
++    json_body.fetch("user")
++  end
++
++  def register_and_verify_customer!(subdomain: "acme", name: "Avery", email: "avery@example.test", password: "my-customer-password")
++    post "/api/v1/registrations",
++      params: { user: { name: name, email: email, password: password } },
++      headers: { "X-Helpdesk-Account" => subdomain },
++      as: :json
++    assert_response :created
++    token = extract_token(ActionMailer::Base.deliveries.last)
++
++    post "/api/v1/email_verifications/confirm",
++      params: { email_verification: { token: token } },
++      headers: { "X-Helpdesk-Account" => subdomain },
++      as: :json
++    assert_response :ok
++    user = json_body.fetch("user")
++    ActionMailer::Base.deliveries.clear
++    user
++  end
++
++  def sign_in!(subdomain:, email:, password:)
++    post "/api/v1/sessions",
++      params: { session: { email: email, password: password } },
++      headers: { "X-Helpdesk-Account" => subdomain },
++      as: :json
++    assert_response :created
++    json_body.dig("session", "token")
++  end
++
++  def auth_headers(subdomain, token)
++    {
++      "X-Helpdesk-Account" => subdomain,
++      "Authorization" => "Bearer #{token}"
++    }
++  end
++
++  test "default merge closes source, sets merged_into_id, leaves null pointer on unmerged, creates private notes, preserves comments and target fields, and lets both views filter closed" do
++    setup_business!(subdomain: "acme", admin_name: "Jo", email: "jo@acme.test")
++    owner_headers = auth_headers("acme", sign_in!(subdomain: "acme", email: "jo@acme.test", password: "my-first-password"))
++
++    sam = invite_and_accept_staff!(subdomain: "acme", owner_headers: owner_headers, email: "sam@acme.test", name: "Sam", role: "agent")
++    sam_headers = auth_headers("acme", sign_in!(subdomain: "acme", email: "sam@acme.test", password: "staff-password"))
++
++    register_and_verify_customer!(subdomain: "acme", name: "Avery", email: "avery@example.test")
++    avery_headers = auth_headers("acme", sign_in!(subdomain: "acme", email: "avery@example.test", password: "my-customer-password"))
++
++    post "/api/v1/groups", params: { group: { name: "Billing" } }, headers: owner_headers, as: :json
++    billing = json_body.fetch("group")
++    post "/api/v1/group_memberships",
++      params: { group_membership: { group_id: billing["id"], user_id: sam["id"] } },
++      headers: owner_headers,
++      as: :json
++    assert_response :created
++
++    # Avery opens duplicate ticket (source) and main ticket (target)
++    post "/api/v1/requests",
++      params: { request: { subject: "Duplicate invoice question", comment: { body: "Why was I billed twice?" } } },
++      headers: avery_headers,
++      as: :json
++    assert_response :created
++    req_source = json_body.fetch("request")
++    assert req_source.key?("merged_into_id")
++    assert_nil req_source["merged_into_id"]
++    source_id = req_source["id"]
++
++    travel 1.minute do
++      post "/api/v1/requests",
++        params: { request: { subject: "Main invoice thread", comment: { body: "Invoice #900 shows two charges." } } },
++        headers: avery_headers,
++        as: :json
++      assert_response :created
++    end
++    req_target_initial = json_body.fetch("request")
++    assert req_target_initial.key?("merged_into_id")
++    assert_nil req_target_initial["merged_into_id"]
++    target_id = req_target_initial["id"]
++
++    # Staff sets target to pending, high priority, assigned to Sam in Billing
++    travel 2.minutes do
++      patch "/api/v1/tickets/#{target_id}",
++        params: {
++          ticket: {
++            status: "pending",
++            priority: "high",
++            group_id: billing["id"],
++            assignee_id: sam["id"],
++            comment: { body: "Looking into invoice #900 now.", public: true }
++          }
++        },
++        headers: owner_headers,
++        as: :json
++      assert_response :ok
++      assert json_body.fetch("ticket").key?("merged_into_id")
++      assert_nil json_body.dig("ticket", "merged_into_id")
++    end
++
++    get "/api/v1/requests/#{target_id}", headers: avery_headers
++    req_target_before_merge = json_body.fetch("request")
++
++    # Agent Sam merges source into target with default notes
++    travel 5.minutes do
++      assert_no_difference -> { ActionMailer::Base.deliveries.size } do
++        post "/api/v1/tickets/#{source_id}/merge",
++          params: { merge: { target_id: target_id } },
++          headers: sam_headers,
++          as: :json
++      end
++      assert_response :ok
++
++      source_json = json_body.fetch("source")
++      target_json = json_body.fetch("target")
++
++      assert_equal source_id, source_json["id"]
++      assert_equal "closed", source_json["status"]
++      assert_equal target_id, source_json["merged_into_id"]
++
++      assert_equal target_id, target_json["id"]
++      assert_equal "pending", target_json["status"]
++      assert_equal "high", target_json["priority"]
++      assert_equal billing["id"], target_json["group_id"]
++      assert_equal sam["id"], target_json["assignee_id"]
++      assert target_json.key?("merged_into_id")
++      assert_nil target_json["merged_into_id"]
++    end
++
++    # Old comments were NOT moved; private merge notes added on both sides authored by Sam
++    get "/api/v1/tickets/#{source_id}/comments", headers: owner_headers
++    assert_response :ok
++    source_comments = json_body.fetch("comments")
++    assert_equal 2, source_comments.size
++    assert_equal "Why was I billed twice?", source_comments[0]["body"]
++    assert_equal true, source_comments[0]["public"]
++    assert_equal false, source_comments[1]["public"]
++    assert_equal sam["id"], source_comments[1].dig("author", "id")
++    assert_includes source_comments[1]["body"], target_id.to_s
++
++    get "/api/v1/tickets/#{target_id}/comments", headers: owner_headers
++    assert_response :ok
++    target_comments = json_body.fetch("comments")
++    assert_equal 3, target_comments.size
++    assert_equal ["Invoice #900 shows two charges.", "Looking into invoice #900 now."], target_comments[0..1].map { |c| c["body"] }
++    assert_equal false, target_comments[2]["public"]
++    assert_equal sam["id"], target_comments[2].dig("author", "id")
++    assert_includes target_comments[2]["body"], source_id.to_s
++
++    # Customer can still read closed source request & its public comments, sees merged_into_id, does not see private merge notes
++    get "/api/v1/requests/#{source_id}", headers: avery_headers
++    assert_response :ok
++    assert_equal "closed", json_body.dig("request", "status")
++    assert_equal target_id, json_body.dig("request", "merged_into_id")
++    assert_operator Time.iso8601(json_body.dig("request", "updated_at")), :>, Time.iso8601(req_source["updated_at"])
++
++    get "/api/v1/requests/#{source_id}/comments", headers: avery_headers
++    assert_response :ok
++    assert_equal ["Why was I billed twice?"], json_body.fetch("comments").map { |c| c["body"] }
++
++    # Customer view of target is completely unchanged when target merge note is private
++    get "/api/v1/requests/#{target_id}", headers: avery_headers
++    assert_response :ok
++    assert_equal req_target_before_merge, json_body.fetch("request")
++
++    # Both views include closed tickets in unfiltered index with merged_into_id (and null on unmerged)
++    get "/api/v1/tickets", headers: sam_headers
++    assert_response :ok
++    tickets_by_id = json_body.fetch("tickets").index_by { |t| t["id"] }
++    assert_equal target_id, tickets_by_id.fetch(source_id)["merged_into_id"]
++    assert tickets_by_id.fetch(target_id).key?("merged_into_id")
++    assert_nil tickets_by_id.fetch(target_id)["merged_into_id"]
++
++    get "/api/v1/requests", headers: avery_headers
++    assert_response :ok
++    requests_by_id = json_body.fetch("requests").index_by { |r| r["id"] }
++    assert_equal target_id, requests_by_id.fetch(source_id)["merged_into_id"]
++    assert requests_by_id.fetch(target_id).key?("merged_into_id")
++    assert_nil requests_by_id.fetch(target_id)["merged_into_id"]
++
++    # Both views can filter by status=closed
++    get "/api/v1/tickets", params: { status: "closed" }, headers: sam_headers
++    assert_response :ok
++    assert_equal [source_id], json_body.fetch("tickets").map { |t| t["id"] }
++
++    get "/api/v1/requests", params: { status: "closed" }, headers: avery_headers
++    assert_response :ok
++    assert_equal [source_id], json_body.fetch("requests").map { |r| r["id"] }
++  end
++
++  test "custom source_comment and target_comment bodies and public flags, email suppression on merge notes, email identity preservation, and rejecting incoming email replies on closed ticket" do
++    setup_business!(subdomain: "acme", admin_name: "Jo", email: "jo@acme.test")
++    owner_headers = auth_headers("acme", sign_in!(subdomain: "acme", email: "jo@acme.test", password: "my-first-password"))
++    register_and_verify_customer!(subdomain: "acme", name: "Avery", email: "avery@example.test")
++    avery_headers = auth_headers("acme", sign_in!(subdomain: "acme", email: "avery@example.test", password: "my-customer-password"))
++
++    # Ticket 1: Email-origin duplicate
++    post_inbound_raw(build_raw_email(
++      from: "Avery <avery@example.test>",
++      to: "acme@support.example.test",
++      subject: "Shipping delay #1",
++      body: "Where is my order?",
++      message_id: "<shipping-dup-1@example.test>"
++    ))
++    assert_response :no_content
++    t_email_dup = Account.find_by!(subdomain: "acme").tickets.order(:id).last
++
++    # Ticket 2: Email-origin surviving ticket (marked solved!)
++    post_inbound_raw(build_raw_email(
++      from: "Avery <avery@example.test>",
++      to: "acme@support.example.test",
++      subject: "Shipping delay main",
++      body: "Order #555 tracking has not updated.",
++      message_id: "<shipping-main-2@example.test>"
++    ))
++    assert_response :no_content
++    t_email_main = Account.find_by!(subdomain: "acme").tickets.order(:id).last
++
++    patch "/api/v1/tickets/#{t_email_main.id}",
++      params: { ticket: { status: "solved" } },
++      headers: owner_headers,
++      as: :json
++    assert_response :ok
++    ActionMailer::Base.deliveries.clear
++
++    orig_main_reply_token = t_email_main.reload.reply_token
++    orig_main_message_id = t_email_main.email_message_id
++    orig_dup_reply_address = t_email_dup.reply_address
++
++    # Merge email-origin dup into email-origin main with PUBLIC source_comment and PRIVATE target_comment -> NO email sent!
++    travel 3.minutes do
++      assert_no_difference -> { ActionMailer::Base.deliveries.size } do
++        post "/api/v1/tickets/#{t_email_dup.id}/merge",
++          params: {
++            merge: {
++              target_id: t_email_main.id,
++              source_comment: { body: "Continuing in ticket #{t_email_main.id}.", public: true },
++              target_comment: { body: "Duplicate checked.", public: false }
++            }
++          },
++          headers: owner_headers,
++          as: :json
++      end
++      assert_response :ok
++      assert_equal "closed", json_body.dig("source", "status")
++      assert_equal t_email_main.id, json_body.dig("source", "merged_into_id")
++      assert_equal "solved", json_body.dig("target", "status")
++      assert_nil json_body.dig("target", "merged_into_id")
++    end
++
++    # Surviving ticket's email identity is untouched
++    t_email_main.reload
++    assert_equal orig_main_reply_token, t_email_main.reply_token
++    assert_equal orig_main_message_id, t_email_main.email_message_id
++    assert_equal true, t_email_main.email_origin
++
++    # Customer sees public source_comment on closed request, does NOT see private target_comment on target request
++    get "/api/v1/requests/#{t_email_dup.id}/comments", headers: avery_headers
++    assert_response :ok
++    assert_equal ["Where is my order?", "Continuing in ticket #{t_email_main.id}."],
++      json_body.fetch("comments").map { |c| c["body"] }
++
++    get "/api/v1/requests/#{t_email_main.id}/comments", headers: avery_headers
++    assert_response :ok
++    assert_equal ["Order #555 tracking has not updated."],
++      json_body.fetch("comments").map { |c| c["body"] }
++
++    # Ticket 3: Another email-origin duplicate merged into main with PRIVATE source_comment and PUBLIC target_comment -> still NO email sent!
++    post_inbound_raw(build_raw_email(
++      from: "Avery <avery@example.test>",
++      to: "acme@support.example.test",
++      subject: "Shipping delay #3",
++      body: "Any news on #555?",
++      message_id: "<shipping-dup-3@example.test>"
++    ))
++    assert_response :no_content
++    t_email_dup3 = Account.find_by!(subdomain: "acme").tickets.order(:id).last
++
++    get "/api/v1/requests/#{t_email_main.id}", headers: avery_headers
++    main_req_before_public_merge_note = json_body.fetch("request")
++
++    travel 6.minutes do
++      assert_no_difference -> { ActionMailer::Base.deliveries.size } do
++        post "/api/v1/tickets/#{t_email_dup3.id}/merge",
++          params: {
++            merge: {
++              target_id: t_email_main.id,
++              source_comment: { body: "Closing duplicate #3" }, # omits public -> defaults to false
++              target_comment: { public: true } # omits body -> uses default merge text, made public
++            }
++          },
++          headers: owner_headers,
++          as: :json
++      end
++      assert_response :ok
++      assert_equal "solved", json_body.dig("target", "status")
++    end
++
++    # Source #3 note defaulted to private; Target note used default body and is public (bumping customer_updated_at on target!)
++    get "/api/v1/requests/#{t_email_dup3.id}/comments", headers: avery_headers
++    assert_response :ok
++    assert_equal ["Any news on #555?"], json_body.fetch("comments").map { |c| c["body"] }
++
++    get "/api/v1/requests/#{t_email_main.id}/comments", headers: avery_headers
++    assert_response :ok
++    assert_equal 2, json_body.fetch("comments").size
++    assert_includes json_body.fetch("comments").last["body"], t_email_dup3.id.to_s
++
++    get "/api/v1/requests/#{t_email_main.id}", headers: avery_headers
++    assert_operator Time.iso8601(json_body.dig("request", "updated_at")), :>, Time.iso8601(main_req_before_public_merge_note["updated_at"])
++
++    # Incoming email reply to CLOSED ticket's reply_address is REJECTED (no comment, stays closed, no ProcessedInboundEmail)
++    dup_updated_before = t_email_dup.reload.updated_at
++    assert_no_difference [-> { Ticket.count }, -> { Comment.count }, -> { ProcessedInboundEmail.count }, -> { ActionMailer::Base.deliveries.size }] do
++      post_inbound_raw(build_raw_email(
++        from: "avery@example.test",
++        to: orig_dup_reply_address,
++        subject: "Re: Shipping delay #1",
++        body: "Replying to closed ticket email thread",
++        message_id: "<reply-to-closed-dup@example.test>"
++      ))
++      assert_response :no_content
++    end
++    assert_equal "closed", t_email_dup.reload.status
++    assert_equal dup_updated_before, t_email_dup.updated_at
++
++    # Incoming email reply to SURVIVING ticket's reply_address still works and reopens it!
++    assert_difference -> { t_email_main.comments.count }, 1 do
++      post_inbound_raw(build_raw_email(
++        from: "avery@example.test",
++        to: t_email_main.reply_address,
++        subject: "Re: Shipping delay main",
++        body: "Replying on the surviving thread!",
++        message_id: "<reply-to-surviving-main@example.test>"
++      ))
++      assert_response :no_content
++    end
++    assert_equal "open", t_email_main.reload.status
++
++    # Merging an email-origin ticket into a PORTAL-origin ticket does NOT turn the portal ticket into email-origin!
++    post "/api/v1/requests",
++      params: { request: { subject: "Portal target", comment: { body: "Opened on web portal" } } },
++      headers: avery_headers,
++      as: :json
++    assert_response :created
++    portal_target_id = json_body.dig("request", "id")
++    portal_target = Ticket.find(portal_target_id)
++    orig_portal_token = portal_target.reply_token
++
++    post "/api/v1/tickets/#{t_email_main.id}/merge",
++      params: { merge: { target_id: portal_target_id } },
++      headers: owner_headers,
++      as: :json
++    assert_response :ok
++
++    portal_target.reload
++    assert_equal false, portal_target.email_origin
++    assert_nil portal_target.email_message_id
++    assert_equal orig_portal_token, portal_target.reply_token
++
++    # Subsequent staff public reply on portal_target does NOT send email
++    assert_no_difference -> { ActionMailer::Base.deliveries.size } do
++      patch "/api/v1/tickets/#{portal_target_id}",
++        params: { ticket: { comment: { body: "Portal reply after merge", public: true } } },
++        headers: owner_headers,
++        as: :json
++      assert_response :ok
++    end
++  end
++
++  test "closed tickets reject all staff and customer edits while assignment cleanup still applies, and chain merges preserve original links" do
++    owner = setup_business!(subdomain: "acme", admin_name: "Jo", email: "jo@acme.test")
++    owner_headers = auth_headers("acme", sign_in!(subdomain: "acme", email: "jo@acme.test", password: "my-first-password"))
++
++    sam = invite_and_accept_staff!(subdomain: "acme", owner_headers: owner_headers, email: "sam@acme.test", name: "Sam", role: "agent")
++    alex = invite_and_accept_staff!(subdomain: "acme", owner_headers: owner_headers, email: "alex@acme.test", name: "Alex", role: "agent")
++
++    register_and_verify_customer!(subdomain: "acme", name: "Avery", email: "avery@example.test")
++    avery_headers = auth_headers("acme", sign_in!(subdomain: "acme", email: "avery@example.test", password: "my-customer-password"))
++
++    post "/api/v1/groups", params: { group: { name: "Billing" } }, headers: owner_headers, as: :json
++    billing = json_body.fetch("group")
++    post "/api/v1/groups", params: { group: { name: "Support" } }, headers: owner_headers, as: :json
++    support = json_body.fetch("group")
++    post "/api/v1/groups", params: { group: { name: "Ops" } }, headers: owner_headers, as: :json
++    ops = json_body.fetch("group")
++
++    post "/api/v1/group_memberships", params: { group_membership: { group_id: billing["id"], user_id: sam["id"] } }, headers: owner_headers, as: :json
++    sam_billing_membership = json_body.fetch("group_membership")
++    post "/api/v1/group_memberships", params: { group_membership: { group_id: support["id"], user_id: alex["id"] } }, headers: owner_headers, as: :json
++    post "/api/v1/group_memberships", params: { group_membership: { group_id: ops["id"], user_id: owner["id"] } }, headers: owner_headers, as: :json
++
++    # Create 4 tickets for Avery: t1, t2, t3, t4
++    t_ids = 4.times.map do |i|
++      post "/api/v1/requests",
++        params: { request: { subject: "Ticket #{i + 1}", comment: { body: "Body #{i + 1}" } } },
++        headers: avery_headers,
++        as: :json
++      assert_response :created
++      json_body.dig("request", "id")
++    end
++    t1_id, t2_id, t3_id, t4_id = t_ids
++
++    # Assign t1 -> Billing/Sam, t2 -> Support/Alex, t3 -> Ops/Jo
++    patch "/api/v1/tickets/#{t1_id}", params: { ticket: { group_id: billing["id"], assignee_id: sam["id"] } }, headers: owner_headers, as: :json
++    assert_response :ok
++    patch "/api/v1/tickets/#{t2_id}", params: { ticket: { group_id: support["id"], assignee_id: alex["id"] } }, headers: owner_headers, as: :json
++    assert_response :ok
++    patch "/api/v1/tickets/#{t3_id}", params: { ticket: { group_id: ops["id"], assignee_id: owner["id"] } }, headers: owner_headers, as: :json
++    assert_response :ok
++
++    # Merge t1 -> t2 and t2 -> t3 (chain merge!), then t3 -> t4
++    travel 2.minutes do
++      post "/api/v1/tickets/#{t1_id}/merge", params: { merge: { target_id: t2_id } }, headers: owner_headers, as: :json
++      assert_response :ok
++      assert_equal t2_id, json_body.dig("source", "merged_into_id")
++      assert_equal billing["id"], json_body.dig("source", "group_id")
++      assert_equal sam["id"], json_body.dig("source", "assignee_id")
++    end
++
++    t1_after_first_merge = Ticket.find(t1_id).attributes.slice("status", "merged_into_id", "updated_at", "customer_updated_at")
++    t1_comment_count = Ticket.find(t1_id).comments.count
++
++    # All staff and customer edits on closed t1 are rejected with 422
++    assert_no_difference -> { Comment.count } do
++      [
++        { comment: { body: "Staff reply", public: true } },
++        { comment: { body: "Private note", public: false } },
++        { status: "open" },
++        { status: "pending" },
++        { status: "solved" },
++        { status: "closed" },
++        { priority: "high" },
++        { priority: "normal" },
++        { assignee_id: nil },
++        { group_id: nil },
++        {}
++      ].each do |staff_payload|
++        patch "/api/v1/tickets/#{t1_id}", params: { ticket: staff_payload }, headers: owner_headers, as: :json
++        assert_response :unprocessable_content, "Expected 422 for staff PATCH #{staff_payload.inspect}"
++      end
++
++      put "/api/v1/tickets/#{t1_id}",
++        params: { ticket: { status: "open", priority: "high" } },
++        headers: owner_headers,
++        as: :json
++      assert_response :unprocessable_content
++
++      [
++        { comment: { body: "Customer reply" } },
++        { status: "solved" },
++        { comment: { body: "Reopen please" }, status: "open" },
++        {}
++      ].each do |customer_payload|
++        patch "/api/v1/requests/#{t1_id}", params: { request: customer_payload }, headers: avery_headers, as: :json
++        assert_response :unprocessable_content, "Expected 422 for customer PATCH #{customer_payload.inspect}"
++      end
++
++      put "/api/v1/requests/#{t1_id}",
++        params: { request: { comment: { body: "Customer PUT" }, status: "open" } },
++        headers: avery_headers,
++        as: :json
++      assert_response :unprocessable_content
++    end
++
++    # Now merge surviving t2 into t3, and then surviving t3 into t4 -> original links are preserved, NOT rewritten!
++    travel 5.minutes do
++      post "/api/v1/tickets/#{t2_id}/merge", params: { merge: { target_id: t3_id } }, headers: owner_headers, as: :json
++      assert_response :ok
++      assert_equal t3_id, json_body.dig("source", "merged_into_id")
++    end
++
++    travel 8.minutes do
++      post "/api/v1/tickets/#{t3_id}/merge", params: { merge: { target_id: t4_id } }, headers: owner_headers, as: :json
++      assert_response :ok
++      assert_equal t4_id, json_body.dig("source", "merged_into_id")
++    end
++
++    # Verify history was NOT rewritten: t1 -> t2, t2 -> t3, t3 -> t4, t4 -> nil
++    assert_equal t1_after_first_merge, Ticket.find(t1_id).attributes.slice("status", "merged_into_id", "updated_at", "customer_updated_at")
++    assert_equal t1_comment_count, Ticket.find(t1_id).comments.count
++    assert_equal t2_id, Ticket.find(t1_id).merged_into_id
++    assert_equal t3_id, Ticket.find(t2_id).merged_into_id
++    assert_equal t4_id, Ticket.find(t3_id).merged_into_id
++    assert_nil Ticket.find(t4_id).merged_into_id
++
++    # Assignment cleanup still applies to closed tickets:
++    # 1. Removing Sam from Billing clears Sam from closed t1 (while keeping Billing group_id)
++    delete "/api/v1/group_memberships/#{sam_billing_membership["id"]}", headers: owner_headers
++    assert_response :no_content
++    get "/api/v1/tickets/#{t1_id}", headers: owner_headers
++    assert_response :ok
++    assert_equal billing["id"], json_body.dig("ticket", "group_id")
++    assert_nil json_body.dig("ticket", "assignee_id")
++    assert_equal "closed", json_body.dig("ticket", "status")
++    assert_equal t2_id, json_body.dig("ticket", "merged_into_id")
++
++    # 2. Suspending Alex clears Alex from closed t2 (while keeping Support group_id)
++    patch "/api/v1/users/#{alex["id"]}", params: { user: { suspended: true } }, headers: owner_headers, as: :json
++    assert_response :ok
++    get "/api/v1/tickets/#{t2_id}", headers: owner_headers
++    assert_response :ok
++    assert_equal support["id"], json_body.dig("ticket", "group_id")
++    assert_nil json_body.dig("ticket", "assignee_id")
++    assert_equal "closed", json_body.dig("ticket", "status")
++    assert_equal t3_id, json_body.dig("ticket", "merged_into_id")
++
++    # 3. Deleting Ops group clears both group_id and assignee_id from closed t3
++    delete "/api/v1/groups/#{ops["id"]}", headers: owner_headers
++    assert_response :no_content
++    get "/api/v1/tickets/#{t3_id}", headers: owner_headers
++    assert_response :ok
++    assert_nil json_body.dig("ticket", "group_id")
++    assert_nil json_body.dig("ticket", "assignee_id")
++    assert_equal "closed", json_body.dig("ticket", "status")
++    assert_equal t4_id, json_body.dig("ticket", "merged_into_id")
++
++    # 4. Cancelling and purging account after 90 days cleanly deletes merged tickets without FK violations
++    acme_id = Account.find_by!(subdomain: "acme").id
++    post "/api/v1/account/cancel", headers: owner_headers
++    assert_response :ok
++
++    Rails.application.load_tasks if Rake::Task.tasks.empty?
++    travel 90.days + 1.second do
++      Rake::Task["helpdesk:purge_cancelled_accounts"].reenable
++      Rake::Task["helpdesk:purge_cancelled_accounts"].invoke
++      assert_not Account.exists?(acme_id)
++      assert_equal 0, Ticket.where(account_id: acme_id).count
++    end
++  end
++
++  test "merge permissions, cross-customer/cross-tenant/self/closed rejections, malformed payloads, and atomic rollback" do
++    setup_business!(subdomain: "acme", admin_name: "Jo", email: "jo@acme.test")
++    setup_business!(subdomain: "globex", admin_name: "Gus", email: "gus@globex.test")
++
++    acme_owner_headers = auth_headers("acme", sign_in!(subdomain: "acme", email: "jo@acme.test", password: "my-first-password"))
++    globex_owner_headers = auth_headers("globex", sign_in!(subdomain: "globex", email: "gus@globex.test", password: "my-first-password"))
++
++    register_and_verify_customer!(subdomain: "acme", name: "Avery", email: "avery@example.test")
++    register_and_verify_customer!(subdomain: "acme", name: "Blake", email: "blake@example.test")
++    register_and_verify_customer!(subdomain: "globex", name: "Avery Globex", email: "avery@example.test")
++
++    avery_headers = auth_headers("acme", sign_in!(subdomain: "acme", email: "avery@example.test", password: "my-customer-password"))
++    blake_headers = auth_headers("acme", sign_in!(subdomain: "acme", email: "blake@example.test", password: "my-customer-password"))
++    globex_avery_headers = auth_headers("globex", sign_in!(subdomain: "globex", email: "avery@example.test", password: "my-customer-password"))
++
++    post "/api/v1/requests", params: { request: { subject: "Avery 1", comment: { body: "Body 1" } } }, headers: avery_headers, as: :json
++    avery_t1 = json_body.dig("request", "id")
++    post "/api/v1/requests", params: { request: { subject: "Avery 2", comment: { body: "Body 2" } } }, headers: avery_headers, as: :json
++    avery_t2 = json_body.dig("request", "id")
++    post "/api/v1/requests", params: { request: { subject: "Avery 3", comment: { body: "Body 3" } } }, headers: avery_headers, as: :json
++    avery_t3 = json_body.dig("request", "id")
++
++    post "/api/v1/requests", params: { request: { subject: "Blake 1", comment: { body: "Blake body" } } }, headers: blake_headers, as: :json
++    blake_t1 = json_body.dig("request", "id")
++
++    post "/api/v1/requests", params: { request: { subject: "Globex 1", comment: { body: "Globex body" } } }, headers: globex_avery_headers, as: :json
++    globex_t1 = json_body.dig("request", "id")
++
++    # Auth & role checks
++    post "/api/v1/tickets/#{avery_t1}/merge", params: { merge: { target_id: avery_t2 } }, as: :json
++    assert_response :bad_request
++
++    post "/api/v1/tickets/#{avery_t1}/merge",
++      params: { merge: { target_id: avery_t2 } },
++      headers: { "X-Helpdesk-Account" => "acme" },
++      as: :json
++    assert_response :unauthorized
++
++    post "/api/v1/tickets/#{avery_t1}/merge",
++      params: { merge: { target_id: avery_t2 } },
++      headers: avery_headers,
++      as: :json
++    assert_response :forbidden
++
++    # Source ticket not found / cross-account / malformed ID -> 404
++    ["999999", "not-an-id", "0", "-5", "999999999999999999999999999", globex_t1.to_s].each do |bad_source_id|
++      post "/api/v1/tickets/#{bad_source_id}/merge",
++        params: { merge: { target_id: avery_t2 } },
++        headers: acme_owner_headers,
++        as: :json
++      assert_response :not_found
++    end
++
++    # Malformed JSON or missing/non-object merge wrapper -> 400
++    post "/api/v1/tickets/#{avery_t1}/merge",
++      params: "{bad json",
++      headers: acme_owner_headers.merge("Content-Type" => "application/json")
++    assert_response :bad_request
++
++    [{}, { merge: "bad" }, { merge: [1] }, { merge: nil }].each do |bad_top|
++      post "/api/v1/tickets/#{avery_t1}/merge",
++        params: bad_top,
++        headers: acme_owner_headers,
++        as: :json
++      assert_response :bad_request
++    end
++
++    # Invalid target_id, self-merge, different customer, cross-account target, and invalid source_comment/target_comment roll back atomically (422)
++    assert_no_difference -> { Comment.count } do
++      [
++        {},
++        { target_id: nil },
++        { target_id: "" },
++        { target_id: "abc" },
++        { target_id: 0 },
++        { target_id: -1 },
++        { target_id: true },
++        { target_id: [avery_t2] },
++        { target_id: { id: avery_t2 } },
++        { target_id: 99_999_999_999_999_999_999_999_999 },
++        { target_id: 999_999 },
++        { target_id: avery_t1 }, # self-merge
++        { target_id: avery_t1.to_s }, # self-merge string
++        { target_id: blake_t1 }, # different customer in same account
++        { target_id: globex_t1 }, # cross-account ticket (even with same customer email)
++        { target_id: avery_t2, source_comment: "not-an-object" },
++        { target_id: avery_t2, source_comment: nil },
++        { target_id: avery_t2, source_comment: ["arr"] },
++        { target_id: avery_t2, source_comment: { body: "" } },
++        { target_id: avery_t2, source_comment: { body: "   " } },
++        { target_id: avery_t2, source_comment: { body: nil } },
++        { target_id: avery_t2, source_comment: { body: 123 } },
++        { target_id: avery_t2, source_comment: { body: "Bad\u0000Body" } },
++        { target_id: avery_t2, source_comment: { body: "Valid", public: "yes" } },
++        { target_id: avery_t2, source_comment: { body: "Valid", public: nil } },
++        { target_id: avery_t2, target_comment: "not-an-object" },
++        { target_id: avery_t2, target_comment: nil },
++        { target_id: avery_t2, target_comment: { body: "   " } },
++        { target_id: avery_t2, target_comment: { body: "Bad\u0000Body" } },
++        { target_id: avery_t2, target_comment: { body: "Valid", public: 1 } }
++      ].each do |bad_merge|
++        post "/api/v1/tickets/#{avery_t1}/merge",
++          params: { merge: bad_merge },
++          headers: acme_owner_headers,
++          as: :json
++        assert_response :unprocessable_content, "Expected 422 for merge payload #{bad_merge.inspect}, got #{response.status}"
++      end
++    end
++
++    assert_equal "open", Ticket.find(avery_t1).status
++    assert_nil Ticket.find(avery_t1).merged_into_id
++
++    # Merge avery_t1 -> avery_t2 succeeds (including numeric string target_id)
++    post "/api/v1/tickets/#{avery_t1}/merge",
++      params: { merge: { target_id: avery_t2.to_s } },
++      headers: acme_owner_headers,
++      as: :json
++    assert_response :ok
++
++    # Re-merging already-closed source avery_t1 is rejected (422)
++    assert_no_difference -> { Comment.count } do
++      post "/api/v1/tickets/#{avery_t1}/merge",
++        params: { merge: { target_id: avery_t3 } },
++        headers: acme_owner_headers,
++        as: :json
++      assert_response :unprocessable_content
++
++      # Merging avery_t3 INTO already-closed target avery_t1 (or avery_t2 into closed avery_t1 cycle!) is ALSO rejected (422)
++      post "/api/v1/tickets/#{avery_t3}/merge",
++        params: { merge: { target_id: avery_t1 } },
++        headers: acme_owner_headers,
++        as: :json
++      assert_response :unprocessable_content
++
++      post "/api/v1/tickets/#{avery_t2}/merge",
++        params: { merge: { target_id: avery_t1 } },
++        headers: acme_owner_headers,
++        as: :json
++      assert_response :unprocessable_content
++    end
++
++    assert_equal t_expected = avery_t2, Ticket.find(avery_t1).merged_into_id
++    assert_equal "open", Ticket.find(avery_t2).status
++    assert_equal "open", Ticket.find(avery_t3).status
++  end
++
++  test "merge response matches GET /tickets/:id, works for unverified email customers, supports combined closed inbox filters, and blocks cancelled accounts" do
++    setup_business!(subdomain: "acme", admin_name: "Jo", email: "jo@acme.test")
++    owner_headers = auth_headers("acme", sign_in!(subdomain: "acme", email: "jo@acme.test", password: "my-first-password"))
++
++    sam = invite_and_accept_staff!(subdomain: "acme", owner_headers: owner_headers, email: "sam@acme.test", name: "Sam", role: "agent")
++    post "/api/v1/groups", params: { group: { name: "VIP" } }, headers: owner_headers, as: :json
++    vip_group = json_body.fetch("group")
++    post "/api/v1/group_memberships", params: { group_membership: { group_id: vip_group["id"], user_id: sam["id"] } }, headers: owner_headers, as: :json
++    assert_response :created
++
++    # Unverified customer sends two emails
++    post_inbound_raw(build_raw_email(
++      from: "New Person <newperson@example.test>",
++      to: "acme@support.example.test",
++      subject: "First unverified email",
++      body: "Initial question from unverified user.",
++      message_id: "<unverified-1@example.test>"
++    ))
++    assert_response :no_content
++
++    post_inbound_raw(build_raw_email(
++      from: "New Person <newperson@example.test>",
++      to: "acme@support.example.test",
++      subject: "Second unverified email",
++      body: "Follow-up duplicate email.",
++      message_id: "<unverified-2@example.test>"
++    ))
++    assert_response :no_content
++    ActionMailer::Base.deliveries.clear
++
++    acme = Account.find_by!(subdomain: "acme")
++    unverified_customer = acme.users.find_by!(email: "newperson@example.test")
++    assert_equal false, unverified_customer.verified?
++    t_main, t_dup = acme.tickets.where(requester_id: unverified_customer.id).order(:id).to_a
++
++    # Assign t_dup to VIP/Sam with high priority before merging
++    patch "/api/v1/tickets/#{t_dup.id}",
++      params: { ticket: { priority: "high", group_id: vip_group["id"], assignee_id: sam["id"] } },
++      headers: owner_headers,
++      as: :json
++    assert_response :ok
++
++    # Merge t_dup into t_main with public source_comment containing searchable keyword and private target_comment containing secret keyword
++    post "/api/v1/tickets/#{t_dup.id}/merge",
++      params: {
++        merge: {
++          target_id: t_main.id,
++          source_comment: { body: "Merged public keyword_alpha", public: true },
++          target_comment: { body: "Merged private secret_omega", public: false }
++        }
++      },
++      headers: owner_headers,
++      as: :json
++    assert_response :ok
++    merge_source_json = json_body.fetch("source")
++    merge_target_json = json_body.fetch("target")
++
++    # Merge response matches GET /api/v1/tickets/:id exactly
++    get "/api/v1/tickets/#{t_dup.id}", headers: owner_headers
++    assert_response :ok
++    assert_equal merge_source_json, json_body.fetch("ticket")
++
++    get "/api/v1/tickets/#{t_main.id}", headers: owner_headers
++    assert_response :ok
++    assert_equal merge_target_json, json_body.fetch("ticket")
++
++    # Combined filters on GET /api/v1/tickets with status=closed
++    get "/api/v1/tickets",
++      params: {
++        status: "closed",
++        priority: "high",
++        group_id: vip_group["id"],
++        assignee_id: sam["id"],
++        requester_id: unverified_customer.id,
++        q: "keyword_alpha"
++      },
++      headers: owner_headers
++    assert_response :ok
++    assert_equal [t_dup.id], json_body.fetch("tickets").map { |t| t["id"] }
++
++    # Private merge note is NOT matched by q search
++    get "/api/v1/tickets", params: { q: "secret_omega" }, headers: owner_headers
++    assert_response :ok
++    assert_equal [], json_body.fetch("tickets")
++
++    # Cancelled account rejects merge with 403 Forbidden
++    post "/api/v1/account/cancel", headers: owner_headers
++    assert_response :ok
++
++    cancelled_owner_token = sign_in!(subdomain: "acme", email: "jo@acme.test", password: "my-first-password")
++    post "/api/v1/tickets/#{t_main.id}/merge",
++      params: { merge: { target_id: t_dup.id } },
++      headers: auth_headers("acme", cancelled_owner_token),
++      as: :json
++    assert_response :forbidden
++  end
++end
+diff --git a/tmp/storage/03/4b/034bbk34f7ivfiwu2pkhlui6pr3x b/tmp/storage/03/4b/034bbk34f7ivfiwu2pkhlui6pr3x
+new file mode 100644
+index 0000000..50d4d4d
+--- /dev/null
++++ b/tmp/storage/03/4b/034bbk34f7ivfiwu2pkhlui6pr3x
+@@ -0,0 +1,12 @@
++Date: Fri, 20 Nov 2026 17:54:01 +0000
++From: avery@example.test
++To: acme@support.example.test
++Message-ID: <58295b7b-7192-45b4-b2d9-2e956843b5e3@example.test>
++In-Reply-To: <initial-refund-77@example.test>
++Subject: Re: Refund request
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Actually opening a separate inquiry at the main support address.
+\ No newline at end of file
+diff --git a/tmp/storage/0b/5p/0b5ppapc9kao3ebrje2m3hhhiwp2 b/tmp/storage/0b/5p/0b5ppapc9kao3ebrje2m3hhhiwp2
+new file mode 100644
+index 0000000..e93a3d0
+--- /dev/null
++++ b/tmp/storage/0b/5p/0b5ppapc9kao3ebrje2m3hhhiwp2
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:08 +0000
++From: evan@example.test
++To: acme+c58f1292d900cf6f0db0df2d25d5a382@support.example.test
++Message-ID: <reply-retry-1@example.test>
++Subject: Re: Valid subject on retry
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Valid reply after empty body failure.
+\ No newline at end of file
+diff --git a/tmp/storage/0g/3m/0g3m44zp5pmjh8w77079t6r0cexp b/tmp/storage/0g/3m/0g3m44zp5pmjh8w77079t6r0cexp
+new file mode 100644
+index 0000000..b656871
+--- /dev/null
++++ b/tmp/storage/0g/3m/0g3m44zp5pmjh8w77079t6r0cexp
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:15:15 +0000
++From: Dana <dana@example.test>
++To: acme@support.example.test
++Message-ID: <retry-exact@example.test>
++Subject: Early delivery
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Sent right as Acme was being set up.
+\ No newline at end of file
+diff --git a/tmp/storage/0r/8p/0r8phjkx6vg8hz66ch6e04e1ygo8 b/tmp/storage/0r/8p/0r8phjkx6vg8hz66ch6e04e1ygo8
+new file mode 100644
+index 0000000..733237c
+--- /dev/null
++++ b/tmp/storage/0r/8p/0r8phjkx6vg8hz66ch6e04e1ygo8
+@@ -0,0 +1,7 @@
++Return-Path: <bcc.customer@example.test>
++Delivered-To: acme@support.example.test
++From: Bcc Customer <bcc.customer@example.test>
++To: undisclosed-recipients:;
++Subject: Re: Already prefixed
++
++Different message without Message-ID without Message-ID.
+diff --git a/tmp/storage/0w/3v/0w3vgrinzuo716bcm4mrencnxncd b/tmp/storage/0w/3v/0w3vgrinzuo716bcm4mrencnxncd
+new file mode 100644
+index 0000000..9df1bc6
+--- /dev/null
++++ b/tmp/storage/0w/3v/0w3vgrinzuo716bcm4mrencnxncd
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:15:15 +0000
++From: avery@example.test
++To: acme@support.example.test
++Message-ID: <933addd5-6c4a-4017-8a9a-226d6d3c0220@example.test>
++Subject: Real issue
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Real human message.
+\ No newline at end of file
+diff --git a/tmp/storage/0z/ue/0zue337jp8o71agkoys1e0wxo4mx b/tmp/storage/0z/ue/0zue337jp8o71agkoys1e0wxo4mx
+new file mode 100644
+index 0000000..2850ab5
+--- /dev/null
++++ b/tmp/storage/0z/ue/0zue337jp8o71agkoys1e0wxo4mx
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:17:16 +0000
++From: AVERY@example.test
++To: ACME+56D8D8AA41208975F455465655A99977@SUPPORT.EXAMPLE.TEST
++Message-ID: <3f16d67a-6ff3-493e-9298-bccc382e2467@example.test>
++Subject: Re: Refund request
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Last 4 digits are 4242.
+\ No newline at end of file
+diff --git a/tmp/storage/1b/6p/1b6pdthfr2yond2aw8z8lki67k1w b/tmp/storage/1b/6p/1b6pdthfr2yond2aw8z8lki67k1w
+new file mode 100644
+index 0000000..565b5b4
+--- /dev/null
++++ b/tmp/storage/1b/6p/1b6pdthfr2yond2aw8z8lki67k1w
+@@ -0,0 +1,12 @@
++Date: Fri, 20 Nov 2026 17:54:00 +0000
++From: Avery Stone <AVERY@Example.Test>
++To: ACME@support.example.test
++Message-ID: <ff5126e8-4d66-4682-8cc2-fb44e897fa3e@example.test>
++Subject: Cannot export CSV
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Clicking export shows a spinner forever.
++Second line.
+\ No newline at end of file
+diff --git a/tmp/storage/1d/tv/1dtvu8h7x1y3roboya6h2i1j3myx b/tmp/storage/1d/tv/1dtvu8h7x1y3roboya6h2i1j3myx
+new file mode 100644
+index 0000000..76f69ef
+--- /dev/null
++++ b/tmp/storage/1d/tv/1dtvu8h7x1y3roboya6h2i1j3myx
+@@ -0,0 +1,13 @@
++Date: Fri, 20 Nov 2026 18:18:33 +0000
++From: human@example.test
++To: acme@support.example.test
++Message-ID: <7eaca787-0877-4cf9-80b9-21209c710b0d@example.test>
++Subject: Explicitly human
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++Auto-Submitted: no
++X-Auto-Response-Suppress: None
++
++Hello from a compliant MUA.
+\ No newline at end of file
+diff --git a/tmp/storage/1k/us/1kusdu5jm33cvn5s3aotiae827zd b/tmp/storage/1k/us/1kusdu5jm33cvn5s3aotiae827zd
+new file mode 100644
+index 0000000..f8054bc
+--- /dev/null
++++ b/tmp/storage/1k/us/1kusdu5jm33cvn5s3aotiae827zd
+@@ -0,0 +1,7 @@
++From: Email Customer <emailer@example.test>
++To: acme@support.example.test
++Subject: Email billing issue
++Message-ID: <email-group-1@example.test>
++Content-Type: text/plain; charset=UTF-8
++
++Need help with billing invoice #999
+diff --git a/tmp/storage/1o/1n/1o1nd3e0iuhbma0hkqs4bwmc7it2 b/tmp/storage/1o/1n/1o1nd3e0iuhbma0hkqs4bwmc7it2
+new file mode 100644
+index 0000000..5d8c667
+--- /dev/null
++++ b/tmp/storage/1o/1n/1o1nd3e0iuhbma0hkqs4bwmc7it2
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:11:18 +0000
++From: evan@example.test
++To: acme+9e2dfed699ef593eda1927fdf2c154d3@support.example.test
++Message-ID: <reply-retry-1@example.test>
++Subject: Re: Valid subject on retry
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Valid reply after empty body failure.
+\ No newline at end of file
+diff --git a/tmp/storage/1s/d4/1sd4iezegrik8ygycrrggri2z5v6 b/tmp/storage/1s/d4/1sd4iezegrik8ygycrrggri2z5v6
+new file mode 100644
+index 0000000..68b29a1
+--- /dev/null
++++ b/tmp/storage/1s/d4/1sd4iezegrik8ygycrrggri2z5v6
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:07 +0000
++From: invited@example.test
++To: acme@support.example.test
++Message-ID: <invited-retry@example.test>
++Subject: Blocked while invite pending
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Hello!
+\ No newline at end of file
+diff --git a/tmp/storage/21/99/2199a2s92l629xuof6h03e6eot40 b/tmp/storage/21/99/2199a2s92l629xuof6h03e6eot40
+new file mode 100644
+index 0000000..49a3cb6
+--- /dev/null
++++ b/tmp/storage/21/99/2199a2s92l629xuof6h03e6eot40
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:31 +0000
++From: Avery <avery@example.test>
++To: acme@support.example.test
++Message-ID: <shipping-dup-3@example.test>
++Subject: Shipping delay #3
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Any news on #555?
+\ No newline at end of file
+diff --git a/tmp/storage/23/ll/23llhfitqplbdixfl916uxrxaprt b/tmp/storage/23/ll/23llhfitqplbdixfl916uxrxaprt
+new file mode 100644
+index 0000000..e2ad3da
+--- /dev/null
++++ b/tmp/storage/23/ll/23llhfitqplbdixfl916uxrxaprt
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:11:18 +0000
++From: Dana <dana@example.test>
++To: acme@support.example.test
++Message-ID: <retry-exact@example.test>
++Subject: Early delivery
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Sent right as Acme was being set up.
+\ No newline at end of file
+diff --git a/tmp/storage/29/1v/291v0x62w636kyoij1rvkfv26i42 b/tmp/storage/29/1v/291v0x62w636kyoij1rvkfv26i42
+new file mode 100644
+index 0000000..278a310
+--- /dev/null
++++ b/tmp/storage/29/1v/291v0x62w636kyoij1rvkfv26i42
+@@ -0,0 +1,7 @@
++Return-Path: <bcc.customer@example.test>
++Delivered-To: acme@support.example.test
++From: Bcc Customer <bcc.customer@example.test>
++To: undisclosed-recipients:;
++Subject: Re: Already prefixed
++
++Sent via Bcc without Message-ID.
+diff --git a/tmp/storage/2j/7s/2j7srvfjkpt9xqsj9xu9popj1630 b/tmp/storage/2j/7s/2j7srvfjkpt9xqsj9xu9popj1630
+new file mode 100644
+index 0000000..5c3c7c4
+--- /dev/null
++++ b/tmp/storage/2j/7s/2j7srvfjkpt9xqsj9xu9popj1630
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:14:43 +0000
++From: Avery <avery@example.test>
++To: acme@support.example.test
++Message-ID: <shipping-dup-1@example.test>
++Subject: Shipping delay #1
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Where is my order?
+\ No newline at end of file
+diff --git a/tmp/storage/2o/tc/2otc451znxqj9o1b0jhzvnt574m2 b/tmp/storage/2o/tc/2otc451znxqj9o1b0jhzvnt574m2
+new file mode 100644
+index 0000000..37f5390
+--- /dev/null
++++ b/tmp/storage/2o/tc/2otc451znxqj9o1b0jhzvnt574m2
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:15:15 +0000
++From: avery@example.test
++To: acme@support.example.test
++Message-ID: <bb8fa63a-6807-4fb7-b97c-ccbf8c89b377@example.test>
++Subject: Second issue
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Another question.
+\ No newline at end of file
+diff --git a/tmp/storage/2p/fc/2pfcmrzd2wy4ijtu8x1xmtqh9dgt b/tmp/storage/2p/fc/2pfcmrzd2wy4ijtu8x1xmtqh9dgt
+new file mode 100644
+index 0000000..278a310
+--- /dev/null
++++ b/tmp/storage/2p/fc/2pfcmrzd2wy4ijtu8x1xmtqh9dgt
+@@ -0,0 +1,7 @@
++Return-Path: <bcc.customer@example.test>
++Delivered-To: acme@support.example.test
++From: Bcc Customer <bcc.customer@example.test>
++To: undisclosed-recipients:;
++Subject: Re: Already prefixed
++
++Sent via Bcc without Message-ID.
+diff --git a/tmp/storage/2s/yl/2sylj5n2l2jec1nlrxva9pvlq4ky b/tmp/storage/2s/yl/2sylj5n2l2jec1nlrxva9pvlq4ky
+new file mode 100644
+index 0000000..278a310
+--- /dev/null
++++ b/tmp/storage/2s/yl/2sylj5n2l2jec1nlrxva9pvlq4ky
+@@ -0,0 +1,7 @@
++Return-Path: <bcc.customer@example.test>
++Delivered-To: acme@support.example.test
++From: Bcc Customer <bcc.customer@example.test>
++To: undisclosed-recipients:;
++Subject: Re: Already prefixed
++
++Sent via Bcc without Message-ID.
+diff --git a/tmp/storage/2x/5w/2x5wn9z2743gy7a60xurnitrmjcf b/tmp/storage/2x/5w/2x5wn9z2743gy7a60xurnitrmjcf
+new file mode 100644
+index 0000000..84d2c7d
+--- /dev/null
++++ b/tmp/storage/2x/5w/2x5wn9z2743gy7a60xurnitrmjcf
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:11:19 +0000
++From: invited@example.test
++To: acme@support.example.test
++Message-ID: <suspended-retry@example.test>
++Subject: While suspended
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Blocked while suspended.
+\ No newline at end of file
+diff --git a/tmp/storage/2y/vz/2yvzunlmtgpn1owhkjrge7urt4hn b/tmp/storage/2y/vz/2yvzunlmtgpn1owhkjrge7urt4hn
+new file mode 100644
+index 0000000..4443ee5
+--- /dev/null
++++ b/tmp/storage/2y/vz/2yvzunlmtgpn1owhkjrge7urt4hn
+@@ -0,0 +1,12 @@
++Date: Fri, 20 Nov 2026 18:14:48 +0000
++From: Avery Stone <AVERY@Example.Test>
++To: ACME@support.example.test
++Message-ID: <48b19e95-7a8e-4359-93af-7530e202235c@example.test>
++Subject: Cannot export CSV
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Clicking export shows a spinner forever.
++Second line.
+\ No newline at end of file
+diff --git a/tmp/storage/3r/81/3r81ow10wge02gbseiuo5tih83ex b/tmp/storage/3r/81/3r81ow10wge02gbseiuo5tih83ex
+new file mode 100644
+index 0000000..3a85c8d
+--- /dev/null
++++ b/tmp/storage/3r/81/3r81ow10wge02gbseiuo5tih83ex
+@@ -0,0 +1,24 @@
++Date: Fri, 20 Nov 2026 18:11:19 +0000
++From: html.only@example.test
++To: acme@support.example.test
++Message-ID: <html-only-retry@example.test>
++Subject: HTML only
++MIME-Version: 1.0
++Content-Type: multipart/alternative;
++ boundary="--==_mimepart_6b008d4726dd4_194c950710ca"
++Content-Transfer-Encoding: 7bit
++
++
++----==_mimepart_6b008d4726dd4_194c950710ca
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Added plain-text fallback!
++----==_mimepart_6b008d4726dd4_194c950710ca
++Content-Type: text/html;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++<p>Only HTML</p>
++----==_mimepart_6b008d4726dd4_194c950710ca--
+diff --git a/tmp/storage/3t/iy/3tiyply4diuuvcob8dr5i0znexxb b/tmp/storage/3t/iy/3tiyply4diuuvcob8dr5i0znexxb
+new file mode 100644
+index 0000000..278a310
+--- /dev/null
++++ b/tmp/storage/3t/iy/3tiyply4diuuvcob8dr5i0znexxb
+@@ -0,0 +1,7 @@
++Return-Path: <bcc.customer@example.test>
++Delivered-To: acme@support.example.test
++From: Bcc Customer <bcc.customer@example.test>
++To: undisclosed-recipients:;
++Subject: Re: Already prefixed
++
++Sent via Bcc without Message-ID.
+diff --git a/tmp/storage/3w/6g/3w6g5ehr12kedsyz89qaxaurgdie b/tmp/storage/3w/6g/3w6g5ehr12kedsyz89qaxaurgdie
+new file mode 100644
+index 0000000..f8054bc
+--- /dev/null
++++ b/tmp/storage/3w/6g/3w6g5ehr12kedsyz89qaxaurgdie
+@@ -0,0 +1,7 @@
++From: Email Customer <emailer@example.test>
++To: acme@support.example.test
++Subject: Email billing issue
++Message-ID: <email-group-1@example.test>
++Content-Type: text/plain; charset=UTF-8
++
++Need help with billing invoice #999
+diff --git a/tmp/storage/41/a0/41a0rvxm5kia0yahhpy7clyvuswm b/tmp/storage/41/a0/41a0rvxm5kia0yahhpy7clyvuswm
+new file mode 100644
+index 0000000..5c74c0c
+--- /dev/null
++++ b/tmp/storage/41/a0/41a0rvxm5kia0yahhpy7clyvuswm
+@@ -0,0 +1,7 @@
++From: Email Customer <emailer@example.test>
++To: acme+466599a06cd9a51b6e28b41415eb575e@support.example.test
++Subject: Re: Email billing issue
++Message-ID: <email-group-2@example.test>
++Content-Type: text/plain; charset=UTF-8
++
++Confirmed!
+diff --git a/tmp/storage/48/oe/48oer5dvmhpfvj7jvmr80icjs3a7 b/tmp/storage/48/oe/48oer5dvmhpfvj7jvmr80icjs3a7
+new file mode 100644
+index 0000000..27811ce
+--- /dev/null
++++ b/tmp/storage/48/oe/48oer5dvmhpfvj7jvmr80icjs3a7
+@@ -0,0 +1,7 @@
++From: Email Customer <emailer@example.test>
++To: acme+b1b627a1f8beef45171b1b2ee7adf24f@support.example.test
++Subject: Re: Email billing issue
++Message-ID: <email-group-2@example.test>
++Content-Type: text/plain; charset=UTF-8
++
++Confirmed!
+diff --git a/tmp/storage/4c/y1/4cy1ru35dw4krx8ktsfixsgv0hln b/tmp/storage/4c/y1/4cy1ru35dw4krx8ktsfixsgv0hln
+new file mode 100644
+index 0000000..bfa806f
+--- /dev/null
++++ b/tmp/storage/4c/y1/4cy1ru35dw4krx8ktsfixsgv0hln
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:33 +0000
++From: evan@example.test
++To: acme+ea4598aa8086f5d31822d25a1a4bd023@support.example.test
++Message-ID: <reply-retry-1@example.test>
++Subject: Re: Valid subject on retry
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Valid reply after empty body failure.
+\ No newline at end of file
+diff --git a/tmp/storage/4h/vv/4hvvktnp931laco2xz12pvj8vctt b/tmp/storage/4h/vv/4hvvktnp931laco2xz12pvj8vctt
+new file mode 100644
+index 0000000..80d22a2
+--- /dev/null
++++ b/tmp/storage/4h/vv/4hvvktnp931laco2xz12pvj8vctt
+@@ -0,0 +1,24 @@
++Date: Fri, 20 Nov 2026 18:18:08 +0000
++From: bare.sender@example.test
++To: acme@support.example.test
++Message-ID: <6b008ee05f0d3_19ca95013542@220a2282e75b.mail>
++Subject: Multipart question
++MIME-Version: 1.0
++Content-Type: multipart/alternative;
++ boundary="--==_mimepart_6b008ee05ee51_19ca95013450"
++Content-Transfer-Encoding: 7bit
++
++
++----==_mimepart_6b008ee05ee51_19ca95013450
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Plain text version of the message.
++----==_mimepart_6b008ee05ee51_19ca95013450
++Content-Type: text/html;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++<h1>HTML version</h1><p>Should not be used.</p>
++----==_mimepart_6b008ee05ee51_19ca95013450--
+diff --git a/tmp/storage/4j/t5/4jt5qddx5qgzl25tmhze0tkorw2s b/tmp/storage/4j/t5/4jt5qddx5qgzl25tmhze0tkorw2s
+new file mode 100644
+index 0000000..b656871
+--- /dev/null
++++ b/tmp/storage/4j/t5/4jt5qddx5qgzl25tmhze0tkorw2s
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:15:15 +0000
++From: Dana <dana@example.test>
++To: acme@support.example.test
++Message-ID: <retry-exact@example.test>
++Subject: Early delivery
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Sent right as Acme was being set up.
+\ No newline at end of file
+diff --git a/tmp/storage/4r/cy/4rcyytc1356068zk34w15f0t38yb b/tmp/storage/4r/cy/4rcyytc1356068zk34w15f0t38yb
+new file mode 100644
+index 0000000..876b6cc
+--- /dev/null
++++ b/tmp/storage/4r/cy/4rcyytc1356068zk34w15f0t38yb
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 17:54:00 +0000
++From: Dana <dana@example.test>
++To: acme@support.example.test
++Message-ID: <retry-exact@example.test>
++Subject: Early delivery
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Sent right as Acme was being set up.
+\ No newline at end of file
+diff --git a/tmp/storage/50/t4/50t482r0qxyw66xjzlls5mrpr29e b/tmp/storage/50/t4/50t482r0qxyw66xjzlls5mrpr29e
+new file mode 100644
+index 0000000..278a310
+--- /dev/null
++++ b/tmp/storage/50/t4/50t482r0qxyw66xjzlls5mrpr29e
+@@ -0,0 +1,7 @@
++Return-Path: <bcc.customer@example.test>
++Delivered-To: acme@support.example.test
++From: Bcc Customer <bcc.customer@example.test>
++To: undisclosed-recipients:;
++Subject: Re: Already prefixed
++
++Sent via Bcc without Message-ID.
+diff --git a/tmp/storage/55/my/55mykeg9jdjcmm0aqy1mmw4sek8d b/tmp/storage/55/my/55mykeg9jdjcmm0aqy1mmw4sek8d
+new file mode 100644
+index 0000000..c62e7fb
+--- /dev/null
++++ b/tmp/storage/55/my/55mykeg9jdjcmm0aqy1mmw4sek8d
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:31 +0000
++From: avery@example.test
++To: acme+540de26316ea7a4260f1e0d698507d1c@support.example.test
++Message-ID: <reply-to-surviving-main@example.test>
++Subject: Re: Shipping delay main
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Replying on the surviving thread!
+\ No newline at end of file
+diff --git a/tmp/storage/59/2f/592fy9b5oqgfayndrxxfv7gk2quc b/tmp/storage/59/2f/592fy9b5oqgfayndrxxfv7gk2quc
+new file mode 100644
+index 0000000..f4c3811
+--- /dev/null
++++ b/tmp/storage/59/2f/592fy9b5oqgfayndrxxfv7gk2quc
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:07 +0000
++From: Avery <avery@example.test>
++To: acme@support.example.test
++Message-ID: <initial-refund-77@example.test>
++Subject: Refund request
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Can I get a refund for order #77?
+\ No newline at end of file
+diff --git a/tmp/storage/5e/ow/5eow2y9gq2utwwszk697ohlnlxbx b/tmp/storage/5e/ow/5eow2y9gq2utwwszk697ohlnlxbx
+new file mode 100644
+index 0000000..12d5baa
+--- /dev/null
++++ b/tmp/storage/5e/ow/5eow2y9gq2utwwszk697ohlnlxbx
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:33 +0000
++From: Avery Stone <avery@example.test>
++To: acme@support.example.test
++Message-ID: <auth-check-1@example.test>
++Subject: Need help with order
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++My package arrived damaged.
+\ No newline at end of file
+diff --git a/tmp/storage/5i/kj/5ikj9yygwc96w6ka9v3p5vxul4xw b/tmp/storage/5i/kj/5ikj9yygwc96w6ka9v3p5vxul4xw
+new file mode 100644
+index 0000000..c42fbab
+--- /dev/null
++++ b/tmp/storage/5i/kj/5ikj9yygwc96w6ka9v3p5vxul4xw
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:03 +0000
++From: New Person <newperson@example.test>
++To: acme@support.example.test
++Message-ID: <unverified-1@example.test>
++Subject: First unverified email
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Initial question from unverified user.
+\ No newline at end of file
+diff --git a/tmp/storage/5z/99/5z99ovdgdkzu6ch9p7p9leyn7wib b/tmp/storage/5z/99/5z99ovdgdkzu6ch9p7p9leyn7wib
+new file mode 100644
+index 0000000..e14cd04
+--- /dev/null
++++ b/tmp/storage/5z/99/5z99ovdgdkzu6ch9p7p9leyn7wib
+@@ -0,0 +1,12 @@
++Received: from mx2.example.test
++Date: Fri, 20 Nov 2026 18:15:16 +0000
++From: evan@example.test
++To: acme+dc526c8d5c6925a843683f5601ac5e65@support.example.test
++Message-ID: <reply-retry-1@example.test>
++Subject: Re: Valid subject on retry
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Valid reply after empty body failure.
+\ No newline at end of file
+diff --git a/tmp/storage/65/df/65dfd2eiyh2ueqsfwz5bc9vhvd3n b/tmp/storage/65/df/65dfd2eiyh2ueqsfwz5bc9vhvd3n
+new file mode 100644
+index 0000000..455e237
+--- /dev/null
++++ b/tmp/storage/65/df/65dfd2eiyh2ueqsfwz5bc9vhvd3n
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:14:48 +0000
++From: evan@example.test
++To: acme+8a5b9f5dbc8a85ff724756b5b6aa2f48@support.example.test
++Message-ID: <reply-retry-1@example.test>
++Subject: Re: Valid subject on retry
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Valid reply after empty body failure.
+\ No newline at end of file
+diff --git a/tmp/storage/67/33/6733w5bilcjnlynuqnjf7fsbn4tx b/tmp/storage/67/33/6733w5bilcjnlynuqnjf7fsbn4tx
+new file mode 100644
+index 0000000..0dd2d9c
+--- /dev/null
++++ b/tmp/storage/67/33/6733w5bilcjnlynuqnjf7fsbn4tx
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:14:48 +0000
++From: avery@example.test
++To: acme@support.example.test
++Message-ID: <904b6173-d769-4549-ada6-45742caa23c3@example.test>
++Subject: Before cancel
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Testing purge.
+\ No newline at end of file
+diff --git a/tmp/storage/6t/om/6tom4o32dwio5y42xmwd1777nhj9 b/tmp/storage/6t/om/6tom4o32dwio5y42xmwd1777nhj9
+new file mode 100644
+index 0000000..f3cad94
+--- /dev/null
++++ b/tmp/storage/6t/om/6tom4o32dwio5y42xmwd1777nhj9
+@@ -0,0 +1,12 @@
++Date: Fri, 20 Nov 2026 18:15:15 +0000
++From: Avery Stone <AVERY@Example.Test>
++To: ACME@support.example.test
++Message-ID: <8fa5d7d1-7b88-4483-858b-fe59511633e9@example.test>
++Subject: Cannot export CSV
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Clicking export shows a spinner forever.
++Second line.
+\ No newline at end of file
+diff --git a/tmp/storage/6v/6a/6v6a6x7zqgcx9azri0tvnuw5wgjz b/tmp/storage/6v/6a/6v6a6x7zqgcx9azri0tvnuw5wgjz
+new file mode 100644
+index 0000000..b84ce66
+--- /dev/null
++++ b/tmp/storage/6v/6a/6v6a6x7zqgcx9azri0tvnuw5wgjz
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 17:54:01 +0000
++From: invited@example.test
++To: acme@support.example.test
++Message-ID: <suspended-retry@example.test>
++Subject: While suspended
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Blocked while suspended.
+\ No newline at end of file
+diff --git a/tmp/storage/7c/cd/7ccdicrqo4qwd0p3ekmsg9mmvcar b/tmp/storage/7c/cd/7ccdicrqo4qwd0p3ekmsg9mmvcar
+new file mode 100644
+index 0000000..876b6cc
+--- /dev/null
++++ b/tmp/storage/7c/cd/7ccdicrqo4qwd0p3ekmsg9mmvcar
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 17:54:00 +0000
++From: Dana <dana@example.test>
++To: acme@support.example.test
++Message-ID: <retry-exact@example.test>
++Subject: Early delivery
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Sent right as Acme was being set up.
+\ No newline at end of file
+diff --git a/tmp/storage/7e/oa/7eoangk7wmjjus8gtc8c3ql4airm b/tmp/storage/7e/oa/7eoangk7wmjjus8gtc8c3ql4airm
+new file mode 100644
+index 0000000..e242d6e
+--- /dev/null
++++ b/tmp/storage/7e/oa/7eoangk7wmjjus8gtc8c3ql4airm
+@@ -0,0 +1,24 @@
++Date: Fri, 20 Nov 2026 18:14:47 +0000
++From: html.only@example.test
++To: acme@support.example.test
++Message-ID: <html-only-retry@example.test>
++Subject: HTML only
++MIME-Version: 1.0
++Content-Type: multipart/alternative;
++ boundary="--==_mimepart_6b008e178051b_1984950108821"
++Content-Transfer-Encoding: 7bit
++
++
++----==_mimepart_6b008e178051b_1984950108821
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Added plain-text fallback!
++----==_mimepart_6b008e178051b_1984950108821
++Content-Type: text/html;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++<p>Only HTML</p>
++----==_mimepart_6b008e178051b_1984950108821--
+diff --git a/tmp/storage/7i/9s/7i9s1mdp60wo2j911glfm6nwr0gs b/tmp/storage/7i/9s/7i9s1mdp60wo2j911glfm6nwr0gs
+new file mode 100644
+index 0000000..733237c
+--- /dev/null
++++ b/tmp/storage/7i/9s/7i9s1mdp60wo2j911glfm6nwr0gs
+@@ -0,0 +1,7 @@
++Return-Path: <bcc.customer@example.test>
++Delivered-To: acme@support.example.test
++From: Bcc Customer <bcc.customer@example.test>
++To: undisclosed-recipients:;
++Subject: Re: Already prefixed
++
++Different message without Message-ID without Message-ID.
+diff --git a/tmp/storage/7j/ph/7jphrdrqcbzlin5yzeoyprijvrvg b/tmp/storage/7j/ph/7jphrdrqcbzlin5yzeoyprijvrvg
+new file mode 100644
+index 0000000..dc2b810
+--- /dev/null
++++ b/tmp/storage/7j/ph/7jphrdrqcbzlin5yzeoyprijvrvg
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:15:15 +0000
++From: avery@example.test
++To: acme@support.example.test
++Message-ID: <ad7ae350-713f-40fd-abff-c8546662caaa@example.test>
++Subject: Before cancel
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Testing purge.
+\ No newline at end of file
+diff --git a/tmp/storage/7o/jm/7ojm8rr98tqtijm7vl8rga9zcxkv b/tmp/storage/7o/jm/7ojm8rr98tqtijm7vl8rga9zcxkv
+new file mode 100644
+index 0000000..0f3028b
+--- /dev/null
++++ b/tmp/storage/7o/jm/7ojm8rr98tqtijm7vl8rga9zcxkv
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 17:54:00 +0000
++From: avery@example.test
++To: acme@support.example.test
++Message-ID: <d9d2df74-5210-43bd-b9f7-7cf5b2309c43@example.test>
++Subject: Second issue
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Another question.
+\ No newline at end of file
+diff --git a/tmp/storage/86/it/86itqwfc00xy6mu3n7ak41gyb7we b/tmp/storage/86/it/86itqwfc00xy6mu3n7ak41gyb7we
+new file mode 100644
+index 0000000..733237c
+--- /dev/null
++++ b/tmp/storage/86/it/86itqwfc00xy6mu3n7ak41gyb7we
+@@ -0,0 +1,7 @@
++Return-Path: <bcc.customer@example.test>
++Delivered-To: acme@support.example.test
++From: Bcc Customer <bcc.customer@example.test>
++To: undisclosed-recipients:;
++Subject: Re: Already prefixed
++
++Different message without Message-ID without Message-ID.
+diff --git a/tmp/storage/88/pz/88pz321s8onchi9djolotu4whx63 b/tmp/storage/88/pz/88pz321s8onchi9djolotu4whx63
+new file mode 100644
+index 0000000..ddb9f81
+--- /dev/null
++++ b/tmp/storage/88/pz/88pz321s8onchi9djolotu4whx63
+@@ -0,0 +1,26 @@
++Date: Fri, 20 Nov 2026 17:54:01 +0000
++From: attach.user@example.test
++To: acme@support.example.test
++Message-ID: <6b00893923400_17509507672@220a2282e75b.mail>
++Subject: With log attachment
++MIME-Version: 1.0
++Content-Type: multipart/mixed;
++ boundary="--==_mimepart_6b008939230d6_17509507529"
++Content-Transfer-Encoding: 7bit
++
++
++----==_mimepart_6b008939230d6_17509507529
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Inline plain-text body.
++----==_mimepart_6b008939230d6_17509507529
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++Content-Disposition: attachment;
++ filename=debug.txt
++
++ATTACHMENT CONTENT DO NOT USE
++----==_mimepart_6b008939230d6_17509507529--
+diff --git a/tmp/storage/8g/ey/8geyl6q78p8n1ld9w9lxlsyfmfm0 b/tmp/storage/8g/ey/8geyl6q78p8n1ld9w9lxlsyfmfm0
+new file mode 100644
+index 0000000..d9e9537
+--- /dev/null
++++ b/tmp/storage/8g/ey/8geyl6q78p8n1ld9w9lxlsyfmfm0
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:15:14 +0000
++From: invited@example.test
++To: acme@support.example.test
++Message-ID: <invited-retry@example.test>
++Subject: Blocked while invite pending
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Hello!
+\ No newline at end of file
+diff --git a/tmp/storage/8h/dl/8hdlggyvatipwxv1fuk96a0pacpb b/tmp/storage/8h/dl/8hdlggyvatipwxv1fuk96a0pacpb
+new file mode 100644
+index 0000000..1a70854
+--- /dev/null
++++ b/tmp/storage/8h/dl/8hdlggyvatipwxv1fuk96a0pacpb
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:31 +0000
++From: Avery <avery@example.test>
++To: acme@support.example.test
++Message-ID: <shipping-main-2@example.test>
++Subject: Shipping delay main
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Order #555 tracking has not updated.
+\ No newline at end of file
+diff --git a/tmp/storage/8x/6b/8x6bymq1bk7yd8lcojjpkqrfvm5s b/tmp/storage/8x/6b/8x6bymq1bk7yd8lcojjpkqrfvm5s
+new file mode 100644
+index 0000000..8a290e6
+--- /dev/null
++++ b/tmp/storage/8x/6b/8x6bymq1bk7yd8lcojjpkqrfvm5s
+@@ -0,0 +1,26 @@
++Date: Fri, 20 Nov 2026 18:15:14 +0000
++From: attach.user@example.test
++To: acme@support.example.test
++Message-ID: <6b008e329cbe4_1996950711dc@220a2282e75b.mail>
++Subject: With log attachment
++MIME-Version: 1.0
++Content-Type: multipart/mixed;
++ boundary="--==_mimepart_6b008e329bc8c_199695071062"
++Content-Transfer-Encoding: 7bit
++
++
++----==_mimepart_6b008e329bc8c_199695071062
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Inline plain-text body.
++----==_mimepart_6b008e329bc8c_199695071062
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++Content-Disposition: attachment;
++ filename=debug.txt
++
++ATTACHMENT CONTENT DO NOT USE
++----==_mimepart_6b008e329bc8c_199695071062--
+diff --git a/tmp/storage/8y/g1/8yg1lwlwsb5mzkrzigxf111ywqcr b/tmp/storage/8y/g1/8yg1lwlwsb5mzkrzigxf111ywqcr
+new file mode 100644
+index 0000000..733237c
+--- /dev/null
++++ b/tmp/storage/8y/g1/8yg1lwlwsb5mzkrzigxf111ywqcr
+@@ -0,0 +1,7 @@
++Return-Path: <bcc.customer@example.test>
++Delivered-To: acme@support.example.test
++From: Bcc Customer <bcc.customer@example.test>
++To: undisclosed-recipients:;
++Subject: Re: Already prefixed
++
++Different message without Message-ID without Message-ID.
+diff --git a/tmp/storage/8y/y5/8yy5d4vaofu6r6qgp9cexxllmz5u b/tmp/storage/8y/y5/8yy5d4vaofu6r6qgp9cexxllmz5u
+new file mode 100644
+index 0000000..b0eff88
+--- /dev/null
++++ b/tmp/storage/8y/y5/8yy5d4vaofu6r6qgp9cexxllmz5u
+@@ -0,0 +1,24 @@
++Date: Fri, 20 Nov 2026 17:54:01 +0000
++From: html.only@example.test
++To: acme@support.example.test
++Message-ID: <html-only-retry@example.test>
++Subject: HTML only
++MIME-Version: 1.0
++Content-Type: multipart/alternative;
++ boundary="--==_mimepart_6b0089392f711_175095079d1"
++Content-Transfer-Encoding: 7bit
++
++
++----==_mimepart_6b0089392f711_175095079d1
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Added plain-text fallback!
++----==_mimepart_6b0089392f711_175095079d1
++Content-Type: text/html;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++<p>Only HTML</p>
++----==_mimepart_6b0089392f711_175095079d1--
+diff --git a/tmp/storage/91/gz/91gzprzjkzvmreixuejev67z4uva b/tmp/storage/91/gz/91gzprzjkzvmreixuejev67z4uva
+new file mode 100644
+index 0000000..765c2bf
+--- /dev/null
++++ b/tmp/storage/91/gz/91gzprzjkzvmreixuejev67z4uva
+@@ -0,0 +1,24 @@
++Date: Fri, 20 Nov 2026 18:18:34 +0000
++From: bare.sender@example.test
++To: acme@support.example.test
++Message-ID: <6b008efabde81_19f795081577@220a2282e75b.mail>
++Subject: Multipart question
++MIME-Version: 1.0
++Content-Type: multipart/alternative;
++ boundary="--==_mimepart_6b008efabdbb7_19f795081478"
++Content-Transfer-Encoding: 7bit
++
++
++----==_mimepart_6b008efabdbb7_19f795081478
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Plain text version of the message.
++----==_mimepart_6b008efabdbb7_19f795081478
++Content-Type: text/html;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++<h1>HTML version</h1><p>Should not be used.</p>
++----==_mimepart_6b008efabdbb7_19f795081478--
+diff --git a/tmp/storage/93/9a/939ayl6gtbgmlfwtzyzxgvbx2vlk b/tmp/storage/93/9a/939ayl6gtbgmlfwtzyzxgvbx2vlk
+new file mode 100644
+index 0000000..9c582a6
+--- /dev/null
++++ b/tmp/storage/93/9a/939ayl6gtbgmlfwtzyzxgvbx2vlk
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 17:54:01 +0000
++From: invited@example.test
++To: acme@support.example.test
++Message-ID: <invited-retry@example.test>
++Subject: Blocked while invite pending
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Hello!
+\ No newline at end of file
+diff --git a/tmp/storage/9l/h6/9lh6h7x310wc8r20w7dyo6025x8w b/tmp/storage/9l/h6/9lh6h7x310wc8r20w7dyo6025x8w
+new file mode 100644
+index 0000000..9e93006
+--- /dev/null
++++ b/tmp/storage/9l/h6/9lh6h7x310wc8r20w7dyo6025x8w
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:15:16 +0000
++From: Avery Stone <avery@example.test>
++To: acme@support.example.test
++Message-ID: <auth-check-1@example.test>
++Subject: Need help with order
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++My package arrived damaged.
+\ No newline at end of file
+diff --git a/tmp/storage/9t/lx/9tlxh1lc4tcuiuu4kntqpltccp10 b/tmp/storage/9t/lx/9tlxh1lc4tcuiuu4kntqpltccp10
+new file mode 100644
+index 0000000..b983b96
+--- /dev/null
++++ b/tmp/storage/9t/lx/9tlxh1lc4tcuiuu4kntqpltccp10
+@@ -0,0 +1,24 @@
++Date: Fri, 20 Nov 2026 17:54:01 +0000
++From: bare.sender@example.test
++To: acme@support.example.test
++Message-ID: <6b008939e8355_17509509913@220a2282e75b.mail>
++Subject: Multipart question
++MIME-Version: 1.0
++Content-Type: multipart/alternative;
++ boundary="--==_mimepart_6b008939e7fc9_1750950986"
++Content-Transfer-Encoding: 7bit
++
++
++----==_mimepart_6b008939e7fc9_1750950986
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Plain text version of the message.
++----==_mimepart_6b008939e7fc9_1750950986
++Content-Type: text/html;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++<h1>HTML version</h1><p>Should not be used.</p>
++----==_mimepart_6b008939e7fc9_1750950986--
+diff --git a/tmp/storage/9w/dq/9wdqhysyh9tpgh14q03uftatrpyq b/tmp/storage/9w/dq/9wdqhysyh9tpgh14q03uftatrpyq
+new file mode 100644
+index 0000000..cf55cc3
+--- /dev/null
++++ b/tmp/storage/9w/dq/9wdqhysyh9tpgh14q03uftatrpyq
+@@ -0,0 +1,12 @@
++Date: Fri, 20 Nov 2026 18:14:48 +0000
++From: pat@example.test
++To: boss@customer.test
++Cc: Acme Support <acme@support.example.test>
++Message-ID: <7367735e-8223-4275-9760-b15819da0757@example.test>
++Subject: CC support test
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Looping in Acme support.
+\ No newline at end of file
+diff --git a/tmp/storage/a7/pf/a7pfs2iahkn3bbx99dvbopcvcu8u b/tmp/storage/a7/pf/a7pfs2iahkn3bbx99dvbopcvcu8u
+new file mode 100644
+index 0000000..a93bfba
+--- /dev/null
++++ b/tmp/storage/a7/pf/a7pfs2iahkn3bbx99dvbopcvcu8u
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 17:54:00 +0000
++From: Evan <evan@example.test>
++To: acme@support.example.test
++Message-ID: <retry-blank-body@example.test>
++Subject: Blank body first attempt
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Now the plain-text body is present!
+\ No newline at end of file
+diff --git a/tmp/storage/ai/d6/aid6mf7oumxa2vux7q9lcfk8w2w2 b/tmp/storage/ai/d6/aid6mf7oumxa2vux7q9lcfk8w2w2
+new file mode 100644
+index 0000000..7716616
+--- /dev/null
++++ b/tmp/storage/ai/d6/aid6mf7oumxa2vux7q9lcfk8w2w2
+@@ -0,0 +1,12 @@
++Date: Fri, 20 Nov 2026 18:20:16 +0000
++From: avery@example.test
++To: acme+56d8d8aa41208975f455465655a99977@support.example.test
++Cc: acme@support.example.test
++Message-ID: <8202b378-8243-4fc1-af5b-f1bca472ddb7@example.test>
++Subject: Re: Refund request
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Wait, I only received a partial refund.
+\ No newline at end of file
+diff --git a/tmp/storage/aj/8x/aj8xaysudidn9zsakm7b3us6x5ih b/tmp/storage/aj/8x/aj8xaysudidn9zsakm7b3us6x5ih
+new file mode 100644
+index 0000000..377d548
+--- /dev/null
++++ b/tmp/storage/aj/8x/aj8xaysudidn9zsakm7b3us6x5ih
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:11:18 +0000
++From: Avery <avery@example.test>
++To: acme@support.example.test
++Message-ID: <initial-refund-77@example.test>
++Subject: Refund request
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Can I get a refund for order #77?
+\ No newline at end of file
+diff --git a/tmp/storage/aq/bg/aqbgw539jw5iv4udsluqfogxzdhk b/tmp/storage/aq/bg/aqbgw539jw5iv4udsluqfogxzdhk
+new file mode 100644
+index 0000000..b2d0ad0
+--- /dev/null
++++ b/tmp/storage/aq/bg/aqbgw539jw5iv4udsluqfogxzdhk
+@@ -0,0 +1,7 @@
++From: Email Customer <emailer@example.test>
++To: acme+ec49da919c023f1087ccb493512257d2@support.example.test
++Subject: Re: Email billing issue
++Message-ID: <email-group-2@example.test>
++Content-Type: text/plain; charset=UTF-8
++
++Confirmed!
+diff --git a/tmp/storage/at/or/atorvj51kjv9shhlapyennz3b6pd b/tmp/storage/at/or/atorvj51kjv9shhlapyennz3b6pd
+new file mode 100644
+index 0000000..093dbc5
+--- /dev/null
++++ b/tmp/storage/at/or/atorvj51kjv9shhlapyennz3b6pd
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 17:56:01 +0000
++From: AVERY@example.test
++To: ACME+80B5AAEE279BE33BD13B325C08365ECE@SUPPORT.EXAMPLE.TEST
++Message-ID: <673ff2e6-31db-4705-98b9-b0eb34e55e90@example.test>
++Subject: Re: Refund request
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Last 4 digits are 4242.
+\ No newline at end of file
+diff --git a/tmp/storage/au/cb/aucbzcv0xlma4qlzajz5scvz72in b/tmp/storage/au/cb/aucbzcv0xlma4qlzajz5scvz72in
+new file mode 100644
+index 0000000..92f3807
+--- /dev/null
++++ b/tmp/storage/au/cb/aucbzcv0xlma4qlzajz5scvz72in
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:08 +0000
++From: evan@example.test
++To: acme@support.example.test
++Message-ID: <retry-blank-subj@example.test>
++Subject: Valid subject on retry
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Body without subject
+\ No newline at end of file
+diff --git a/tmp/storage/b8/z8/b8z8bo6tb8kmdjtte60lxwlsfnlx b/tmp/storage/b8/z8/b8z8bo6tb8kmdjtte60lxwlsfnlx
+new file mode 100644
+index 0000000..393b922
+--- /dev/null
++++ b/tmp/storage/b8/z8/b8z8bo6tb8kmdjtte60lxwlsfnlx
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 17:54:00 +0000
++From: Avery Stone <avery@example.test>
++To: acme@support.example.test
++Message-ID: <auth-check-1@example.test>
++Subject: Need help with order
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++My package arrived damaged.
+\ No newline at end of file
+diff --git a/tmp/storage/bd/rp/bdrptdhi67t92kk1p72og8n8j6q2 b/tmp/storage/bd/rp/bdrptdhi67t92kk1p72og8n8j6q2
+new file mode 100644
+index 0000000..9d5f9f1
+--- /dev/null
++++ b/tmp/storage/bd/rp/bdrptdhi67t92kk1p72og8n8j6q2
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:14:43 +0000
++From: avery@example.test
++To: acme+b0671a743d3625122eb03baea98ae649@support.example.test
++Message-ID: <reply-to-surviving-main@example.test>
++Subject: Re: Shipping delay main
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Replying on the surviving thread!
+\ No newline at end of file
+diff --git a/tmp/storage/be/m0/bem03cvrqjizgcf9ju29g3ijt06d b/tmp/storage/be/m0/bem03cvrqjizgcf9ju29g3ijt06d
+new file mode 100644
+index 0000000..d8de6c1
+--- /dev/null
++++ b/tmp/storage/be/m0/bem03cvrqjizgcf9ju29g3ijt06d
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:07 +0000
++From: invited@example.test
++To: acme@support.example.test
++Message-ID: <suspended-retry@example.test>
++Subject: While suspended
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Blocked while suspended.
+\ No newline at end of file
+diff --git a/tmp/storage/bw/s9/bws92ydiz3hmq12wrwwzvkxixt77 b/tmp/storage/bw/s9/bws92ydiz3hmq12wrwwzvkxixt77
+new file mode 100644
+index 0000000..7c821ed
+--- /dev/null
++++ b/tmp/storage/bw/s9/bws92ydiz3hmq12wrwwzvkxixt77
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:03 +0000
++From: avery@example.test
++To: acme+171e378c57129d2eb2e4665e94af26ed@support.example.test
++Message-ID: <reply-to-surviving-main@example.test>
++Subject: Re: Shipping delay main
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Replying on the surviving thread!
+\ No newline at end of file
+diff --git a/tmp/storage/c8/xy/c8xyf42fofdgy0l9eeo1l484ctlg b/tmp/storage/c8/xy/c8xyf42fofdgy0l9eeo1l484ctlg
+new file mode 100644
+index 0000000..8872ba0
+--- /dev/null
++++ b/tmp/storage/c8/xy/c8xyf42fofdgy0l9eeo1l484ctlg
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:15:15 +0000
++From: Evan <evan@example.test>
++To: acme@support.example.test
++Message-ID: <retry-blank-body@example.test>
++Subject: Blank body first attempt
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Now the plain-text body is present!
+\ No newline at end of file
+diff --git a/tmp/storage/ci/2x/ci2x6r6fj19av1dahr4fbwblug3p b/tmp/storage/ci/2x/ci2x6r6fj19av1dahr4fbwblug3p
+new file mode 100644
+index 0000000..043915d
+--- /dev/null
++++ b/tmp/storage/ci/2x/ci2x6r6fj19av1dahr4fbwblug3p
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:14:48 +0000
++From: Evan <evan@example.test>
++To: acme@support.example.test
++Message-ID: <retry-blank-body@example.test>
++Subject: Blank body first attempt
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Now the plain-text body is present!
+\ No newline at end of file
+diff --git a/tmp/storage/cn/60/cn60on1c8eo1t6iizhhtknhdbd0o b/tmp/storage/cn/60/cn60on1c8eo1t6iizhhtknhdbd0o
+new file mode 100644
+index 0000000..b8ccdef
+--- /dev/null
++++ b/tmp/storage/cn/60/cn60on1c8eo1t6iizhhtknhdbd0o
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:33 +0000
++From: Dana <dana@example.test>
++To: acme@support.example.test
++Message-ID: <retry-exact@example.test>
++Subject: Early delivery
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Sent right as Acme was being set up.
+\ No newline at end of file
+diff --git a/tmp/storage/co/iy/coiyi3el5w7xedf016ia8ojdy3mm b/tmp/storage/co/iy/coiyi3el5w7xedf016ia8ojdy3mm
+new file mode 100644
+index 0000000..f8054bc
+--- /dev/null
++++ b/tmp/storage/co/iy/coiyi3el5w7xedf016ia8ojdy3mm
+@@ -0,0 +1,7 @@
++From: Email Customer <emailer@example.test>
++To: acme@support.example.test
++Subject: Email billing issue
++Message-ID: <email-group-1@example.test>
++Content-Type: text/plain; charset=UTF-8
++
++Need help with billing invoice #999
+diff --git a/tmp/storage/d6/kq/d6kq5hdqv4p5172jkd4s3cfz9u0g b/tmp/storage/d6/kq/d6kq5hdqv4p5172jkd4s3cfz9u0g
+new file mode 100644
+index 0000000..5bfc1ba
+--- /dev/null
++++ b/tmp/storage/d6/kq/d6kq5hdqv4p5172jkd4s3cfz9u0g
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:03 +0000
++From: New Person <newperson@example.test>
++To: acme@support.example.test
++Message-ID: <unverified-2@example.test>
++Subject: Second unverified email
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Follow-up duplicate email.
+\ No newline at end of file
+diff --git a/tmp/storage/dd/5d/dd5d4cihd9ymrhqxwt2c1awjolbr b/tmp/storage/dd/5d/dd5d4cihd9ymrhqxwt2c1awjolbr
+new file mode 100644
+index 0000000..55f8e4b
+--- /dev/null
++++ b/tmp/storage/dd/5d/dd5d4cihd9ymrhqxwt2c1awjolbr
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:11:18 +0000
++From: Evan <evan@example.test>
++To: acme@support.example.test
++Message-ID: <retry-blank-body@example.test>
++Subject: Blank body first attempt
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Now the plain-text body is present!
+\ No newline at end of file
+diff --git a/tmp/storage/dd/ku/ddkux1lr34e8e8dfvbk84tutd4xu b/tmp/storage/dd/ku/ddkux1lr34e8e8dfvbk84tutd4xu
+new file mode 100644
+index 0000000..a469257
+--- /dev/null
++++ b/tmp/storage/dd/ku/ddkux1lr34e8e8dfvbk84tutd4xu
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 17:54:01 +0000
++From: avery@example.test
++To: acme@support.example.test
++Message-ID: <d8e9cc03-9573-4d68-b7d9-a27d062520de@example.test>
++Subject: Before cancel
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Testing purge.
+\ No newline at end of file
+diff --git a/tmp/storage/di/3y/di3y9fmc9n6dkig8htnu94bphtyx b/tmp/storage/di/3y/di3y9fmc9n6dkig8htnu94bphtyx
+new file mode 100644
+index 0000000..6cdc4bc
+--- /dev/null
++++ b/tmp/storage/di/3y/di3y9fmc9n6dkig8htnu94bphtyx
+@@ -0,0 +1,26 @@
++Date: Fri, 20 Nov 2026 18:14:47 +0000
++From: attach.user@example.test
++To: acme@support.example.test
++Message-ID: <6b008e177635f_198495010852b@220a2282e75b.mail>
++Subject: With log attachment
++MIME-Version: 1.0
++Content-Type: multipart/mixed;
++ boundary="--==_mimepart_6b008e1775fd4_198495010848"
++Content-Transfer-Encoding: 7bit
++
++
++----==_mimepart_6b008e1775fd4_198495010848
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Inline plain-text body.
++----==_mimepart_6b008e1775fd4_198495010848
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++Content-Disposition: attachment;
++ filename=debug.txt
++
++ATTACHMENT CONTENT DO NOT USE
++----==_mimepart_6b008e1775fd4_198495010848--
+diff --git a/tmp/storage/ds/6c/ds6crya6qt9ng8qobau74pqxq2nz b/tmp/storage/ds/6c/ds6crya6qt9ng8qobau74pqxq2nz
+new file mode 100644
+index 0000000..ec0ccde
+--- /dev/null
++++ b/tmp/storage/ds/6c/ds6crya6qt9ng8qobau74pqxq2nz
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 17:54:01 +0000
++From: Avery <avery@example.test>
++To: acme@support.example.test
++Message-ID: <initial-refund-77@example.test>
++Subject: Refund request
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Can I get a refund for order #77?
+\ No newline at end of file
+diff --git a/tmp/storage/e6/si/e6si4ewagrqka0gxjichc0n9u4sx b/tmp/storage/e6/si/e6si4ewagrqka0gxjichc0n9u4sx
+new file mode 100644
+index 0000000..488ce02
+--- /dev/null
++++ b/tmp/storage/e6/si/e6si4ewagrqka0gxjichc0n9u4sx
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:33 +0000
++From: evan@example.test
++To: acme@support.example.test
++Message-ID: <retry-blank-subj@example.test>
++Subject: Valid subject on retry
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Body without subject
+\ No newline at end of file
+diff --git a/tmp/storage/ec/fv/ecfv7sfd5tfndqaz8bduyh6m2dcq b/tmp/storage/ec/fv/ecfv7sfd5tfndqaz8bduyh6m2dcq
+new file mode 100644
+index 0000000..2ef6aa2
+--- /dev/null
++++ b/tmp/storage/ec/fv/ecfv7sfd5tfndqaz8bduyh6m2dcq
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:11:18 +0000
++From: avery@example.test
++To: acme@support.example.test
++Message-ID: <725ff251-8eb8-4eaa-aed0-d26543ddede0@example.test>
++Subject: Real issue
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Real human message.
+\ No newline at end of file
+diff --git a/tmp/storage/ep/sy/epsy2n4krje6x9g7l2yihe9wv8uv b/tmp/storage/ep/sy/epsy2n4krje6x9g7l2yihe9wv8uv
+new file mode 100644
+index 0000000..c8429f3
+--- /dev/null
++++ b/tmp/storage/ep/sy/epsy2n4krje6x9g7l2yihe9wv8uv
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:15:14 +0000
++From: invited@example.test
++To: acme@support.example.test
++Message-ID: <suspended-retry@example.test>
++Subject: While suspended
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Blocked while suspended.
+\ No newline at end of file
+diff --git a/tmp/storage/f4/hl/f4hl7nowryhtfuyd427mbgxwj8y8 b/tmp/storage/f4/hl/f4hl7nowryhtfuyd427mbgxwj8y8
+new file mode 100644
+index 0000000..733237c
+--- /dev/null
++++ b/tmp/storage/f4/hl/f4hl7nowryhtfuyd427mbgxwj8y8
+@@ -0,0 +1,7 @@
++Return-Path: <bcc.customer@example.test>
++Delivered-To: acme@support.example.test
++From: Bcc Customer <bcc.customer@example.test>
++To: undisclosed-recipients:;
++Subject: Re: Already prefixed
++
++Different message without Message-ID without Message-ID.
+diff --git a/tmp/storage/f4/px/f4pxyh2les0ai2w4acn33pwi5nb8 b/tmp/storage/f4/px/f4pxyh2les0ai2w4acn33pwi5nb8
+new file mode 100644
+index 0000000..1c9ccfe
+--- /dev/null
++++ b/tmp/storage/f4/px/f4pxyh2les0ai2w4acn33pwi5nb8
+@@ -0,0 +1,12 @@
++Date: Fri, 20 Nov 2026 17:59:01 +0000
++From: avery@example.test
++To: acme+80b5aaee279be33bd13b325c08365ece@support.example.test
++Cc: acme@support.example.test
++Message-ID: <4207158f-16bd-4ccd-9363-c739f73eeefb@example.test>
++Subject: Re: Refund request
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Wait, I only received a partial refund.
+\ No newline at end of file
+diff --git a/tmp/storage/fl/0l/fl0lbhf3z1qebrkug4ou5crq6h70 b/tmp/storage/fl/0l/fl0lbhf3z1qebrkug4ou5crq6h70
+new file mode 100644
+index 0000000..a2d3477
+--- /dev/null
++++ b/tmp/storage/fl/0l/fl0lbhf3z1qebrkug4ou5crq6h70
+@@ -0,0 +1,12 @@
++Date: Fri, 20 Nov 2026 18:23:34 +0000
++From: avery@example.test
++To: acme+98103566cd8d65a6c73790b970cdc32d@support.example.test
++Cc: acme@support.example.test
++Message-ID: <d2cc37f2-15ef-4749-8a1f-63718ced665d@example.test>
++Subject: Re: Refund request
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Wait, I only received a partial refund.
+\ No newline at end of file
+diff --git a/tmp/storage/fw/wj/fwwj4p6gw0sa2k96v1op3vsb09ra b/tmp/storage/fw/wj/fwwj4p6gw0sa2k96v1op3vsb09ra
+new file mode 100644
+index 0000000..9bf4ed1
+--- /dev/null
++++ b/tmp/storage/fw/wj/fwwj4p6gw0sa2k96v1op3vsb09ra
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:03 +0000
++From: Avery <avery@example.test>
++To: acme@support.example.test
++Message-ID: <shipping-dup-3@example.test>
++Subject: Shipping delay #3
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Any news on #555?
+\ No newline at end of file
+diff --git a/tmp/storage/g2/vk/g2vkjemzbxse3go2po518j2gpgec b/tmp/storage/g2/vk/g2vkjemzbxse3go2po518j2gpgec
+new file mode 100644
+index 0000000..39eb455
+--- /dev/null
++++ b/tmp/storage/g2/vk/g2vkjemzbxse3go2po518j2gpgec
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:30 +0000
++From: New Person <newperson@example.test>
++To: acme@support.example.test
++Message-ID: <unverified-1@example.test>
++Subject: First unverified email
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Initial question from unverified user.
+\ No newline at end of file
+diff --git a/tmp/storage/g3/8q/g38qbalx6z6vzvvmpn57oylwtlz8 b/tmp/storage/g3/8q/g38qbalx6z6vzvvmpn57oylwtlz8
+new file mode 100644
+index 0000000..5b254b8
+--- /dev/null
++++ b/tmp/storage/g3/8q/g38qbalx6z6vzvvmpn57oylwtlz8
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:11:19 +0000
++From: avery@example.test
++To: acme@support.example.test
++Message-ID: <f7c3e8e5-6f78-4dfe-9ed8-8d82553315cb@example.test>
++Subject: Second issue
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Another question.
+\ No newline at end of file
+diff --git a/tmp/storage/g4/6n/g46nal3lfzsvoyw5j63gy340qz9n b/tmp/storage/g4/6n/g46nal3lfzsvoyw5j63gy340qz9n
+new file mode 100644
+index 0000000..3af195f
+--- /dev/null
++++ b/tmp/storage/g4/6n/g46nal3lfzsvoyw5j63gy340qz9n
+@@ -0,0 +1,26 @@
++Date: Fri, 20 Nov 2026 18:11:19 +0000
++From: attach.user@example.test
++To: acme@support.example.test
++Message-ID: <6b008d471b0b4_194c9507074c@220a2282e75b.mail>
++Subject: With log attachment
++MIME-Version: 1.0
++Content-Type: multipart/mixed;
++ boundary="--==_mimepart_6b008d471ad18_194c95070610"
++Content-Transfer-Encoding: 7bit
++
++
++----==_mimepart_6b008d471ad18_194c95070610
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Inline plain-text body.
++----==_mimepart_6b008d471ad18_194c95070610
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++Content-Disposition: attachment;
++ filename=debug.txt
++
++ATTACHMENT CONTENT DO NOT USE
++----==_mimepart_6b008d471ad18_194c95070610--
+diff --git a/tmp/storage/g7/q0/g7q0fq1h87gsus30u9seauo00a5d b/tmp/storage/g7/q0/g7q0fq1h87gsus30u9seauo00a5d
+new file mode 100644
+index 0000000..c2dd844
+--- /dev/null
++++ b/tmp/storage/g7/q0/g7q0fq1h87gsus30u9seauo00a5d
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:34 +0000
++From: invited@example.test
++To: acme@support.example.test
++Message-ID: <suspended-retry@example.test>
++Subject: While suspended
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Blocked while suspended.
+\ No newline at end of file
+diff --git a/tmp/storage/ga/be/gabex0w0015i98oxyjr7nhi55ryv b/tmp/storage/ga/be/gabex0w0015i98oxyjr7nhi55ryv
+new file mode 100644
+index 0000000..edac8e3
+--- /dev/null
++++ b/tmp/storage/ga/be/gabex0w0015i98oxyjr7nhi55ryv
+@@ -0,0 +1,26 @@
++Date: Fri, 20 Nov 2026 18:18:34 +0000
++From: attach.user@example.test
++To: acme@support.example.test
++Message-ID: <6b008efa4fc7c_19f79508036d@220a2282e75b.mail>
++Subject: With log attachment
++MIME-Version: 1.0
++Content-Type: multipart/mixed;
++ boundary="--==_mimepart_6b008efa4f964_19f79508022f"
++Content-Transfer-Encoding: 7bit
++
++
++----==_mimepart_6b008efa4f964_19f79508022f
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Inline plain-text body.
++----==_mimepart_6b008efa4f964_19f79508022f
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++Content-Disposition: attachment;
++ filename=debug.txt
++
++ATTACHMENT CONTENT DO NOT USE
++----==_mimepart_6b008efa4f964_19f79508022f--
+diff --git a/tmp/storage/ga/sk/gask15tqsg944yqx8kni4qc1kffy b/tmp/storage/ga/sk/gask15tqsg944yqx8kni4qc1kffy
+new file mode 100644
+index 0000000..ea37930
+--- /dev/null
++++ b/tmp/storage/ga/sk/gask15tqsg944yqx8kni4qc1kffy
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:31 +0000
++From: Avery <avery@example.test>
++To: acme@support.example.test
++Message-ID: <shipping-dup-1@example.test>
++Subject: Shipping delay #1
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Where is my order?
+\ No newline at end of file
+diff --git a/tmp/storage/gl/z0/glz0hb7sg0vc93jyr2ssd1kjti2y b/tmp/storage/gl/z0/glz0hb7sg0vc93jyr2ssd1kjti2y
+new file mode 100644
+index 0000000..f8054bc
+--- /dev/null
++++ b/tmp/storage/gl/z0/glz0hb7sg0vc93jyr2ssd1kjti2y
+@@ -0,0 +1,7 @@
++From: Email Customer <emailer@example.test>
++To: acme@support.example.test
++Subject: Email billing issue
++Message-ID: <email-group-1@example.test>
++Content-Type: text/plain; charset=UTF-8
++
++Need help with billing invoice #999
+diff --git a/tmp/storage/gm/e2/gme2mejpf1q22nplc93rinvvt3rh b/tmp/storage/gm/e2/gme2mejpf1q22nplc93rinvvt3rh
+new file mode 100644
+index 0000000..3896780
+--- /dev/null
++++ b/tmp/storage/gm/e2/gme2mejpf1q22nplc93rinvvt3rh
+@@ -0,0 +1,12 @@
++Date: Fri, 20 Nov 2026 18:11:18 +0000
++From: pat@example.test
++To: boss@customer.test
++Cc: Acme Support <acme@support.example.test>
++Message-ID: <bcff3f96-3980-4970-8b14-9a8c19bd3309@example.test>
++Subject: CC support test
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Looping in Acme support.
+\ No newline at end of file
+diff --git a/tmp/storage/gt/8r/gt8ru14h14ahohj7jfrhn3waxxzi b/tmp/storage/gt/8r/gt8ru14h14ahohj7jfrhn3waxxzi
+new file mode 100644
+index 0000000..8a43b5a
+--- /dev/null
++++ b/tmp/storage/gt/8r/gt8ru14h14ahohj7jfrhn3waxxzi
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:30 +0000
++From: New Person <newperson@example.test>
++To: acme@support.example.test
++Message-ID: <unverified-2@example.test>
++Subject: Second unverified email
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Follow-up duplicate email.
+\ No newline at end of file
+diff --git a/tmp/storage/hc/db/hcdb4eu4k4qzjjek61cfoi1yvmmu b/tmp/storage/hc/db/hcdb4eu4k4qzjjek61cfoi1yvmmu
+new file mode 100644
+index 0000000..278a310
+--- /dev/null
++++ b/tmp/storage/hc/db/hcdb4eu4k4qzjjek61cfoi1yvmmu
+@@ -0,0 +1,7 @@
++Return-Path: <bcc.customer@example.test>
++Delivered-To: acme@support.example.test
++From: Bcc Customer <bcc.customer@example.test>
++To: undisclosed-recipients:;
++Subject: Re: Already prefixed
++
++Sent via Bcc without Message-ID.
+diff --git a/tmp/storage/hj/jv/hjjvwarj7a3ci7474yh8ijjcyv79 b/tmp/storage/hj/jv/hjjvwarj7a3ci7474yh8ijjcyv79
+new file mode 100644
+index 0000000..200d644
+--- /dev/null
++++ b/tmp/storage/hj/jv/hjjvwarj7a3ci7474yh8ijjcyv79
+@@ -0,0 +1,12 @@
++Received: from relay2.example.test
++Date: Fri, 20 Nov 2026 18:18:33 +0000
++From: Dana <dana@example.test>
++To: acme@support.example.test
++Message-ID: <retry-exact@example.test>
++Subject: Early delivery
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Sent right as Acme was being set up.
+\ No newline at end of file
+diff --git a/tmp/storage/hk/pv/hkpvgme5xkt8svil5xw27s00hbr7 b/tmp/storage/hk/pv/hkpvgme5xkt8svil5xw27s00hbr7
+new file mode 100644
+index 0000000..7f55a46
+--- /dev/null
++++ b/tmp/storage/hk/pv/hkpvgme5xkt8svil5xw27s00hbr7
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:08 +0000
++From: pat@example.test
++To: globex@mail.helpdesk.custom
++Message-ID: <f0423fa1-ccd2-402d-a878-1530587b4538@example.test>
++Subject: Custom domain works
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Hello Globex!
+\ No newline at end of file
+diff --git a/tmp/storage/hy/hg/hyhgjznuxh10vivlla8iywtiv8t2 b/tmp/storage/hy/hg/hyhgjznuxh10vivlla8iywtiv8t2
+new file mode 100644
+index 0000000..24777e5
+--- /dev/null
++++ b/tmp/storage/hy/hg/hyhgjznuxh10vivlla8iywtiv8t2
+@@ -0,0 +1,13 @@
++Date: Fri, 20 Nov 2026 17:54:02 +0000
++From: human@example.test
++To: acme@support.example.test
++Message-ID: <a696371f-bdf8-4309-bc6f-506afc4cb968@example.test>
++Subject: Explicitly human
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++Auto-Submitted: no
++X-Auto-Response-Suppress: None
++
++Hello from a compliant MUA.
+\ No newline at end of file
+diff --git a/tmp/storage/hy/us/hyusikvnnlo9arrgjw3a098uh947 b/tmp/storage/hy/us/hyusikvnnlo9arrgjw3a098uh947
+new file mode 100644
+index 0000000..746a1e5
+--- /dev/null
++++ b/tmp/storage/hy/us/hyusikvnnlo9arrgjw3a098uh947
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:13:18 +0000
++From: AVERY@example.test
++To: ACME+3722EDAC177BF3B703798948EC48BDEA@SUPPORT.EXAMPLE.TEST
++Message-ID: <09b84f10-e3bf-4e93-a5ed-700f0506f477@example.test>
++Subject: Re: Refund request
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Last 4 digits are 4242.
+\ No newline at end of file
+diff --git a/tmp/storage/i5/1c/i51c0p47y3kugl4ebhzk61g4k0r3 b/tmp/storage/i5/1c/i51c0p47y3kugl4ebhzk61g4k0r3
+new file mode 100644
+index 0000000..f8054bc
+--- /dev/null
++++ b/tmp/storage/i5/1c/i51c0p47y3kugl4ebhzk61g4k0r3
+@@ -0,0 +1,7 @@
++From: Email Customer <emailer@example.test>
++To: acme@support.example.test
++Subject: Email billing issue
++Message-ID: <email-group-1@example.test>
++Content-Type: text/plain; charset=UTF-8
++
++Need help with billing invoice #999
+diff --git a/tmp/storage/ib/fe/ibfe9qn4yhlihy8j27l8f9ftntue b/tmp/storage/ib/fe/ibfe9qn4yhlihy8j27l8f9ftntue
+new file mode 100644
+index 0000000..c67be47
+--- /dev/null
++++ b/tmp/storage/ib/fe/ibfe9qn4yhlihy8j27l8f9ftntue
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:14:43 +0000
++From: Avery <avery@example.test>
++To: acme@support.example.test
++Message-ID: <shipping-main-2@example.test>
++Subject: Shipping delay main
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Order #555 tracking has not updated.
+\ No newline at end of file
+diff --git a/tmp/storage/im/to/imtotk8vbg8nqb3swq94k87vm1d4 b/tmp/storage/im/to/imtotk8vbg8nqb3swq94k87vm1d4
+new file mode 100644
+index 0000000..ce9d6c8
+--- /dev/null
++++ b/tmp/storage/im/to/imtotk8vbg8nqb3swq94k87vm1d4
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:15:17 +0000
++From: Avery <avery@example.test>
++To: acme@support.example.test
++Message-ID: <shipping-dup-3@example.test>
++Subject: Shipping delay #3
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Any news on #555?
+\ No newline at end of file
+diff --git a/tmp/storage/ip/df/ipdf2uoovxdoja9xauk3hos2g7xf b/tmp/storage/ip/df/ipdf2uoovxdoja9xauk3hos2g7xf
+new file mode 100644
+index 0000000..501fa89
+--- /dev/null
++++ b/tmp/storage/ip/df/ipdf2uoovxdoja9xauk3hos2g7xf
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:14:47 +0000
++From: Avery <avery@example.test>
++To: acme@support.example.test
++Message-ID: <initial-refund-77@example.test>
++Subject: Refund request
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Can I get a refund for order #77?
+\ No newline at end of file
+diff --git a/tmp/storage/ip/tj/iptjzgad7jge6s5b2ovvy7x5zwg1 b/tmp/storage/ip/tj/iptjzgad7jge6s5b2ovvy7x5zwg1
+new file mode 100644
+index 0000000..5ceabd8
+--- /dev/null
++++ b/tmp/storage/ip/tj/iptjzgad7jge6s5b2ovvy7x5zwg1
+@@ -0,0 +1,24 @@
++Date: Fri, 20 Nov 2026 18:11:18 +0000
++From: bare.sender@example.test
++To: acme@support.example.test
++Message-ID: <6b008d46a88c7_194c950699db@220a2282e75b.mail>
++Subject: Multipart question
++MIME-Version: 1.0
++Content-Type: multipart/alternative;
++ boundary="--==_mimepart_6b008d46a85ab_194c9506986a"
++Content-Transfer-Encoding: 7bit
++
++
++----==_mimepart_6b008d46a85ab_194c9506986a
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Plain text version of the message.
++----==_mimepart_6b008d46a85ab_194c9506986a
++Content-Type: text/html;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++<h1>HTML version</h1><p>Should not be used.</p>
++----==_mimepart_6b008d46a85ab_194c9506986a--
+diff --git a/tmp/storage/iu/l5/iul5o3mh4dvinakk9ou9dkg53c84 b/tmp/storage/iu/l5/iul5o3mh4dvinakk9ou9dkg53c84
+new file mode 100644
+index 0000000..8d6d6c4
+--- /dev/null
++++ b/tmp/storage/iu/l5/iul5o3mh4dvinakk9ou9dkg53c84
+@@ -0,0 +1,12 @@
++Date: Fri, 20 Nov 2026 18:16:18 +0000
++From: avery@example.test
++To: acme+3722edac177bf3b703798948ec48bdea@support.example.test
++Cc: acme@support.example.test
++Message-ID: <e868ad37-12a4-4f5f-b5ae-63bc0baa10e5@example.test>
++Subject: Re: Refund request
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Wait, I only received a partial refund.
+\ No newline at end of file
+diff --git a/tmp/storage/iu/xt/iuxtang63vz3y95nzk1v3fr2tpmj b/tmp/storage/iu/xt/iuxtang63vz3y95nzk1v3fr2tpmj
+new file mode 100644
+index 0000000..08c4ec3
+--- /dev/null
++++ b/tmp/storage/iu/xt/iuxtang63vz3y95nzk1v3fr2tpmj
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:14:47 +0000
++From: avery@example.test
++To: acme@support.example.test
++Message-ID: <415db158-222d-4674-820b-5263a2a000b9@example.test>
++Subject: Real issue
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Real human message.
+\ No newline at end of file
+diff --git a/tmp/storage/iy/gm/iygmvf2h5jwwfyid7da6qban92k9 b/tmp/storage/iy/gm/iygmvf2h5jwwfyid7da6qban92k9
+new file mode 100644
+index 0000000..dbbe2ed
+--- /dev/null
++++ b/tmp/storage/iy/gm/iygmvf2h5jwwfyid7da6qban92k9
+@@ -0,0 +1,12 @@
++Date: Fri, 20 Nov 2026 18:18:33 +0000
++From: pat@example.test
++To: boss@customer.test
++Cc: Acme Support <acme@support.example.test>
++Message-ID: <2098fca6-0b36-41a6-9388-c95aa5d27199@example.test>
++Subject: CC support test
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Looping in Acme support.
+\ No newline at end of file
+diff --git a/tmp/storage/iz/89/iz89hkt067uygd4dku8tk2wz6e9t b/tmp/storage/iz/89/iz89hkt067uygd4dku8tk2wz6e9t
+new file mode 100644
+index 0000000..da9801c
+--- /dev/null
++++ b/tmp/storage/iz/89/iz89hkt067uygd4dku8tk2wz6e9t
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:08 +0000
++From: Dana <dana@example.test>
++To: acme@support.example.test
++Message-ID: <retry-exact@example.test>
++Subject: Early delivery
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Sent right as Acme was being set up.
+\ No newline at end of file
+diff --git a/tmp/storage/j0/7x/j07xf3use9uli5ww6b1ec5s222x2 b/tmp/storage/j0/7x/j07xf3use9uli5ww6b1ec5s222x2
+new file mode 100644
+index 0000000..278a310
+--- /dev/null
++++ b/tmp/storage/j0/7x/j07xf3use9uli5ww6b1ec5s222x2
+@@ -0,0 +1,7 @@
++Return-Path: <bcc.customer@example.test>
++Delivered-To: acme@support.example.test
++From: Bcc Customer <bcc.customer@example.test>
++To: undisclosed-recipients:;
++Subject: Re: Already prefixed
++
++Sent via Bcc without Message-ID.
+diff --git a/tmp/storage/jd/7x/jd7xe3s6u151rmo88fv7ws0kzqcj b/tmp/storage/jd/7x/jd7xe3s6u151rmo88fv7ws0kzqcj
+new file mode 100644
+index 0000000..6c14c53
+--- /dev/null
++++ b/tmp/storage/jd/7x/jd7xe3s6u151rmo88fv7ws0kzqcj
+@@ -0,0 +1,7 @@
++From: Email Customer <emailer@example.test>
++To: acme+03482ba0a8ab145de00d1c1926ca5d1f@support.example.test
++Subject: Re: Email billing issue
++Message-ID: <email-group-2@example.test>
++Content-Type: text/plain; charset=UTF-8
++
++Confirmed!
+diff --git a/tmp/storage/jq/ga/jqga4msd1x49yn2xxthch36cl0ih b/tmp/storage/jq/ga/jqga4msd1x49yn2xxthch36cl0ih
+new file mode 100644
+index 0000000..d3c3993
+--- /dev/null
++++ b/tmp/storage/jq/ga/jqga4msd1x49yn2xxthch36cl0ih
+@@ -0,0 +1,12 @@
++Received: from mx2.example.test
++Date: Fri, 20 Nov 2026 18:18:08 +0000
++From: evan@example.test
++To: acme+c58f1292d900cf6f0db0df2d25d5a382@support.example.test
++Message-ID: <reply-retry-1@example.test>
++Subject: Re: Valid subject on retry
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Valid reply after empty body failure.
+\ No newline at end of file
+diff --git a/tmp/storage/jr/f2/jrf2egpdr6b61s2h2bhhj6lnqbf8 b/tmp/storage/jr/f2/jrf2egpdr6b61s2h2bhhj6lnqbf8
+new file mode 100644
+index 0000000..49bfccb
+--- /dev/null
++++ b/tmp/storage/jr/f2/jrf2egpdr6b61s2h2bhhj6lnqbf8
+@@ -0,0 +1,12 @@
++Date: Fri, 20 Nov 2026 18:18:07 +0000
++From: Avery Stone <AVERY@Example.Test>
++To: ACME@support.example.test
++Message-ID: <56dc79aa-30d7-40f0-a796-2f2e7d16887b@example.test>
++Subject: Cannot export CSV
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Clicking export shows a spinner forever.
++Second line.
+\ No newline at end of file
+diff --git a/tmp/storage/jt/1j/jt1jb2h5n1e6247ohrpausvcipf0 b/tmp/storage/jt/1j/jt1jb2h5n1e6247ohrpausvcipf0
+new file mode 100644
+index 0000000..5837930
+--- /dev/null
++++ b/tmp/storage/jt/1j/jt1jb2h5n1e6247ohrpausvcipf0
+@@ -0,0 +1,12 @@
++Received: from relay2.example.test
++Date: Fri, 20 Nov 2026 18:11:18 +0000
++From: Dana <dana@example.test>
++To: acme@support.example.test
++Message-ID: <retry-exact@example.test>
++Subject: Early delivery
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Sent right as Acme was being set up.
+\ No newline at end of file
+diff --git a/tmp/storage/jt/rf/jtrf1zb8xrfw0meiuyeg0m1e4pr6 b/tmp/storage/jt/rf/jtrf1zb8xrfw0meiuyeg0m1e4pr6
+new file mode 100644
+index 0000000..c19e47b
+--- /dev/null
++++ b/tmp/storage/jt/rf/jtrf1zb8xrfw0meiuyeg0m1e4pr6
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:33 +0000
++From: avery@example.test
++To: acme@support.example.test
++Message-ID: <90f449d3-f219-471a-9a7d-a673f1a3f501@example.test>
++Subject: Real issue
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Real human message.
+\ No newline at end of file
+diff --git a/tmp/storage/k5/0m/k50mlwabulw953beojd407nsmvr1 b/tmp/storage/k5/0m/k50mlwabulw953beojd407nsmvr1
+new file mode 100644
+index 0000000..092da92
+--- /dev/null
++++ b/tmp/storage/k5/0m/k50mlwabulw953beojd407nsmvr1
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:07 +0000
++From: avery@example.test
++To: acme@support.example.test
++Message-ID: <553ef0cb-fa24-4794-91a2-a6055dce03b2@example.test>
++Subject: Second issue
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Another question.
+\ No newline at end of file
+diff --git a/tmp/storage/k5/bm/k5bmvzwoxuzdcyen5pp7x3d2zrk0 b/tmp/storage/k5/bm/k5bmvzwoxuzdcyen5pp7x3d2zrk0
+new file mode 100644
+index 0000000..e5879ae
+--- /dev/null
++++ b/tmp/storage/k5/bm/k5bmvzwoxuzdcyen5pp7x3d2zrk0
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:33 +0000
++From: pat@example.test
++To: globex@mail.helpdesk.custom
++Message-ID: <c0b96a6b-fe27-4494-8f54-a0f5f04662c9@example.test>
++Subject: Custom domain works
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Hello Globex!
+\ No newline at end of file
+diff --git a/tmp/storage/k8/uu/k8uuzedr62ifhnbnkv748bq0njny b/tmp/storage/k8/uu/k8uuzedr62ifhnbnkv748bq0njny
+new file mode 100644
+index 0000000..c0ad193
+--- /dev/null
++++ b/tmp/storage/k8/uu/k8uuzedr62ifhnbnkv748bq0njny
+@@ -0,0 +1,12 @@
++Received: from relay2.example.test
++Date: Fri, 20 Nov 2026 18:15:15 +0000
++From: Dana <dana@example.test>
++To: acme@support.example.test
++Message-ID: <retry-exact@example.test>
++Subject: Early delivery
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Sent right as Acme was being set up.
+\ No newline at end of file
+diff --git a/tmp/storage/kk/zp/kkzpc22p036lsr47892jw51a4fn5 b/tmp/storage/kk/zp/kkzpc22p036lsr47892jw51a4fn5
+new file mode 100644
+index 0000000..81f7c94
+--- /dev/null
++++ b/tmp/storage/kk/zp/kkzpc22p036lsr47892jw51a4fn5
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:08 +0000
++From: avery@example.test
++To: acme@support.example.test
++Message-ID: <b80a4f07-87cf-4276-a9f2-f8f1c2b9b953@example.test>
++Subject: Before cancel
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Testing purge.
+\ No newline at end of file
+diff --git a/tmp/storage/km/o1/kmo1zxkhezv9z7w1bah9fmbcfejh b/tmp/storage/km/o1/kmo1zxkhezv9z7w1bah9fmbcfejh
+new file mode 100644
+index 0000000..5a873bb
+--- /dev/null
++++ b/tmp/storage/km/o1/kmo1zxkhezv9z7w1bah9fmbcfejh
+@@ -0,0 +1,13 @@
++Date: Fri, 20 Nov 2026 18:11:19 +0000
++From: human@example.test
++To: acme@support.example.test
++Message-ID: <6a3af653-119c-4c6c-a0b9-e4af392ae753@example.test>
++Subject: Explicitly human
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++Auto-Submitted: no
++X-Auto-Response-Suppress: None
++
++Hello from a compliant MUA.
+\ No newline at end of file
+diff --git a/tmp/storage/ku/60/ku600nk3tjpp2ebb1hr5dps80fvl b/tmp/storage/ku/60/ku600nk3tjpp2ebb1hr5dps80fvl
+new file mode 100644
+index 0000000..b248f3a
+--- /dev/null
++++ b/tmp/storage/ku/60/ku600nk3tjpp2ebb1hr5dps80fvl
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 17:54:01 +0000
++From: evan@example.test
++To: acme+c37d0aba03a0507b3b5103fc4371abd9@support.example.test
++Message-ID: <reply-retry-1@example.test>
++Subject: Re: Valid subject on retry
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Valid reply after empty body failure.
+\ No newline at end of file
+diff --git a/tmp/storage/kx/y8/kxy8acimrbw9ctqxw3q7ja3gzx23 b/tmp/storage/kx/y8/kxy8acimrbw9ctqxw3q7ja3gzx23
+new file mode 100644
+index 0000000..be595f2
+--- /dev/null
++++ b/tmp/storage/kx/y8/kxy8acimrbw9ctqxw3q7ja3gzx23
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:08 +0000
++From: Avery Stone <avery@example.test>
++To: acme@support.example.test
++Message-ID: <auth-check-1@example.test>
++Subject: Need help with order
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++My package arrived damaged.
+\ No newline at end of file
+diff --git a/tmp/storage/la/42/la42xbsizbnywpyrucjq0yc2g3em b/tmp/storage/la/42/la42xbsizbnywpyrucjq0yc2g3em
+new file mode 100644
+index 0000000..f34e7ae
+--- /dev/null
++++ b/tmp/storage/la/42/la42xbsizbnywpyrucjq0yc2g3em
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:15:17 +0000
++From: Avery <avery@example.test>
++To: acme@support.example.test
++Message-ID: <shipping-main-2@example.test>
++Subject: Shipping delay main
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Order #555 tracking has not updated.
+\ No newline at end of file
+diff --git a/tmp/storage/le/5a/le5asqyt2s871zi2n6j0kctm5bx9 b/tmp/storage/le/5a/le5asqyt2s871zi2n6j0kctm5bx9
+new file mode 100644
+index 0000000..2de578b
+--- /dev/null
++++ b/tmp/storage/le/5a/le5asqyt2s871zi2n6j0kctm5bx9
+@@ -0,0 +1,12 @@
++Received: from mx2.example.test
++Date: Fri, 20 Nov 2026 18:14:48 +0000
++From: evan@example.test
++To: acme+8a5b9f5dbc8a85ff724756b5b6aa2f48@support.example.test
++Message-ID: <reply-retry-1@example.test>
++Subject: Re: Valid subject on retry
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Valid reply after empty body failure.
+\ No newline at end of file
+diff --git a/tmp/storage/ln/1d/ln1d7j3a1519chlkk18lqj1o2vd2 b/tmp/storage/ln/1d/ln1d7j3a1519chlkk18lqj1o2vd2
+new file mode 100644
+index 0000000..496a864
+--- /dev/null
++++ b/tmp/storage/ln/1d/ln1d7j3a1519chlkk18lqj1o2vd2
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:16:47 +0000
++From: AVERY@example.test
++To: ACME+B189B662A96346A783F1F568831B2CF4@SUPPORT.EXAMPLE.TEST
++Message-ID: <3e0ba2a8-fc0e-4cff-ad12-83d03836e805@example.test>
++Subject: Re: Refund request
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Last 4 digits are 4242.
+\ No newline at end of file
+diff --git a/tmp/storage/lv/m3/lvm3xzdi6i334y1rg4of8k6ivdub b/tmp/storage/lv/m3/lvm3xzdi6i334y1rg4of8k6ivdub
+new file mode 100644
+index 0000000..fc47edd
+--- /dev/null
++++ b/tmp/storage/lv/m3/lvm3xzdi6i334y1rg4of8k6ivdub
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 17:54:01 +0000
++From: evan@example.test
++To: acme@support.example.test
++Message-ID: <retry-blank-subj@example.test>
++Subject: Valid subject on retry
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Body without subject
+\ No newline at end of file
+diff --git a/tmp/storage/m0/28/m028aamgxfdf2yb3hqcbxm5azsio b/tmp/storage/m0/28/m028aamgxfdf2yb3hqcbxm5azsio
+new file mode 100644
+index 0000000..f8054bc
+--- /dev/null
++++ b/tmp/storage/m0/28/m028aamgxfdf2yb3hqcbxm5azsio
+@@ -0,0 +1,7 @@
++From: Email Customer <emailer@example.test>
++To: acme@support.example.test
++Subject: Email billing issue
++Message-ID: <email-group-1@example.test>
++Content-Type: text/plain; charset=UTF-8
++
++Need help with billing invoice #999
+diff --git a/tmp/storage/mh/9t/mh9tmcpphdjnbxb3ch72glnif1bd b/tmp/storage/mh/9t/mh9tmcpphdjnbxb3ch72glnif1bd
+new file mode 100644
+index 0000000..8e83ca6
+--- /dev/null
++++ b/tmp/storage/mh/9t/mh9tmcpphdjnbxb3ch72glnif1bd
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:14:43 +0000
++From: Avery <avery@example.test>
++To: acme@support.example.test
++Message-ID: <shipping-dup-3@example.test>
++Subject: Shipping delay #3
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Any news on #555?
+\ No newline at end of file
+diff --git a/tmp/storage/ml/6m/ml6muu3438t7mjmjzee7k9a5jr5y b/tmp/storage/ml/6m/ml6muu3438t7mjmjzee7k9a5jr5y
+new file mode 100644
+index 0000000..045309c
+--- /dev/null
++++ b/tmp/storage/ml/6m/ml6muu3438t7mjmjzee7k9a5jr5y
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 17:54:01 +0000
++From: pat@example.test
++To: globex@mail.helpdesk.custom
++Message-ID: <2e638bdc-43ec-4438-a76f-51329679f3bd@example.test>
++Subject: Custom domain works
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Hello Globex!
+\ No newline at end of file
+diff --git a/tmp/storage/mr/s5/mrs5nlwdmggkml0vdkegrl43bf1f b/tmp/storage/mr/s5/mrs5nlwdmggkml0vdkegrl43bf1f
+new file mode 100644
+index 0000000..b8ccdef
+--- /dev/null
++++ b/tmp/storage/mr/s5/mrs5nlwdmggkml0vdkegrl43bf1f
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:33 +0000
++From: Dana <dana@example.test>
++To: acme@support.example.test
++Message-ID: <retry-exact@example.test>
++Subject: Early delivery
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Sent right as Acme was being set up.
+\ No newline at end of file
+diff --git a/tmp/storage/mw/mq/mwmqwtc6g4xxwrot8307bd6i2olp b/tmp/storage/mw/mq/mwmqwtc6g4xxwrot8307bd6i2olp
+new file mode 100644
+index 0000000..74e4fb0
+--- /dev/null
++++ b/tmp/storage/mw/mq/mwmqwtc6g4xxwrot8307bd6i2olp
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:14:47 +0000
++From: invited@example.test
++To: acme@support.example.test
++Message-ID: <suspended-retry@example.test>
++Subject: While suspended
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Blocked while suspended.
+\ No newline at end of file
+diff --git a/tmp/storage/n0/gd/n0gdeapf5bjd3jm4rql9n4tqays8 b/tmp/storage/n0/gd/n0gdeapf5bjd3jm4rql9n4tqays8
+new file mode 100644
+index 0000000..7966242
+--- /dev/null
++++ b/tmp/storage/n0/gd/n0gdeapf5bjd3jm4rql9n4tqays8
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:03 +0000
++From: Avery <avery@example.test>
++To: acme@support.example.test
++Message-ID: <shipping-main-2@example.test>
++Subject: Shipping delay main
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Order #555 tracking has not updated.
+\ No newline at end of file
+diff --git a/tmp/storage/nv/6v/nv6vde3qqh77ag4d93pomo5e0jz9 b/tmp/storage/nv/6v/nv6vde3qqh77ag4d93pomo5e0jz9
+new file mode 100644
+index 0000000..2da6066
+--- /dev/null
++++ b/tmp/storage/nv/6v/nv6vde3qqh77ag4d93pomo5e0jz9
+@@ -0,0 +1,12 @@
++Date: Fri, 20 Nov 2026 18:15:16 +0000
++From: avery@example.test
++To: acme@support.example.test
++Message-ID: <25639653-a2e5-4a71-b15d-03d9283e227d@example.test>
++In-Reply-To: <initial-refund-77@example.test>
++Subject: Re: Refund request
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Actually opening a separate inquiry at the main support address.
+\ No newline at end of file
+diff --git a/tmp/storage/o1/d3/o1d3mnvdeshxz55f97slrb7q39oh b/tmp/storage/o1/d3/o1d3mnvdeshxz55f97slrb7q39oh
+new file mode 100644
+index 0000000..acbd2ec
+--- /dev/null
++++ b/tmp/storage/o1/d3/o1d3mnvdeshxz55f97slrb7q39oh
+@@ -0,0 +1,12 @@
++Date: Fri, 20 Nov 2026 18:14:47 +0000
++From: avery@example.test
++To: acme@support.example.test
++Message-ID: <223d9cea-48e8-458b-a891-c4b81c211096@example.test>
++In-Reply-To: <initial-refund-77@example.test>
++Subject: Re: Refund request
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Actually opening a separate inquiry at the main support address.
+\ No newline at end of file
+diff --git a/tmp/storage/of/uk/ofukh6mvha2iys4uez649f1655d4 b/tmp/storage/of/uk/ofukh6mvha2iys4uez649f1655d4
+new file mode 100644
+index 0000000..1ef3d43
+--- /dev/null
++++ b/tmp/storage/of/uk/ofukh6mvha2iys4uez649f1655d4
+@@ -0,0 +1,12 @@
++Received: from relay2.example.test
++Date: Fri, 20 Nov 2026 17:54:00 +0000
++From: Dana <dana@example.test>
++To: acme@support.example.test
++Message-ID: <retry-exact@example.test>
++Subject: Early delivery
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Sent right as Acme was being set up.
+\ No newline at end of file
+diff --git a/tmp/storage/op/81/op81d6oow4is3gn328xelfg1gxm2 b/tmp/storage/op/81/op81d6oow4is3gn328xelfg1gxm2
+new file mode 100644
+index 0000000..99a3fc7
+--- /dev/null
++++ b/tmp/storage/op/81/op81d6oow4is3gn328xelfg1gxm2
+@@ -0,0 +1,26 @@
++Date: Fri, 20 Nov 2026 18:18:07 +0000
++From: attach.user@example.test
++To: acme@support.example.test
++Message-ID: <6b008edf68065_19ca9501159a@220a2282e75b.mail>
++Subject: With log attachment
++MIME-Version: 1.0
++Content-Type: multipart/mixed;
++ boundary="--==_mimepart_6b008edf67d43_19ca950114d1"
++Content-Transfer-Encoding: 7bit
++
++
++----==_mimepart_6b008edf67d43_19ca950114d1
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Inline plain-text body.
++----==_mimepart_6b008edf67d43_19ca950114d1
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++Content-Disposition: attachment;
++ filename=debug.txt
++
++ATTACHMENT CONTENT DO NOT USE
++----==_mimepart_6b008edf67d43_19ca950114d1--
+diff --git a/tmp/storage/op/kq/opkqv8et9zuafbsv63agc41wnyob b/tmp/storage/op/kq/opkqv8et9zuafbsv63agc41wnyob
+new file mode 100644
+index 0000000..543166c
+--- /dev/null
++++ b/tmp/storage/op/kq/opkqv8et9zuafbsv63agc41wnyob
+@@ -0,0 +1,13 @@
++Date: Fri, 20 Nov 2026 18:15:15 +0000
++From: human@example.test
++To: acme@support.example.test
++Message-ID: <5d3372b2-4f6a-44a6-afae-7af67477af52@example.test>
++Subject: Explicitly human
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++Auto-Submitted: no
++X-Auto-Response-Suppress: None
++
++Hello from a compliant MUA.
+\ No newline at end of file
+diff --git a/tmp/storage/ou/cc/oucc014lp5e9len7rhv04ibjc7hg b/tmp/storage/ou/cc/oucc014lp5e9len7rhv04ibjc7hg
+new file mode 100644
+index 0000000..54aa522
+--- /dev/null
++++ b/tmp/storage/ou/cc/oucc014lp5e9len7rhv04ibjc7hg
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:14:48 +0000
++From: Dana <dana@example.test>
++To: acme@support.example.test
++Message-ID: <retry-exact@example.test>
++Subject: Early delivery
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Sent right as Acme was being set up.
+\ No newline at end of file
+diff --git a/tmp/storage/p4/w2/p4w22hjzyiejjzbjw6xpqb6915g4 b/tmp/storage/p4/w2/p4w22hjzyiejjzbjw6xpqb6915g4
+new file mode 100644
+index 0000000..bff24ed
+--- /dev/null
++++ b/tmp/storage/p4/w2/p4w22hjzyiejjzbjw6xpqb6915g4
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:20:34 +0000
++From: AVERY@example.test
++To: ACME+98103566CD8D65A6C73790B970CDC32D@SUPPORT.EXAMPLE.TEST
++Message-ID: <472f1bba-f658-4cad-a28c-5641f1890fee@example.test>
++Subject: Re: Refund request
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Last 4 digits are 4242.
+\ No newline at end of file
+diff --git a/tmp/storage/pe/gp/pegp69zu2f4rrnyf43yhuwy98nh1 b/tmp/storage/pe/gp/pegp69zu2f4rrnyf43yhuwy98nh1
+new file mode 100644
+index 0000000..8ff0dc0
+--- /dev/null
++++ b/tmp/storage/pe/gp/pegp69zu2f4rrnyf43yhuwy98nh1
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:14:48 +0000
++From: pat@example.test
++To: globex@mail.helpdesk.custom
++Message-ID: <469c5230-b126-44ac-87a2-20a5a54b8158@example.test>
++Subject: Custom domain works
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Hello Globex!
+\ No newline at end of file
+diff --git a/tmp/storage/qd/aq/qdaqwzdine0544fgoqkua184x506 b/tmp/storage/qd/aq/qdaqwzdine0544fgoqkua184x506
+new file mode 100644
+index 0000000..0a961e1
+--- /dev/null
++++ b/tmp/storage/qd/aq/qdaqwzdine0544fgoqkua184x506
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:14:48 +0000
++From: evan@example.test
++To: acme@support.example.test
++Message-ID: <retry-blank-subj@example.test>
++Subject: Valid subject on retry
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Body without subject
+\ No newline at end of file
+diff --git a/tmp/storage/qj/ur/qjur7gt2g93qc4yuxchnf11xgsmv b/tmp/storage/qj/ur/qjur7gt2g93qc4yuxchnf11xgsmv
+new file mode 100644
+index 0000000..9692548
+--- /dev/null
++++ b/tmp/storage/qj/ur/qjur7gt2g93qc4yuxchnf11xgsmv
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:08 +0000
++From: avery@example.test
++To: acme@support.example.test
++Message-ID: <97eddc22-b2b5-4767-9ef0-c7b415cc3254@example.test>
++Subject: Real issue
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Real human message.
+\ No newline at end of file
+diff --git a/tmp/storage/qv/cq/qvcqycfjzx5umk5gcjdn6loey8kr b/tmp/storage/qv/cq/qvcqycfjzx5umk5gcjdn6loey8kr
+new file mode 100644
+index 0000000..4eb6bc7
+--- /dev/null
++++ b/tmp/storage/qv/cq/qvcqycfjzx5umk5gcjdn6loey8kr
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:33 +0000
++From: Evan <evan@example.test>
++To: acme@support.example.test
++Message-ID: <retry-blank-body@example.test>
++Subject: Blank body first attempt
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Now the plain-text body is present!
+\ No newline at end of file
+diff --git a/tmp/storage/r0/71/r07196qeaovwuk65av75hvs92em4 b/tmp/storage/r0/71/r07196qeaovwuk65av75hvs92em4
+new file mode 100644
+index 0000000..f9078a3
+--- /dev/null
++++ b/tmp/storage/r0/71/r07196qeaovwuk65av75hvs92em4
+@@ -0,0 +1,24 @@
++Date: Fri, 20 Nov 2026 18:15:15 +0000
++From: bare.sender@example.test
++To: acme@support.example.test
++Message-ID: <6b008e33cebd7_199695073597@220a2282e75b.mail>
++Subject: Multipart question
++MIME-Version: 1.0
++Content-Type: multipart/alternative;
++ boundary="--==_mimepart_6b008e33ce969_1996950734e2"
++Content-Transfer-Encoding: 7bit
++
++
++----==_mimepart_6b008e33ce969_1996950734e2
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Plain text version of the message.
++----==_mimepart_6b008e33ce969_1996950734e2
++Content-Type: text/html;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++<h1>HTML version</h1><p>Should not be used.</p>
++----==_mimepart_6b008e33ce969_1996950734e2--
+diff --git a/tmp/storage/r7/i3/r7i321myo041xnzrbgsoy1dsuwvx b/tmp/storage/r7/i3/r7i321myo041xnzrbgsoy1dsuwvx
+new file mode 100644
+index 0000000..6540247
+--- /dev/null
++++ b/tmp/storage/r7/i3/r7i321myo041xnzrbgsoy1dsuwvx
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:14:47 +0000
++From: invited@example.test
++To: acme@support.example.test
++Message-ID: <invited-retry@example.test>
++Subject: Blocked while invite pending
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Hello!
+\ No newline at end of file
+diff --git a/tmp/storage/rh/w5/rhw5r91vgcpwhynzy09jm34daste b/tmp/storage/rh/w5/rhw5r91vgcpwhynzy09jm34daste
+new file mode 100644
+index 0000000..278a310
+--- /dev/null
++++ b/tmp/storage/rh/w5/rhw5r91vgcpwhynzy09jm34daste
+@@ -0,0 +1,7 @@
++Return-Path: <bcc.customer@example.test>
++Delivered-To: acme@support.example.test
++From: Bcc Customer <bcc.customer@example.test>
++To: undisclosed-recipients:;
++Subject: Re: Already prefixed
++
++Sent via Bcc without Message-ID.
+diff --git a/tmp/storage/ri/po/ripob3994b9os487qyw8krhzvyfw b/tmp/storage/ri/po/ripob3994b9os487qyw8krhzvyfw
+new file mode 100644
+index 0000000..703dd02
+--- /dev/null
++++ b/tmp/storage/ri/po/ripob3994b9os487qyw8krhzvyfw
+@@ -0,0 +1,7 @@
++From: Email Customer <emailer@example.test>
++To: acme+9d62ad9d09784badd4a13b92ed9e7ea8@support.example.test
++Subject: Re: Email billing issue
++Message-ID: <email-group-2@example.test>
++Content-Type: text/plain; charset=UTF-8
++
++Confirmed!
+diff --git a/tmp/storage/rn/h8/rnh8knz8oezvhyn0eeho6dvh5iqp b/tmp/storage/rn/h8/rnh8knz8oezvhyn0eeho6dvh5iqp
+new file mode 100644
+index 0000000..e33c6a6
+--- /dev/null
++++ b/tmp/storage/rn/h8/rnh8knz8oezvhyn0eeho6dvh5iqp
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:15:16 +0000
++From: evan@example.test
++To: acme@support.example.test
++Message-ID: <retry-blank-subj@example.test>
++Subject: Valid subject on retry
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Body without subject
+\ No newline at end of file
+diff --git a/tmp/storage/rx/d8/rxd8cx6r3351ij8znpguosvywa29 b/tmp/storage/rx/d8/rxd8cx6r3351ij8znpguosvywa29
+new file mode 100644
+index 0000000..c64b8ee
+--- /dev/null
++++ b/tmp/storage/rx/d8/rxd8cx6r3351ij8znpguosvywa29
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:11:18 +0000
++From: evan@example.test
++To: acme@support.example.test
++Message-ID: <retry-blank-subj@example.test>
++Subject: Valid subject on retry
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Body without subject
+\ No newline at end of file
+diff --git a/tmp/storage/ry/vx/ryvxfu1you8nr3sf7yz5j6vplcw6 b/tmp/storage/ry/vx/ryvxfu1you8nr3sf7yz5j6vplcw6
+new file mode 100644
+index 0000000..505d325
+--- /dev/null
++++ b/tmp/storage/ry/vx/ryvxfu1you8nr3sf7yz5j6vplcw6
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:11:17 +0000
++From: Avery Stone <avery@example.test>
++To: acme@support.example.test
++Message-ID: <auth-check-1@example.test>
++Subject: Need help with order
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++My package arrived damaged.
+\ No newline at end of file
+diff --git a/tmp/storage/s9/hn/s9hnt88pp6ohfqf9hzmqz3vkn4h2 b/tmp/storage/s9/hn/s9hnt88pp6ohfqf9hzmqz3vkn4h2
+new file mode 100644
+index 0000000..7a7b861
+--- /dev/null
++++ b/tmp/storage/s9/hn/s9hnt88pp6ohfqf9hzmqz3vkn4h2
+@@ -0,0 +1,7 @@
++From: Email Customer <emailer@example.test>
++To: acme+7e78e84dc9e34c2cb3e10485a34c060e@support.example.test
++Subject: Re: Email billing issue
++Message-ID: <email-group-2@example.test>
++Content-Type: text/plain; charset=UTF-8
++
++Confirmed!
+diff --git a/tmp/storage/sc/6s/sc6sx9yvfhj025h3hgxvi7vy83mo b/tmp/storage/sc/6s/sc6sx9yvfhj025h3hgxvi7vy83mo
+new file mode 100644
+index 0000000..a9b8880
+--- /dev/null
++++ b/tmp/storage/sc/6s/sc6sx9yvfhj025h3hgxvi7vy83mo
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:34 +0000
++From: Avery <avery@example.test>
++To: acme@support.example.test
++Message-ID: <initial-refund-77@example.test>
++Subject: Refund request
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Can I get a refund for order #77?
+\ No newline at end of file
+diff --git a/tmp/storage/sg/fm/sgfmcinu9oullyxgf9vbf43a9cd3 b/tmp/storage/sg/fm/sgfmcinu9oullyxgf9vbf43a9cd3
+new file mode 100644
+index 0000000..68c236b
+--- /dev/null
++++ b/tmp/storage/sg/fm/sgfmcinu9oullyxgf9vbf43a9cd3
+@@ -0,0 +1,13 @@
++Date: Fri, 20 Nov 2026 18:14:48 +0000
++From: human@example.test
++To: acme@support.example.test
++Message-ID: <9a3b02ea-5c8e-4cc4-9867-b33e27b3768e@example.test>
++Subject: Explicitly human
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++Auto-Submitted: no
++X-Auto-Response-Suppress: None
++
++Hello from a compliant MUA.
+\ No newline at end of file
+diff --git a/tmp/storage/sj/ry/sjry8c6xpz0idbyhwrs96dr3xprv b/tmp/storage/sj/ry/sjry8c6xpz0idbyhwrs96dr3xprv
+new file mode 100644
+index 0000000..bdde7d5
+--- /dev/null
++++ b/tmp/storage/sj/ry/sjry8c6xpz0idbyhwrs96dr3xprv
+@@ -0,0 +1,12 @@
++Received: from mx2.example.test
++Date: Fri, 20 Nov 2026 18:11:18 +0000
++From: evan@example.test
++To: acme+9e2dfed699ef593eda1927fdf2c154d3@support.example.test
++Message-ID: <reply-retry-1@example.test>
++Subject: Re: Valid subject on retry
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Valid reply after empty body failure.
+\ No newline at end of file
+diff --git a/tmp/storage/sk/zj/skzj5pwf3mb3rpemmozmjkujw17h b/tmp/storage/sk/zj/skzj5pwf3mb3rpemmozmjkujw17h
+new file mode 100644
+index 0000000..4e5d571
+--- /dev/null
++++ b/tmp/storage/sk/zj/skzj5pwf3mb3rpemmozmjkujw17h
+@@ -0,0 +1,12 @@
++Date: Fri, 20 Nov 2026 18:11:18 +0000
++From: avery@example.test
++To: acme@support.example.test
++Message-ID: <5a38fe71-6019-4bca-b9b1-d43c619a4a87@example.test>
++In-Reply-To: <initial-refund-77@example.test>
++Subject: Re: Refund request
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Actually opening a separate inquiry at the main support address.
+\ No newline at end of file
+diff --git a/tmp/storage/sr/4e/sr4e9fdzryytmokqh6gzt0utqulx b/tmp/storage/sr/4e/sr4e9fdzryytmokqh6gzt0utqulx
+new file mode 100644
+index 0000000..5e6d906
+--- /dev/null
++++ b/tmp/storage/sr/4e/sr4e9fdzryytmokqh6gzt0utqulx
+@@ -0,0 +1,24 @@
++Date: Fri, 20 Nov 2026 18:18:34 +0000
++From: html.only@example.test
++To: acme@support.example.test
++Message-ID: <html-only-retry@example.test>
++Subject: HTML only
++MIME-Version: 1.0
++Content-Type: multipart/alternative;
++ boundary="--==_mimepart_6b008efa5de80_19f795080687"
++Content-Transfer-Encoding: 7bit
++
++
++----==_mimepart_6b008efa5de80_19f795080687
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Added plain-text fallback!
++----==_mimepart_6b008efa5de80_19f795080687
++Content-Type: text/html;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++<p>Only HTML</p>
++----==_mimepart_6b008efa5de80_19f795080687--
+diff --git a/tmp/storage/sr/qq/srqqq4qoz20tz5v45ta9clg5kfng b/tmp/storage/sr/qq/srqqq4qoz20tz5v45ta9clg5kfng
+new file mode 100644
+index 0000000..8d887ce
+--- /dev/null
++++ b/tmp/storage/sr/qq/srqqq4qoz20tz5v45ta9clg5kfng
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:11:19 +0000
++From: invited@example.test
++To: acme@support.example.test
++Message-ID: <invited-retry@example.test>
++Subject: Blocked while invite pending
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Hello!
+\ No newline at end of file
+diff --git a/tmp/storage/sz/t6/szt6juihmzrg9o1antlz771d1d3c b/tmp/storage/sz/t6/szt6juihmzrg9o1antlz771d1d3c
+new file mode 100644
+index 0000000..164ca4c
+--- /dev/null
++++ b/tmp/storage/sz/t6/szt6juihmzrg9o1antlz771d1d3c
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:15:16 +0000
++From: evan@example.test
++To: acme+dc526c8d5c6925a843683f5601ac5e65@support.example.test
++Message-ID: <reply-retry-1@example.test>
++Subject: Re: Valid subject on retry
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Valid reply after empty body failure.
+\ No newline at end of file
+diff --git a/tmp/storage/t3/kl/t3kl20k8ryep3zh11zwianddd46i b/tmp/storage/t3/kl/t3kl20k8ryep3zh11zwianddd46i
+new file mode 100644
+index 0000000..eed2425
+--- /dev/null
++++ b/tmp/storage/t3/kl/t3kl20k8ryep3zh11zwianddd46i
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:34 +0000
++From: invited@example.test
++To: acme@support.example.test
++Message-ID: <invited-retry@example.test>
++Subject: Blocked while invite pending
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Hello!
+\ No newline at end of file
+diff --git a/tmp/storage/tk/c7/tkc7sy7yclewy50d1vahfp624lwm b/tmp/storage/tk/c7/tkc7sy7yclewy50d1vahfp624lwm
+new file mode 100644
+index 0000000..bbb1fd2
+--- /dev/null
++++ b/tmp/storage/tk/c7/tkc7sy7yclewy50d1vahfp624lwm
+@@ -0,0 +1,12 @@
++Date: Fri, 20 Nov 2026 18:18:33 +0000
++From: Avery Stone <AVERY@Example.Test>
++To: ACME@support.example.test
++Message-ID: <8bbc9a9a-1e1c-46c9-8040-91d9b9c49760@example.test>
++Subject: Cannot export CSV
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Clicking export shows a spinner forever.
++Second line.
+\ No newline at end of file
+diff --git a/tmp/storage/to/zp/tozp71776qjo1vofx53gm6he8vj9 b/tmp/storage/to/zp/tozp71776qjo1vofx53gm6he8vj9
+new file mode 100644
+index 0000000..5efed23
+--- /dev/null
++++ b/tmp/storage/to/zp/tozp71776qjo1vofx53gm6he8vj9
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:33 +0000
++From: avery@example.test
++To: acme@support.example.test
++Message-ID: <1649cc8e-b815-4c4e-a9c7-3b30570b9e36@example.test>
++Subject: Before cancel
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Testing purge.
+\ No newline at end of file
+diff --git a/tmp/storage/u9/wm/u9wmfhwoc0npd58j4x0dwlis5qnu b/tmp/storage/u9/wm/u9wmfhwoc0npd58j4x0dwlis5qnu
+new file mode 100644
+index 0000000..64e3ff3
+--- /dev/null
++++ b/tmp/storage/u9/wm/u9wmfhwoc0npd58j4x0dwlis5qnu
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:11:18 +0000
++From: pat@example.test
++To: globex@mail.helpdesk.custom
++Message-ID: <d71f82e6-04ce-4f54-960c-adb9be238922@example.test>
++Subject: Custom domain works
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Hello Globex!
+\ No newline at end of file
+diff --git a/tmp/storage/ua/7l/ua7l5ux4jftu09mn6fvafvlccneg b/tmp/storage/ua/7l/ua7l5ux4jftu09mn6fvafvlccneg
+new file mode 100644
+index 0000000..fb4d6f1
+--- /dev/null
++++ b/tmp/storage/ua/7l/ua7l5ux4jftu09mn6fvafvlccneg
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:14:48 +0000
++From: Avery Stone <avery@example.test>
++To: acme@support.example.test
++Message-ID: <auth-check-1@example.test>
++Subject: Need help with order
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++My package arrived damaged.
+\ No newline at end of file
+diff --git a/tmp/storage/ui/hs/uihsgkufpjc1axo8htxljfg4y1ts b/tmp/storage/ui/hs/uihsgkufpjc1axo8htxljfg4y1ts
+new file mode 100644
+index 0000000..278a310
+--- /dev/null
++++ b/tmp/storage/ui/hs/uihsgkufpjc1axo8htxljfg4y1ts
+@@ -0,0 +1,7 @@
++Return-Path: <bcc.customer@example.test>
++Delivered-To: acme@support.example.test
++From: Bcc Customer <bcc.customer@example.test>
++To: undisclosed-recipients:;
++Subject: Re: Already prefixed
++
++Sent via Bcc without Message-ID.
+diff --git a/tmp/storage/uu/ah/uuaht7one9lkhhynqmaxii8rnw6l b/tmp/storage/uu/ah/uuaht7one9lkhhynqmaxii8rnw6l
+new file mode 100644
+index 0000000..648e027
+--- /dev/null
++++ b/tmp/storage/uu/ah/uuaht7one9lkhhynqmaxii8rnw6l
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:15:16 +0000
++From: Avery <avery@example.test>
++To: acme@support.example.test
++Message-ID: <initial-refund-77@example.test>
++Subject: Refund request
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Can I get a refund for order #77?
+\ No newline at end of file
+diff --git a/tmp/storage/uu/ux/uuuxw0fuywr1nqtuelqufj5nnuba b/tmp/storage/uu/ux/uuuxw0fuywr1nqtuelqufj5nnuba
+new file mode 100644
+index 0000000..025d0c8
+--- /dev/null
++++ b/tmp/storage/uu/ux/uuuxw0fuywr1nqtuelqufj5nnuba
+@@ -0,0 +1,12 @@
++Date: Fri, 20 Nov 2026 18:18:34 +0000
++From: avery@example.test
++To: acme@support.example.test
++Message-ID: <1e1be575-3345-4119-93f0-25d6bb12c2b7@example.test>
++In-Reply-To: <initial-refund-77@example.test>
++Subject: Re: Refund request
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Actually opening a separate inquiry at the main support address.
+\ No newline at end of file
+diff --git a/tmp/storage/uz/zw/uzzwgkxgytzumcftcyy69idlx4qj b/tmp/storage/uz/zw/uzzwgkxgytzumcftcyy69idlx4qj
+new file mode 100644
+index 0000000..e97a087
+--- /dev/null
++++ b/tmp/storage/uz/zw/uzzwgkxgytzumcftcyy69idlx4qj
+@@ -0,0 +1,12 @@
++Date: Fri, 20 Nov 2026 18:19:47 +0000
++From: avery@example.test
++To: acme+b189b662a96346a783f1f568831b2cf4@support.example.test
++Cc: acme@support.example.test
++Message-ID: <0cf79d5b-db72-4829-959d-702e5c622bb0@example.test>
++Subject: Re: Refund request
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Wait, I only received a partial refund.
+\ No newline at end of file
+diff --git a/tmp/storage/v0/63/v063mdmn9lc9cfz7chbrh8gbtfxq b/tmp/storage/v0/63/v063mdmn9lc9cfz7chbrh8gbtfxq
+new file mode 100644
+index 0000000..079a8e4
+--- /dev/null
++++ b/tmp/storage/v0/63/v063mdmn9lc9cfz7chbrh8gbtfxq
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 17:54:02 +0000
++From: avery@example.test
++To: acme@support.example.test
++Message-ID: <495ef542-1f04-426e-a26c-8042e2f5c9a7@example.test>
++Subject: Real issue
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Real human message.
+\ No newline at end of file
+diff --git a/tmp/storage/v7/if/v7ifwkwy37mzugs3xp9tuscnvota b/tmp/storage/v7/if/v7ifwkwy37mzugs3xp9tuscnvota
+new file mode 100644
+index 0000000..071fb52
+--- /dev/null
++++ b/tmp/storage/v7/if/v7ifwkwy37mzugs3xp9tuscnvota
+@@ -0,0 +1,24 @@
++Date: Fri, 20 Nov 2026 18:18:07 +0000
++From: html.only@example.test
++To: acme@support.example.test
++Message-ID: <html-only-retry@example.test>
++Subject: HTML only
++MIME-Version: 1.0
++Content-Type: multipart/alternative;
++ boundary="--==_mimepart_6b008edf73ff8_19ca950118f7"
++Content-Transfer-Encoding: 7bit
++
++
++----==_mimepart_6b008edf73ff8_19ca950118f7
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Added plain-text fallback!
++----==_mimepart_6b008edf73ff8_19ca950118f7
++Content-Type: text/html;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++<p>Only HTML</p>
++----==_mimepart_6b008edf73ff8_19ca950118f7--
+diff --git a/tmp/storage/vw/1j/vw1jy9eq7andnbgr6fmj3mpfjtam b/tmp/storage/vw/1j/vw1jy9eq7andnbgr6fmj3mpfjtam
+new file mode 100644
+index 0000000..2c743be
+--- /dev/null
++++ b/tmp/storage/vw/1j/vw1jy9eq7andnbgr6fmj3mpfjtam
+@@ -0,0 +1,13 @@
++Date: Fri, 20 Nov 2026 18:18:08 +0000
++From: human@example.test
++To: acme@support.example.test
++Message-ID: <b49fedc2-f1f7-4a1f-a573-894bc09223b8@example.test>
++Subject: Explicitly human
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++Auto-Submitted: no
++X-Auto-Response-Suppress: None
++
++Hello from a compliant MUA.
+\ No newline at end of file
+diff --git a/tmp/storage/vy/3q/vy3quv18o9o4wko0e5k53vkeeq5n b/tmp/storage/vy/3q/vy3quv18o9o4wko0e5k53vkeeq5n
+new file mode 100644
+index 0000000..7dca58a
+--- /dev/null
++++ b/tmp/storage/vy/3q/vy3quv18o9o4wko0e5k53vkeeq5n
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:11:18 +0000
++From: avery@example.test
++To: acme@support.example.test
++Message-ID: <3a7a274c-12be-4781-8b48-e6d9872d6fc5@example.test>
++Subject: Before cancel
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Testing purge.
+\ No newline at end of file
+diff --git a/tmp/storage/vy/vw/vyvw1izx1rl8j0mwbijmxm5h7g47 b/tmp/storage/vy/vw/vyvw1izx1rl8j0mwbijmxm5h7g47
+new file mode 100644
+index 0000000..dd0aa9c
+--- /dev/null
++++ b/tmp/storage/vy/vw/vyvw1izx1rl8j0mwbijmxm5h7g47
+@@ -0,0 +1,12 @@
++Received: from mx2.example.test
++Date: Fri, 20 Nov 2026 18:18:33 +0000
++From: evan@example.test
++To: acme+ea4598aa8086f5d31822d25a1a4bd023@support.example.test
++Message-ID: <reply-retry-1@example.test>
++Subject: Re: Valid subject on retry
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Valid reply after empty body failure.
+\ No newline at end of file
+diff --git a/tmp/storage/w7/qh/w7qhz92ppbb6kpbdo7hyflalx0k6 b/tmp/storage/w7/qh/w7qhz92ppbb6kpbdo7hyflalx0k6
+new file mode 100644
+index 0000000..8e77288
+--- /dev/null
++++ b/tmp/storage/w7/qh/w7qhz92ppbb6kpbdo7hyflalx0k6
+@@ -0,0 +1,12 @@
++Date: Fri, 20 Nov 2026 18:23:07 +0000
++From: avery@example.test
++To: acme+c35b0cb6f13466ac412172bffd5abb53@support.example.test
++Cc: acme@support.example.test
++Message-ID: <89ae2c04-a283-4967-adf2-35eab58c2060@example.test>
++Subject: Re: Refund request
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Wait, I only received a partial refund.
+\ No newline at end of file
+diff --git a/tmp/storage/w7/te/w7tenpjvh6u7zttv11487e3nwuxf b/tmp/storage/w7/te/w7tenpjvh6u7zttv11487e3nwuxf
+new file mode 100644
+index 0000000..0122d03
+--- /dev/null
++++ b/tmp/storage/w7/te/w7tenpjvh6u7zttv11487e3nwuxf
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:15:17 +0000
++From: Avery <avery@example.test>
++To: acme@support.example.test
++Message-ID: <shipping-dup-1@example.test>
++Subject: Shipping delay #1
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Where is my order?
+\ No newline at end of file
+diff --git a/tmp/storage/we/wu/wewujj5si51nr80hvyognrdp959c b/tmp/storage/we/wu/wewujj5si51nr80hvyognrdp959c
+new file mode 100644
+index 0000000..382f149
+--- /dev/null
++++ b/tmp/storage/we/wu/wewujj5si51nr80hvyognrdp959c
+@@ -0,0 +1,12 @@
++Received: from relay2.example.test
++Date: Fri, 20 Nov 2026 18:18:08 +0000
++From: Dana <dana@example.test>
++To: acme@support.example.test
++Message-ID: <retry-exact@example.test>
++Subject: Early delivery
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Sent right as Acme was being set up.
+\ No newline at end of file
+diff --git a/tmp/storage/wl/yl/wlyl7bmht45fmj05onp7lmar91zl b/tmp/storage/wl/yl/wlyl7bmht45fmj05onp7lmar91zl
+new file mode 100644
+index 0000000..c12e653
+--- /dev/null
++++ b/tmp/storage/wl/yl/wlyl7bmht45fmj05onp7lmar91zl
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:14:48 +0000
++From: avery@example.test
++To: acme@support.example.test
++Message-ID: <0a021ff0-d6fb-440c-bedf-e2a5f1eff469@example.test>
++Subject: Second issue
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Another question.
+\ No newline at end of file
+diff --git a/tmp/storage/wn/20/wn200jwm1a3r4inkl4bt0hfcmgnc b/tmp/storage/wn/20/wn200jwm1a3r4inkl4bt0hfcmgnc
+new file mode 100644
+index 0000000..79cfac4
+--- /dev/null
++++ b/tmp/storage/wn/20/wn200jwm1a3r4inkl4bt0hfcmgnc
+@@ -0,0 +1,24 @@
++Date: Fri, 20 Nov 2026 18:14:48 +0000
++From: bare.sender@example.test
++To: acme@support.example.test
++Message-ID: <6b008e18a7d4d_198495011143c@220a2282e75b.mail>
++Subject: Multipart question
++MIME-Version: 1.0
++Content-Type: multipart/alternative;
++ boundary="--==_mimepart_6b008e18a7928_198495011131a"
++Content-Transfer-Encoding: 7bit
++
++
++----==_mimepart_6b008e18a7928_198495011131a
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Plain text version of the message.
++----==_mimepart_6b008e18a7928_198495011131a
++Content-Type: text/html;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++<h1>HTML version</h1><p>Should not be used.</p>
++----==_mimepart_6b008e18a7928_198495011131a--
+diff --git a/tmp/storage/wu/dx/wudx0k5rap9xgxnfa7vfklo11f0a b/tmp/storage/wu/dx/wudx0k5rap9xgxnfa7vfklo11f0a
+new file mode 100644
+index 0000000..278a310
+--- /dev/null
++++ b/tmp/storage/wu/dx/wudx0k5rap9xgxnfa7vfklo11f0a
+@@ -0,0 +1,7 @@
++Return-Path: <bcc.customer@example.test>
++Delivered-To: acme@support.example.test
++From: Bcc Customer <bcc.customer@example.test>
++To: undisclosed-recipients:;
++Subject: Re: Already prefixed
++
++Sent via Bcc without Message-ID.
+diff --git a/tmp/storage/wv/er/wver5w35p0kdoni3c19b3cg4d1yl b/tmp/storage/wv/er/wver5w35p0kdoni3c19b3cg4d1yl
+new file mode 100644
+index 0000000..54aa522
+--- /dev/null
++++ b/tmp/storage/wv/er/wver5w35p0kdoni3c19b3cg4d1yl
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:14:48 +0000
++From: Dana <dana@example.test>
++To: acme@support.example.test
++Message-ID: <retry-exact@example.test>
++Subject: Early delivery
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Sent right as Acme was being set up.
+\ No newline at end of file
+diff --git a/tmp/storage/x7/29/x7297vgihzx9jygwy28joc9mluol b/tmp/storage/x7/29/x7297vgihzx9jygwy28joc9mluol
+new file mode 100644
+index 0000000..6090ad2
+--- /dev/null
++++ b/tmp/storage/x7/29/x7297vgihzx9jygwy28joc9mluol
+@@ -0,0 +1,24 @@
++Date: Fri, 20 Nov 2026 18:15:14 +0000
++From: html.only@example.test
++To: acme@support.example.test
++Message-ID: <html-only-retry@example.test>
++Subject: HTML only
++MIME-Version: 1.0
++Content-Type: multipart/alternative;
++ boundary="--==_mimepart_6b008e32b7f6c_199695071422"
++Content-Transfer-Encoding: 7bit
++
++
++----==_mimepart_6b008e32b7f6c_199695071422
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Added plain-text fallback!
++----==_mimepart_6b008e32b7f6c_199695071422
++Content-Type: text/html;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++<p>Only HTML</p>
++----==_mimepart_6b008e32b7f6c_199695071422--
+diff --git a/tmp/storage/xe/4a/xe4az6ir1693k8a7gefv1ddhxo5e b/tmp/storage/xe/4a/xe4az6ir1693k8a7gefv1ddhxo5e
+new file mode 100644
+index 0000000..733237c
+--- /dev/null
++++ b/tmp/storage/xe/4a/xe4az6ir1693k8a7gefv1ddhxo5e
+@@ -0,0 +1,7 @@
++Return-Path: <bcc.customer@example.test>
++Delivered-To: acme@support.example.test
++From: Bcc Customer <bcc.customer@example.test>
++To: undisclosed-recipients:;
++Subject: Re: Already prefixed
++
++Different message without Message-ID without Message-ID.
+diff --git a/tmp/storage/xh/ye/xhyergbs1x6uknimi2bebsdxqc4i b/tmp/storage/xh/ye/xhyergbs1x6uknimi2bebsdxqc4i
+new file mode 100644
+index 0000000..3daf25a
+--- /dev/null
++++ b/tmp/storage/xh/ye/xhyergbs1x6uknimi2bebsdxqc4i
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:15:15 +0000
++From: pat@example.test
++To: globex@mail.helpdesk.custom
++Message-ID: <c355c301-7a21-408c-9d7c-c30494174694@example.test>
++Subject: Custom domain works
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Hello Globex!
+\ No newline at end of file
+diff --git a/tmp/storage/xr/rc/xrrc3o7jd8e0wdm2pz5yvzf3ibyi b/tmp/storage/xr/rc/xrrc3o7jd8e0wdm2pz5yvzf3ibyi
+new file mode 100644
+index 0000000..2d17e37
+--- /dev/null
++++ b/tmp/storage/xr/rc/xrrc3o7jd8e0wdm2pz5yvzf3ibyi
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:03 +0000
++From: Avery <avery@example.test>
++To: acme@support.example.test
++Message-ID: <shipping-dup-1@example.test>
++Subject: Shipping delay #1
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Where is my order?
+\ No newline at end of file
+diff --git a/tmp/storage/xu/ii/xuiinzrt3nvh5vvvg4f41ddcsy1f b/tmp/storage/xu/ii/xuiinzrt3nvh5vvvg4f41ddcsy1f
+new file mode 100644
+index 0000000..e649ce5
+--- /dev/null
++++ b/tmp/storage/xu/ii/xuiinzrt3nvh5vvvg4f41ddcsy1f
+@@ -0,0 +1,12 @@
++Date: Fri, 20 Nov 2026 18:18:08 +0000
++From: pat@example.test
++To: boss@customer.test
++Cc: Acme Support <acme@support.example.test>
++Message-ID: <9758c008-efd8-4903-b54c-a005c3711505@example.test>
++Subject: CC support test
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Looping in Acme support.
+\ No newline at end of file
+diff --git a/tmp/storage/xv/77/xv77rtst0gbdsrx9u3bus2jj414s b/tmp/storage/xv/77/xv77rtst0gbdsrx9u3bus2jj414s
+new file mode 100644
+index 0000000..eb4ec5e
+--- /dev/null
++++ b/tmp/storage/xv/77/xv77rtst0gbdsrx9u3bus2jj414s
+@@ -0,0 +1,12 @@
++Received: from mx2.example.test
++Date: Fri, 20 Nov 2026 17:54:01 +0000
++From: evan@example.test
++To: acme+c37d0aba03a0507b3b5103fc4371abd9@support.example.test
++Message-ID: <reply-retry-1@example.test>
++Subject: Re: Valid subject on retry
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Valid reply after empty body failure.
+\ No newline at end of file
+diff --git a/tmp/storage/xx/fq/xxfqpihh755wknap9w6xx568bugj b/tmp/storage/xx/fq/xxfqpihh755wknap9w6xx568bugj
+new file mode 100644
+index 0000000..e138738
+--- /dev/null
++++ b/tmp/storage/xx/fq/xxfqpihh755wknap9w6xx568bugj
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:33 +0000
++From: avery@example.test
++To: acme@support.example.test
++Message-ID: <39678df8-ff7e-410e-a95c-51d833f83063@example.test>
++Subject: Second issue
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Another question.
+\ No newline at end of file
+diff --git a/tmp/storage/y2/jj/y2jjq6ac1jtyj36bfy1krwan752y b/tmp/storage/y2/jj/y2jjq6ac1jtyj36bfy1krwan752y
+new file mode 100644
+index 0000000..e3226a4
+--- /dev/null
++++ b/tmp/storage/y2/jj/y2jjq6ac1jtyj36bfy1krwan752y
+@@ -0,0 +1,12 @@
++Date: Fri, 20 Nov 2026 18:11:19 +0000
++From: Avery Stone <AVERY@Example.Test>
++To: ACME@support.example.test
++Message-ID: <38a7cb3e-4e7e-49e3-95bc-33394b8e91d2@example.test>
++Subject: Cannot export CSV
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Clicking export shows a spinner forever.
++Second line.
+\ No newline at end of file
+diff --git a/tmp/storage/yf/n9/yfn90dkdbeuiqe1si49be939z89p b/tmp/storage/yf/n9/yfn90dkdbeuiqe1si49be939z89p
+new file mode 100644
+index 0000000..197d2ee
+--- /dev/null
++++ b/tmp/storage/yf/n9/yfn90dkdbeuiqe1si49be939z89p
+@@ -0,0 +1,12 @@
++Date: Fri, 20 Nov 2026 17:54:01 +0000
++From: pat@example.test
++To: boss@customer.test
++Cc: Acme Support <acme@support.example.test>
++Message-ID: <f8660446-33ce-4fe0-9189-85edeaf31ea4@example.test>
++Subject: CC support test
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Looping in Acme support.
+\ No newline at end of file
+diff --git a/tmp/storage/ym/j2/ymj2od88tlh4ortw0wjh293hb3gu b/tmp/storage/ym/j2/ymj2od88tlh4ortw0wjh293hb3gu
+new file mode 100644
+index 0000000..da9801c
+--- /dev/null
++++ b/tmp/storage/ym/j2/ymj2od88tlh4ortw0wjh293hb3gu
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:08 +0000
++From: Dana <dana@example.test>
++To: acme@support.example.test
++Message-ID: <retry-exact@example.test>
++Subject: Early delivery
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Sent right as Acme was being set up.
+\ No newline at end of file
+diff --git a/tmp/storage/yt/xu/ytxuyaorc0gle6wuy8q47toinoqr b/tmp/storage/yt/xu/ytxuyaorc0gle6wuy8q47toinoqr
+new file mode 100644
+index 0000000..278a310
+--- /dev/null
++++ b/tmp/storage/yt/xu/ytxuyaorc0gle6wuy8q47toinoqr
+@@ -0,0 +1,7 @@
++Return-Path: <bcc.customer@example.test>
++Delivered-To: acme@support.example.test
++From: Bcc Customer <bcc.customer@example.test>
++To: undisclosed-recipients:;
++Subject: Re: Already prefixed
++
++Sent via Bcc without Message-ID.
+diff --git a/tmp/storage/z4/2b/z42bmzmsig2qqubkn637kr4sji6l b/tmp/storage/z4/2b/z42bmzmsig2qqubkn637kr4sji6l
+new file mode 100644
+index 0000000..278a310
+--- /dev/null
++++ b/tmp/storage/z4/2b/z42bmzmsig2qqubkn637kr4sji6l
+@@ -0,0 +1,7 @@
++Return-Path: <bcc.customer@example.test>
++Delivered-To: acme@support.example.test
++From: Bcc Customer <bcc.customer@example.test>
++To: undisclosed-recipients:;
++Subject: Re: Already prefixed
++
++Sent via Bcc without Message-ID.
+diff --git a/tmp/storage/zb/sj/zbsj6tcml6zeouqapwbk1c8qau7i b/tmp/storage/zb/sj/zbsj6tcml6zeouqapwbk1c8qau7i
+new file mode 100644
+index 0000000..d8e3668
+--- /dev/null
++++ b/tmp/storage/zb/sj/zbsj6tcml6zeouqapwbk1c8qau7i
+@@ -0,0 +1,12 @@
++Received: from relay2.example.test
++Date: Fri, 20 Nov 2026 18:14:48 +0000
++From: Dana <dana@example.test>
++To: acme@support.example.test
++Message-ID: <retry-exact@example.test>
++Subject: Early delivery
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Sent right as Acme was being set up.
+\ No newline at end of file
+diff --git a/tmp/storage/zh/oj/zhoj369vfpyq2ibndwhewjdn8k39 b/tmp/storage/zh/oj/zhoj369vfpyq2ibndwhewjdn8k39
+new file mode 100644
+index 0000000..2c6c868
+--- /dev/null
++++ b/tmp/storage/zh/oj/zhoj369vfpyq2ibndwhewjdn8k39
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:18:08 +0000
++From: Evan <evan@example.test>
++To: acme@support.example.test
++Message-ID: <retry-blank-body@example.test>
++Subject: Blank body first attempt
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Now the plain-text body is present!
+\ No newline at end of file
+diff --git a/tmp/storage/zh/x2/zhx2bltsc8n0pvlt3gg7cnedajib b/tmp/storage/zh/x2/zhx2bltsc8n0pvlt3gg7cnedajib
+new file mode 100644
+index 0000000..7f47199
+--- /dev/null
++++ b/tmp/storage/zh/x2/zhx2bltsc8n0pvlt3gg7cnedajib
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:15:17 +0000
++From: avery@example.test
++To: acme+87eeb35f781d0ba9d09e69b2464c26d7@support.example.test
++Message-ID: <reply-to-surviving-main@example.test>
++Subject: Re: Shipping delay main
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Replying on the surviving thread!
+\ No newline at end of file
+diff --git a/tmp/storage/zi/6j/zi6jbbnxnxiawrrkcs7z4wmxx5gy b/tmp/storage/zi/6j/zi6jbbnxnxiawrrkcs7z4wmxx5gy
+new file mode 100644
+index 0000000..5a2c868
+--- /dev/null
++++ b/tmp/storage/zi/6j/zi6jbbnxnxiawrrkcs7z4wmxx5gy
+@@ -0,0 +1,12 @@
++Date: Fri, 20 Nov 2026 18:15:15 +0000
++From: pat@example.test
++To: boss@customer.test
++Cc: Acme Support <acme@support.example.test>
++Message-ID: <dcda8ca1-9de6-4bf8-9834-75615a64327f@example.test>
++Subject: CC support test
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Looping in Acme support.
+\ No newline at end of file
+diff --git a/tmp/storage/zm/ou/zmoufpzyivm17810oo3qovwvkjxb b/tmp/storage/zm/ou/zmoufpzyivm17810oo3qovwvkjxb
+new file mode 100644
+index 0000000..d0da529
+--- /dev/null
++++ b/tmp/storage/zm/ou/zmoufpzyivm17810oo3qovwvkjxb
+@@ -0,0 +1,12 @@
++Date: Fri, 20 Nov 2026 18:18:08 +0000
++From: avery@example.test
++To: acme@support.example.test
++Message-ID: <3ebe3c93-9deb-44d4-aff2-fd910c0c2e12@example.test>
++In-Reply-To: <initial-refund-77@example.test>
++Subject: Re: Refund request
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Actually opening a separate inquiry at the main support address.
+\ No newline at end of file
+diff --git a/tmp/storage/zn/5f/zn5frmtf1tzd90qfjb26foqv7f9z b/tmp/storage/zn/5f/zn5frmtf1tzd90qfjb26foqv7f9z
+new file mode 100644
+index 0000000..e2ad3da
+--- /dev/null
++++ b/tmp/storage/zn/5f/zn5frmtf1tzd90qfjb26foqv7f9z
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:11:18 +0000
++From: Dana <dana@example.test>
++To: acme@support.example.test
++Message-ID: <retry-exact@example.test>
++Subject: Early delivery
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Sent right as Acme was being set up.
+\ No newline at end of file
+diff --git a/tmp/storage/zy/j9/zyj9is6knyre841uvv7dpntie4so b/tmp/storage/zy/j9/zyj9is6knyre841uvv7dpntie4so
+new file mode 100644
+index 0000000..43db6cd
+--- /dev/null
++++ b/tmp/storage/zy/j9/zyj9is6knyre841uvv7dpntie4so
+@@ -0,0 +1,11 @@
++Date: Fri, 20 Nov 2026 18:20:07 +0000
++From: AVERY@example.test
++To: ACME+C35B0CB6F13466AC412172BFFD5ABB53@SUPPORT.EXAMPLE.TEST
++Message-ID: <041a1d98-5615-4cc1-8c48-f004c24ff7c8@example.test>
++Subject: Re: Refund request
++MIME-Version: 1.0
++Content-Type: text/plain;
++ charset=UTF-8
++Content-Transfer-Encoding: 7bit
++
++Last 4 digits are 4242.
+\ No newline at end of file

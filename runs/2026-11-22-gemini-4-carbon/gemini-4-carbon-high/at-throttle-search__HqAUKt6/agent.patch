@@ -1,0 +1,185 @@
+diff --git a/app/controllers/books/searches_controller.rb b/app/controllers/books/searches_controller.rb
+index 5268c55..6939373 100644
+--- a/app/controllers/books/searches_controller.rb
++++ b/app/controllers/books/searches_controller.rb
+@@ -1,4 +1,7 @@
+ class Books::SearchesController < ApplicationController
++  RATE_LIMITER = RateLimiter.new(scope: "books/searches", limit: 30, within: 1.minute)
++
++  before_action :enforce_rate_limit, only: :create
+   allow_unauthenticated_access
+ 
+   include BookScoped
+@@ -6,4 +9,13 @@ class Books::SearchesController < ApplicationController
+   def create
+     @leaves = @book.leaves.active.search(params[:search]).favoring_title.limit(50)
+   end
++
++  private
++    def enforce_rate_limit
++      allowed, retry_after = RATE_LIMITER.check(request.remote_ip, cache_store: cache_store)
++      unless allowed
++        response.set_header("Retry-After", retry_after.to_s)
++        head :too_many_requests
++      end
++    end
+ end
+diff --git a/app/models/rate_limiter.rb b/app/models/rate_limiter.rb
+new file mode 100644
+index 0000000..59a3624
+--- /dev/null
++++ b/app/models/rate_limiter.rb
+@@ -0,0 +1,144 @@
++require "ipaddr"
++require "securerandom"
++
++class RateLimiter
++  REDIS_SLIDING_WINDOW_SCRIPT = <<~LUA.freeze
++    local key = KEYS[1]
++    local cutoff = tonumber(ARGV[1])
++    local now = tonumber(ARGV[2])
++    local limit = tonumber(ARGV[3])
++    local ttl = tonumber(ARGV[4])
++    local member = ARGV[5]
++
++    redis.call("ZREMRANGEBYSCORE", key, "-inf", cutoff)
++    local count = redis.call("ZCARD", key)
++    if count >= limit then
++      local oldest = redis.call("ZRANGE", key, 0, 0, "WITHSCORES")
++      local retry_after = 1
++      if oldest[2] then
++        retry_after = math.max(1, math.ceil((tonumber(oldest[2]) + ttl) - now))
++      end
++      return { 0, retry_after }
++    end
++
++    redis.call("ZADD", key, now, member)
++    redis.call("PEXPIRE", key, math.ceil(ttl * 1000))
++    return { 1, 0 }
++  LUA
++
++  REDIS_RETRY_COOLDOWN = 1.0
++
++  @registry_mutex = Mutex.new
++  @instances = []
++
++  class << self
++    def register(instance)
++      @registry_mutex.synchronize { @instances << instance }
++      instance
++    end
++
++    def reset_all!
++      instances = @registry_mutex.synchronize { @instances.dup }
++      instances.each(&:reset!)
++    end
++  end
++
++  def initialize(scope:, limit:, within:)
++    @scope = scope
++    @limit = limit
++    @window = within.to_f
++    @fallback_store = ActiveSupport::Cache::MemoryStore.new
++    @mutex = Mutex.new
++    @redis_backoff_until = nil
++    self.class.register(self)
++  end
++
++  def check(identifier, cache_store: nil)
++    key = cache_key_for(identifier)
++    now = Time.now.to_f
++    cutoff = now - @window
++
++    store = resolve_store(cache_store)
++    if store.is_a?(ActiveSupport::Cache::RedisCacheStore)
++      result = check_redis(store, key, now, cutoff)
++      return result if result
++      store = @fallback_store
++    end
++
++    check_cache_store(store, key, now, cutoff)
++  end
++
++  def reset!
++    @mutex.synchronize do
++      @fallback_store.clear
++      @redis_backoff_until = nil
++    end
++  end
++
++  private
++    def resolve_store(cache_store)
++      if usable_store?(cache_store)
++        cache_store
++      elsif usable_store?(Rails.cache)
++        Rails.cache
++      else
++        @fallback_store
++      end
++    end
++
++    def usable_store?(store)
++      store && !store.is_a?(ActiveSupport::Cache::NullStore)
++    end
++
++    def cache_key_for(identifier)
++      "rate-limit:#{@scope}:#{normalize_ip(identifier)}"
++    end
++
++    def normalize_ip(identifier)
++      IPAddr.new(identifier.to_s).to_s
++    rescue IPAddr::InvalidAddressError, ArgumentError
++      identifier.to_s
++    end
++
++    def check_redis(store, key, now, cutoff)
++      monotonic_now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
++      if @mutex.synchronize { @redis_backoff_until && monotonic_now < @redis_backoff_until }
++        return nil
++      end
++
++      redis_key = store.options[:namespace] ? "#{store.options[:namespace]}:#{key}" : key
++      member = "#{now}:#{SecureRandom.hex(6)}"
++      allowed, retry_after = store.redis.then do |client|
++        client.eval(
++          REDIS_SLIDING_WINDOW_SCRIPT,
++          keys: [ redis_key ],
++          argv: [ cutoff.to_s, now.to_s, @limit.to_s, @window.to_s, member ]
++        )
++      end
++
++      @mutex.synchronize { @redis_backoff_until = nil }
++      [ allowed == 1, retry_after.to_i ]
++    rescue ::Redis::BaseError, ConnectionPool::Error, SystemCallError
++      @mutex.synchronize do
++        @redis_backoff_until = Process.clock_gettime(Process::CLOCK_MONOTONIC) + REDIS_RETRY_COOLDOWN
++      end
++      nil
++    end
++
++    def check_cache_store(store, key, now, cutoff)
++      @mutex.synchronize do
++        timestamps = Array(store.read(key))
++        timestamps.reject! { |ts| ts <= cutoff }
++
++        if timestamps.length >= @limit
++          oldest = timestamps.min || now
++          retry_after = [ ((oldest + @window) - now).ceil, 1 ].max
++          [ false, retry_after ]
++        else
++          timestamps << now
++          store.write(key, timestamps, expires_in: @window.seconds)
++          [ true, 0 ]
++        end
++      end
++    end
++end
+diff --git a/config/initializers/rate_limiting.rb b/config/initializers/rate_limiting.rb
+new file mode 100644
+index 0000000..e3cc290
+--- /dev/null
++++ b/config/initializers/rate_limiting.rb
+@@ -0,0 +1,3 @@
++ActiveSupport.on_load(:active_support_test_case) do
++  teardown { RateLimiter.reset_all! }
++end

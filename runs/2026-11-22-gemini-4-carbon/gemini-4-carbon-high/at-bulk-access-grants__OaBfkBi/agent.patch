@@ -1,0 +1,347 @@
+diff --git a/app/jobs/book/access_notification_job.rb b/app/jobs/book/access_notification_job.rb
+index 8e4d36a..695320a 100644
+--- a/app/jobs/book/access_notification_job.rb
++++ b/app/jobs/book/access_notification_job.rb
+@@ -1,4 +1,6 @@
+ class Book::AccessNotificationJob < ApplicationJob
++  self.enqueue_after_transaction_commit = true
++
+   def perform(access)
+     Rails.logger.info(
+       "[access-notification] user=#{access.user_id} book=#{access.book_id} level=#{access.level}"
+diff --git a/app/models/access.rb b/app/models/access.rb
+index 0de39df..615f276 100644
+--- a/app/models/access.rb
++++ b/app/models/access.rb
+@@ -1,5 +1,5 @@
+ class Access < ApplicationRecord
+-  enum :level, %w[ reader editor ].index_by(&:itself)
++  enum :level, %w[ reader editor ].index_by(&:itself), validate: true
+ 
+   belongs_to :user
+   belongs_to :book
+diff --git a/app/models/book/access_import.rb b/app/models/book/access_import.rb
+index 4d920cf..8946e51 100644
+--- a/app/models/book/access_import.rb
++++ b/app/models/book/access_import.rb
+@@ -6,20 +6,67 @@ class Book::AccessImport
+   end
+ 
+   def import
+-    accesses = []
+-    duplicate_index = nil
+-
+-    Access.transaction do
+-      @grants.each_with_index do |grant, index|
+-        access = @book.accesses.create!(user_id: grant[:user_id], level: grant[:level])
+-        Book::AccessNotificationJob.perform_later(access)
+-        accesses << access
+-      rescue ActiveRecord::RecordNotUnique
+-        duplicate_index = index
+-        raise ActiveRecord::Rollback
+-      end
++    accesses = build_accesses
++    return Result.new([], nil) if accesses.empty?
++
++    raise ActiveRecord::RecordNotSaved, "You cannot call create unless the parent is saved" unless @book.persisted?
++
++    user_ids = accesses.filter_map(&:user_id).uniq
++    users_by_id = User.where(id: user_ids).index_by(&:id)
++    seen_user_ids = existing_user_ids_for(user_ids)
++
++    accesses.each_with_index do |access, index|
++      access.association(:user).target = users_by_id[access.user_id]
++      access.validate!
++
++      return Result.new([], index) unless seen_user_ids.add?(access.user_id)
+     end
+ 
+-    duplicate_index ? Result.new([], duplicate_index) : Result.new(accesses, nil)
++    persisted_accesses = insert_accesses(accesses, users_by_id)
++    return Result.new([], find_duplicate_index(accesses, user_ids)) unless persisted_accesses
++
++    ActiveJob.perform_all_later(persisted_accesses.map { |access| Book::AccessNotificationJob.new(access) })
++
++    Result.new(persisted_accesses, nil)
+   end
++
++  private
++    def build_accesses
++      @grants.map do |grant|
++        Access.new(book: @book, user_id: grant[:user_id], level: grant[:level])
++      end
++    end
++
++    def existing_user_ids_for(user_ids)
++      @book.accesses.where(user_id: user_ids).pluck(:user_id).to_set
++    end
++
++    def insert_accesses(accesses, users_by_id)
++      now = Time.current
++      rows = accesses.map do |access|
++        {
++          user_id: access.user_id,
++          level: access.level,
++          created_at: now,
++          updated_at: now
++        }
++      end
++
++      result = @book.accesses.insert_all!(rows, returning: Access.column_names)
++      inserted_by_user_id = result.to_h do |row|
++        access = Access.instantiate(row)
++        access.association(:book).target = @book
++        access.association(:user).target = users_by_id[access.user_id]
++        [ access.user_id, access ]
++      end
++
++      accesses.map { |access| inserted_by_user_id.fetch(access.user_id) }
++    rescue ActiveRecord::RecordNotUnique
++      nil
++    end
++
++    def find_duplicate_index(accesses, user_ids)
++      seen_user_ids = existing_user_ids_for(user_ids)
++      accesses.index { |access| !seen_user_ids.add?(access.user_id) }
++    end
+ end
+diff --git a/test/models/book/access_import_test.rb b/test/models/book/access_import_test.rb
+new file mode 100644
+index 0000000..36da70d
+--- /dev/null
++++ b/test/models/book/access_import_test.rb
+@@ -0,0 +1,234 @@
++require "test_helper"
++
++class Book::AccessImportTest < ActiveSupport::TestCase
++  include ActiveJob::TestHelper
++
++  test "imports valid grants in order and enqueues notifications" do
++    book = books(:manual)
++    book.accesses.delete_all
++
++    grants = [
++      { user_id: users(:kevin).id, level: "editor" },
++      { user_id: users(:jz).id, level: :reader },
++      { user_id: users(:david).id, level: "reader" }
++    ]
++
++    result = nil
++    assert_enqueued_jobs 3, only: Book::AccessNotificationJob do
++      result = Book::AccessImport.new(book, grants).import
++    end
++
++    assert_instance_of Book::AccessImport::Result, result
++    assert_nil result.duplicate_index
++    assert_equal 3, result.accesses.size
++    assert result.accesses.all?(&:persisted?)
++    assert_equal [ users(:kevin).id, users(:jz).id, users(:david).id ], result.accesses.map(&:user_id)
++    assert_equal %w[ editor reader reader ], result.accesses.map(&:level)
++    assert_equal 3, book.accesses.count
++
++    result.accesses.each do |access|
++      assert_enqueued_with job: Book::AccessNotificationJob, args: [ access ]
++    end
++
++    assert_performed_jobs 3, only: Book::AccessNotificationJob do
++      perform_enqueued_jobs
++    end
++  end
++
++  test "imports empty grants without queries or notifications" do
++    book = books(:manual)
++
++    result = nil
++    assert_no_enqueued_jobs do
++      assert_no_queries do
++        result = Book::AccessImport.new(book, []).import
++      end
++    end
++
++    assert_equal [], result.accesses
++    assert_nil result.duplicate_index
++  end
++
++  test "rejects duplicate against existing access without notifying anyone" do
++    book = books(:manual)
++    initial_count = book.accesses.count
++
++    grants = [
++      { user_id: users(:kevin).id, level: :reader },
++      { user_id: users(:david).id, level: :editor }
++    ]
++
++    result = nil
++    assert_no_enqueued_jobs do
++      result = Book::AccessImport.new(book, grants).import
++    end
++
++    assert_equal [], result.accesses
++    assert_equal 1, result.duplicate_index
++    assert_equal initial_count, book.accesses.count
++  end
++
++  test "rejects duplicate within the same roster without notifying anyone" do
++    book = books(:manual)
++    book.accesses.delete_all
++
++    grants = [
++      { user_id: users(:kevin).id, level: :reader },
++      { user_id: users(:jz).id, level: :editor },
++      { user_id: users(:kevin).id, level: :editor }
++    ]
++
++    result = nil
++    assert_no_enqueued_jobs do
++      result = Book::AccessImport.new(book, grants).import
++    end
++
++    assert_equal [], result.accesses
++    assert_equal 2, result.duplicate_index
++    assert_equal 0, book.accesses.count
++  end
++
++  test "turns down unknown level with RecordInvalid and sends no notifications" do
++    book = books(:manual)
++    book.accesses.delete_all
++
++    grants = [
++      { user_id: users(:kevin).id, level: :reader },
++      { user_id: users(:jz).id, level: "moderator" },
++      { user_id: users(:david).id, level: :editor }
++    ]
++
++    assert_no_enqueued_jobs do
++      assert_raises ActiveRecord::RecordInvalid do
++        Book::AccessImport.new(book, grants).import
++      end
++    end
++
++    assert_equal 0, book.accesses.count
++  end
++
++  test "turns down blank or nil level with RecordInvalid and sends no notifications" do
++    book = books(:manual)
++    book.accesses.delete_all
++
++    [ nil, "", "   ", :owner ].each do |bad_level|
++      assert_no_enqueued_jobs do
++        assert_raises ActiveRecord::RecordInvalid do
++          Book::AccessImport.new(book, [
++            { user_id: users(:kevin).id, level: :reader },
++            { user_id: users(:jz).id, level: bad_level }
++          ]).import
++        end
++      end
++
++      assert_equal 0, book.accesses.count
++    end
++  end
++
++  test "turns down missing user with RecordInvalid and sends no notifications" do
++    book = books(:manual)
++    book.accesses.delete_all
++
++    grants = [
++      { user_id: users(:kevin).id, level: :reader },
++      { user_id: -1, level: :editor }
++    ]
++
++    assert_no_enqueued_jobs do
++      assert_raises ActiveRecord::RecordInvalid do
++        Book::AccessImport.new(book, grants).import
++      end
++    end
++
++    assert_equal 0, book.accesses.count
++  end
++
++  test "does not notify when an enclosing transaction rolls back" do
++    book = books(:manual)
++    book.accesses.delete_all
++
++    assert_no_enqueued_jobs do
++      Access.transaction do
++        Book::AccessImport.new(book, [ { user_id: users(:kevin).id, level: :reader } ]).import
++        raise ActiveRecord::Rollback
++      end
++    end
++
++    assert_equal 0, book.accesses.count
++  end
++
++  test "preserves row-by-row precedence between duplicate and invalid rows" do
++    book = books(:manual)
++
++    duplicate_first = [
++      { user_id: users(:david).id, level: :reader },
++      { user_id: users(:kevin).id, level: "unknown" }
++    ]
++    result = Book::AccessImport.new(book, duplicate_first).import
++    assert_equal [], result.accesses
++    assert_equal 0, result.duplicate_index
++
++    invalid_first = [
++      { user_id: users(:kevin).id, level: "unknown" },
++      { user_id: users(:david).id, level: :reader }
++    ]
++    assert_raises ActiveRecord::RecordInvalid do
++      Book::AccessImport.new(book, invalid_first).import
++    end
++  end
++
++  test "sixteen names cost the same queries as four whether taken or turned down" do
++    book_four = Book.create!(title: "Roster Four", everyone_access: false)
++    book_sixteen = Book.create!(title: "Roster Sixteen", everyone_access: false)
++
++    roster_users = User.limit(4).to_a
++    while roster_users.size < 16
++      index = roster_users.size + 1
++      roster_users << User.create!(
++        name: "Roster Member #{index}",
++        email_address: "roster-#{index}@example.com",
++        password_digest: "digest",
++        role: :member
++      )
++    end
++
++    four_valid = roster_users.first(4).map { |u| { user_id: u.id, level: :reader } }
++    sixteen_valid = roster_users.first(16).map { |u| { user_id: u.id, level: :reader } }
++
++    four_taken_queries = count_sql_queries { Book::AccessImport.new(book_four, four_valid).import }
++    sixteen_taken_queries = count_sql_queries { Book::AccessImport.new(book_sixteen, sixteen_valid).import }
++    assert_equal four_taken_queries, sixteen_taken_queries
++
++    book_four.accesses.delete_all
++    book_sixteen.accesses.delete_all
++
++    four_dup = roster_users.first(3).map { |u| { user_id: u.id, level: :reader } } + [ { user_id: roster_users.first.id, level: :editor } ]
++    sixteen_dup = roster_users.first(15).map { |u| { user_id: u.id, level: :reader } } + [ { user_id: roster_users.first.id, level: :editor } ]
++
++    four_dup_queries = count_sql_queries { Book::AccessImport.new(book_four, four_dup).import }
++    sixteen_dup_queries = count_sql_queries { Book::AccessImport.new(book_sixteen, sixteen_dup).import }
++    assert_equal four_dup_queries, sixteen_dup_queries
++
++    four_bad_level = roster_users.first(3).map { |u| { user_id: u.id, level: :reader } } + [ { user_id: roster_users[3].id, level: "unknown" } ]
++    sixteen_bad_level = roster_users.first(15).map { |u| { user_id: u.id, level: :reader } } + [ { user_id: roster_users[15].id, level: "unknown" } ]
++
++    four_bad_queries = count_sql_queries do
++      assert_raises(ActiveRecord::RecordInvalid) { Book::AccessImport.new(book_four, four_bad_level).import }
++    end
++    sixteen_bad_queries = count_sql_queries do
++      assert_raises(ActiveRecord::RecordInvalid) { Book::AccessImport.new(book_sixteen, sixteen_bad_level).import }
++    end
++    assert_equal four_bad_queries, sixteen_bad_queries
++  end
++
++  private
++    def count_sql_queries(&block)
++      ActiveRecord::Base.lease_connection.materialize_transactions
++      queries = []
++      subscriber = ->(*, payload) do
++        queries << payload[:sql] unless payload[:name] == "SCHEMA" || payload[:cached]
++      end
++      ActiveSupport::Notifications.subscribed(subscriber, "sql.active_record", &block)
++      queries.size
++    end
++end

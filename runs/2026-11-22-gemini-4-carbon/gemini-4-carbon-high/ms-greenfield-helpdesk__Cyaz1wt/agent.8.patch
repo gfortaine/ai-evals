@@ -1,0 +1,1327 @@
+diff --git a/app/controllers/api/v1/base_controller.rb b/app/controllers/api/v1/base_controller.rb
+index 109d4bc..ee60dc4 100644
+--- a/app/controllers/api/v1/base_controller.rb
++++ b/app/controllers/api/v1/base_controller.rb
+@@ -1,6 +1,8 @@
+ module Api
+   module V1
+     class BaseController < ApplicationController
++      include CursorPaginatable
++
+       class InvalidPaginationError < StandardError
+         attr_reader :errors_hash
+ 
+@@ -92,10 +94,37 @@ module Api
+         raw.to_s.strip
+       end
+ 
+-      def render_paginated(collection_key, scope)
++      def render_paginated(
++        collection_key,
++        scope,
++        cursor_scope: collection_key,
++        sort_column: nil,
++        direction: :asc,
++        cursor_context: {},
++        &block
++      )
++        if cursor_pagination_requested?
++          return render_cursor_paginated(
++            collection_key,
++            scope,
++            cursor_scope: cursor_scope,
++            sort_column: sort_column,
++            direction: direction,
++            cursor_context: cursor_context,
++            &block
++          )
++        end
++
+         page = parse_positive_integer_param(:page, default: DEFAULT_PAGE)
+         per_page = parse_positive_integer_param(:per_page, default: DEFAULT_PER_PAGE)
+ 
++        if per_page > MAX_PAGINATION_BIGINT || (page - 1) * per_page > MAX_PAGINATION_BIGINT
++          raise InvalidPaginationError.new(
++            "Pagination value is too large",
++            { page: [ "is too large" ] }
++          )
++        end
++
+         total_count = scope.count
+         total_pages = total_count.zero? ? 0 : (total_count.to_f / per_page).ceil
+         records = scope.offset((page - 1) * per_page).limit(per_page)
+@@ -119,6 +148,13 @@ module Api
+ 
+       def parse_positive_integer_param(name, default:)
+         raw = params[name]
++        if raw.is_a?(Array) || raw.is_a?(Hash) || raw.is_a?(ActionController::Parameters) || raw == true || raw == false
++          raise InvalidPaginationError.new(
++            "#{name.to_s.humanize} must be a positive integer",
++            { name => [ "must be a positive integer" ] }
++          )
++        end
++
+         return default if raw.nil? || raw.to_s.strip.empty?
+ 
+         str = raw.to_s.strip
+diff --git a/app/controllers/api/v1/requests/comments_controller.rb b/app/controllers/api/v1/requests/comments_controller.rb
+index 583947f..e5c8e6f 100644
+--- a/app/controllers/api/v1/requests/comments_controller.rb
++++ b/app/controllers/api/v1/requests/comments_controller.rb
+@@ -10,7 +10,14 @@ module Api
+         def index
+           ticket = current_account.tickets.where(requester_id: current_user.id).find(params[:request_id])
+           scope = ticket.comments.where(public: true).includes(:author).oldest_first
+-          render_paginated(:comments, scope) { |records| records.map(&:as_api_json) }
++          render_paginated(
++            :comments,
++            scope,
++            cursor_scope: "request_comments",
++            sort_column: :created_at,
++            direction: :asc,
++            cursor_context: { p: ticket.id, u: current_user.id }
++          ) { |records| records.map(&:as_api_json) }
+         end
+       end
+     end
+diff --git a/app/controllers/api/v1/requests_controller.rb b/app/controllers/api/v1/requests_controller.rb
+index 4965bd6..0af9673 100644
+--- a/app/controllers/api/v1/requests_controller.rb
++++ b/app/controllers/api/v1/requests_controller.rb
+@@ -22,7 +22,7 @@ module Api
+           scope = scope.where(status: status_filter)
+         end
+ 
+-        render_paginated(:requests, scope) { |records| records.map(&:as_request_json) }
++        render_paginated(:requests, scope, cursor_scope: "requests", sort_column: :customer_updated_at, direction: :desc, cursor_context: { u: current_user.id }) { |records| records.map(&:as_request_json) }
+       end
+ 
+       def show
+diff --git a/app/controllers/api/v1/tickets/comments_controller.rb b/app/controllers/api/v1/tickets/comments_controller.rb
+index 147e044..141dfc7 100644
+--- a/app/controllers/api/v1/tickets/comments_controller.rb
++++ b/app/controllers/api/v1/tickets/comments_controller.rb
+@@ -10,7 +10,14 @@ module Api
+         def index
+           ticket = current_account.tickets.find(params[:ticket_id])
+           scope = ticket.comments.includes(:author).oldest_first
+-          render_paginated(:comments, scope) { |records| records.map(&:as_api_json) }
++          render_paginated(
++            :comments,
++            scope,
++            cursor_scope: "ticket_comments",
++            sort_column: :created_at,
++            direction: :asc,
++            cursor_context: { p: ticket.id }
++          ) { |records| records.map(&:as_api_json) }
+         end
+       end
+     end
+diff --git a/app/controllers/api/v1/tickets_controller.rb b/app/controllers/api/v1/tickets_controller.rb
+index 955f7de..e28d3fc 100644
+--- a/app/controllers/api/v1/tickets_controller.rb
++++ b/app/controllers/api/v1/tickets_controller.rb
+@@ -93,7 +93,7 @@ module Api
+           }, status: :unprocessable_entity
+         end
+ 
+-        render_paginated(:tickets, scope) { |records| records.map(&:as_ticket_json) }
++        render_paginated(:tickets, scope, cursor_scope: "tickets", sort_column: :updated_at, direction: :desc) { |records| records.map(&:as_ticket_json) }
+       end
+ 
+       def show
+diff --git a/app/controllers/concerns/cursor_paginatable.rb b/app/controllers/concerns/cursor_paginatable.rb
+new file mode 100644
+index 0000000..3d0af84
+--- /dev/null
++++ b/app/controllers/concerns/cursor_paginatable.rb
+@@ -0,0 +1,381 @@
++require "base64"
++require "json"
++require "openssl"
++
++module CursorPaginatable
++  extend ActiveSupport::Concern
++
++  MAX_PAGINATION_BIGINT = 9_223_372_036_854_775_807
++  CURSOR_VERSION = 1
++  CURSOR_MAC_BYTES = 16
++  ALLOWED_CURSOR_PAGE_KEYS = %w[size after before].freeze
++
++  private
++
++  def cursor_pagination_requested?
++    params[:page].is_a?(ActionController::Parameters) || params[:page].is_a?(Hash)
++  end
++
++  def render_cursor_paginated(
++    collection_key,
++    scope,
++    cursor_scope:,
++    sort_column: nil,
++    direction: :asc,
++    cursor_context: {}
++  )
++    normalized_context = normalize_cursor_context(cursor_context)
++    parsed = parse_cursor_pagination_params(
++      cursor_scope: cursor_scope.to_s,
++      sort_column: sort_column,
++      cursor_context: normalized_context
++    )
++
++    size = parsed[:size]
++    mode = parsed[:mode]
++    cursor = parsed[:cursor]
++
++    arel_table = scope.klass.arel_table
++    reverse_direction = direction == :asc ? :desc : :asc
++
++    forward_order = build_cursor_order(arel_table, sort_column, direction)
++    backward_order = build_cursor_order(arel_table, sort_column, reverse_direction)
++
++    case mode
++    when :initial
++      fetched = scope.reorder(*forward_order).limit(size + 1).to_a
++      has_next = fetched.length > size
++      records = fetched.first(size)
++      has_prev = false
++      has_more = has_next
++    when :after
++      predicate = build_cursor_predicate(scope.klass, sort_column, direction, :after, cursor)
++      fetched = scope.where(*predicate).reorder(*forward_order).limit(size + 1).to_a
++      has_next = fetched.length > size
++      records = fetched.first(size)
++      has_prev = if records.any?
++        first_values = extract_cursor_values(records.first, sort_column)
++        prev_predicate = build_cursor_predicate(scope.klass, sort_column, direction, :before, first_values)
++        cursor_neighbor_exists?(scope, prev_predicate, backward_order)
++      else
++        false
++      end
++      has_more = has_next
++    when :before
++      predicate = build_cursor_predicate(scope.klass, sort_column, direction, :before, cursor)
++      fetched = scope.where(*predicate).reorder(*backward_order).limit(size + 1).to_a
++      has_prev = fetched.length > size
++      records = fetched.first(size).reverse
++      has_next = if records.any?
++        last_values = extract_cursor_values(records.last, sort_column)
++        next_predicate = build_cursor_predicate(scope.klass, sort_column, direction, :after, last_values)
++        cursor_neighbor_exists?(scope, next_predicate, forward_order)
++      else
++        false
++      end
++      has_more = has_prev
++    end
++
++    if records.any?
++      before_cursor = encode_cursor(
++        records.first,
++        cursor_scope: cursor_scope.to_s,
++        sort_column: sort_column,
++        cursor_context: normalized_context
++      )
++      after_cursor = encode_cursor(
++        records.last,
++        cursor_scope: cursor_scope.to_s,
++        sort_column: sort_column,
++        cursor_context: normalized_context
++      )
++    else
++      before_cursor = nil
++      after_cursor = nil
++    end
++
++    next_link = has_next && after_cursor ? build_cursor_link(size: size, after: after_cursor) : nil
++    prev_link = has_prev && before_cursor ? build_cursor_link(size: size, before: before_cursor) : nil
++
++    render json: {
++      collection_key => yield(records),
++      meta: {
++        has_more: has_more,
++        after_cursor: after_cursor,
++        before_cursor: before_cursor
++      },
++      links: {
++        next: next_link,
++        prev: prev_link
++      }
++    }, status: :ok
++  end
++
++  def parse_cursor_pagination_params(cursor_scope:, sort_column:, cursor_context:)
++    raw_page = params[:page]
++    raw_hash = raw_page.is_a?(ActionController::Parameters) ? raw_page.to_unsafe_h : raw_page
++
++    string_hash = {}
++    raw_hash.each do |k, v|
++      string_hash[k.to_s] = v
++    end
++
++    unknown_keys = string_hash.keys - ALLOWED_CURSOR_PAGE_KEYS
++    if unknown_keys.any?
++      bad_key = unknown_keys.first
++      raise self.class::InvalidPaginationError.new(
++        "Unsupported page parameter: #{bad_key}",
++        { :"page.#{bad_key}" => [ "is not supported" ] }
++      )
++    end
++
++    compacted = string_hash.reject { |_k, v| v.nil? }
++    if compacted.empty?
++      raise self.class::InvalidPaginationError.new(
++        "Page parameters are invalid",
++        { page: [ "is invalid" ] }
++      )
++    end
++
++    fallback_per_page = if params.key?(:per_page)
++      val = parse_positive_integer_param(:per_page, default: self.class::DEFAULT_PER_PAGE)
++      if val >= MAX_PAGINATION_BIGINT
++        raise self.class::InvalidPaginationError.new(
++          "Per page is too large",
++          { per_page: [ "is too large" ] }
++        )
++      end
++      val
++    else
++      self.class::DEFAULT_PER_PAGE
++    end
++
++    size = if compacted.key?("size")
++      parse_strict_cursor_size!(compacted["size"])
++    else
++      fallback_per_page
++    end
++
++    has_after = compacted.key?("after")
++    has_before = compacted.key?("before")
++
++    if has_after && has_before
++      raise self.class::InvalidPaginationError.new(
++        "Cannot specify both page[after] and page[before]",
++        { page: [ "cannot specify both after and before" ] }
++      )
++    end
++
++    if has_after
++      cursor = decode_cursor!(
++        compacted["after"],
++        param_key: :"page.after",
++        cursor_scope: cursor_scope,
++        sort_column: sort_column,
++        cursor_context: cursor_context
++      )
++      { size: size, mode: :after, cursor: cursor }
++    elsif has_before
++      cursor = decode_cursor!(
++        compacted["before"],
++        param_key: :"page.before",
++        cursor_scope: cursor_scope,
++        sort_column: sort_column,
++        cursor_context: cursor_context
++      )
++      { size: size, mode: :before, cursor: cursor }
++    else
++      { size: size, mode: :initial, cursor: nil }
++    end
++  end
++
++  def parse_strict_cursor_size!(raw_size)
++    if raw_size.is_a?(Array) || raw_size.is_a?(Hash) || raw_size.is_a?(ActionController::Parameters) || raw_size == true || raw_size == false
++      raise self.class::InvalidPaginationError.new(
++        "Page size must be a positive integer",
++        { :"page.size" => [ "must be a positive integer" ] }
++      )
++    end
++
++    str = raw_size.to_s.strip
++    unless str.match?(/\A\d+\z/)
++      raise self.class::InvalidPaginationError.new(
++        "Page size must be a positive integer",
++        { :"page.size" => [ "must be a positive integer" ] }
++      )
++    end
++
++    value = str.to_i
++    if value < 1
++      raise self.class::InvalidPaginationError.new(
++        "Page size must be greater than 0",
++        { :"page.size" => [ "must be greater than 0" ] }
++      )
++    end
++
++    if value >= MAX_PAGINATION_BIGINT
++      raise self.class::InvalidPaginationError.new(
++        "Page size is too large",
++        { :"page.size" => [ "is too large" ] }
++      )
++    end
++
++    value
++  end
++
++  def build_cursor_order(arel_table, sort_column, dir)
++    if sort_column
++      [ arel_table[sort_column].public_send(dir), arel_table[:id].public_send(dir) ]
++    else
++      [ arel_table[:id].public_send(dir) ]
++    end
++  end
++
++  def build_cursor_predicate(klass, sort_column, direction, browse_dir, cursor_vals)
++    conn = klass.connection
++    quoted_table = klass.quoted_table_name
++    quoted_id = "#{quoted_table}.#{conn.quote_column_name(:id)}"
++
++    operator = if (direction == :asc && browse_dir == :after) || (direction == :desc && browse_dir == :before)
++      ">"
++    else
++      "<"
++    end
++
++    if sort_column
++      quoted_sort = "#{quoted_table}.#{conn.quote_column_name(sort_column)}"
++      [ "(#{quoted_sort}, #{quoted_id}) #{operator} (?, ?)", cursor_vals[:time], cursor_vals[:id] ]
++    else
++      [ "#{quoted_id} #{operator} ?", cursor_vals[:id] ]
++    end
++  end
++
++  def cursor_neighbor_exists?(base_scope, predicate, order_clauses)
++    base_scope
++      .except(:includes, :preload, :eager_load, :select)
++      .where(*predicate)
++      .reorder(*order_clauses)
++      .limit(1)
++      .pluck(Arel.sql("1"))
++      .any?
++  end
++
++  def extract_cursor_values(record, sort_column)
++    if sort_column
++      ts = record.public_send(sort_column).utc
++      { id: record.id, time: Time.at(ts.to_i, ts.usec, :microsecond, in: "UTC") }
++    else
++      { id: record.id, time: nil }
++    end
++  end
++
++  def normalize_cursor_context(cursor_context)
++    result = {}
++    (cursor_context || {}).each do |k, v|
++      result[k.to_s] = v
++    end
++    result
++  end
++
++  def encode_cursor(record, cursor_scope:, sort_column:, cursor_context:)
++    payload = {
++      "v" => CURSOR_VERSION,
++      "s" => cursor_scope,
++      "a" => current_account.id,
++      "i" => record.id
++    }
++
++    if sort_column
++      ts = record.public_send(sort_column).utc
++      payload["t"] = (ts.to_i * 1_000_000) + ts.usec
++    end
++
++    payload["c"] = cursor_context unless cursor_context.empty?
++
++    json = JSON.generate(payload)
++    mac = OpenSSL::HMAC.digest("SHA256", cursor_signing_key, json).byteslice(0, CURSOR_MAC_BYTES)
++    Base64.urlsafe_encode64(mac + json, padding: false)
++  end
++
++  def decode_cursor!(raw_cursor, param_key:, cursor_scope:, sort_column:, cursor_context:)
++    unless raw_cursor.is_a?(String) && raw_cursor.bytesize.between?(1, 1024) && raw_cursor.match?(/\A[A-Za-z0-9_-]+\z/)
++      raise_invalid_cursor!(param_key)
++    end
++
++    decoded = begin
++      Base64.urlsafe_decode64(raw_cursor)
++    rescue ArgumentError
++      raise_invalid_cursor!(param_key)
++    end
++
++    if decoded.bytesize <= CURSOR_MAC_BYTES || Base64.urlsafe_encode64(decoded, padding: false) != raw_cursor
++      raise_invalid_cursor!(param_key)
++    end
++
++    provided_mac = decoded.byteslice(0, CURSOR_MAC_BYTES)
++    json = decoded.byteslice(CURSOR_MAC_BYTES, decoded.bytesize - CURSOR_MAC_BYTES)
++    expected_mac = OpenSSL::HMAC.digest("SHA256", cursor_signing_key, json).byteslice(0, CURSOR_MAC_BYTES)
++
++    unless ActiveSupport::SecurityUtils.secure_compare(provided_mac, expected_mac)
++      raise_invalid_cursor!(param_key)
++    end
++
++    data = begin
++      JSON.parse(json)
++    rescue JSON::ParserError
++      raise_invalid_cursor!(param_key)
++    end
++
++    unless data.is_a?(Hash) &&
++        data["v"] == CURSOR_VERSION &&
++        data["s"] == cursor_scope &&
++        data["a"] == current_account.id &&
++        (data["c"] || {}) == cursor_context
++      raise_invalid_cursor!(param_key)
++    end
++
++    id_val = data["i"]
++    unless id_val.is_a?(Integer) && id_val >= 1 && id_val <= MAX_PAGINATION_BIGINT
++      raise_invalid_cursor!(param_key)
++    end
++
++    if sort_column
++      t_val = data["t"]
++      unless t_val.is_a?(Integer)
++        raise_invalid_cursor!(param_key)
++      end
++
++      sec, usec = t_val.divmod(1_000_000)
++      cursor_time = begin
++        Time.at(sec, usec, :microsecond, in: "UTC")
++      rescue RangeError, ArgumentError
++        raise_invalid_cursor!(param_key)
++      end
++
++      { id: id_val, time: cursor_time }
++    else
++      raise_invalid_cursor!(param_key) if data.key?("t")
++      { id: id_val, time: nil }
++    end
++  end
++
++  def raise_invalid_cursor!(param_key)
++    raise self.class::InvalidPaginationError.new(
++      "Invalid pagination cursor",
++      { param_key => [ "is invalid" ] }
++    )
++  end
++
++  def cursor_signing_key
++    OpenSSL::HMAC.digest("SHA256", Rails.application.secret_key_base.to_s, "helpdesk:cursor:v1")
++  end
++
++  def build_cursor_link(size:, after: nil, before: nil)
++    preserved = request.query_parameters.except("page", "per_page").deep_dup
++    page_params = { "size" => size }
++    page_params["after"] = after if after
++    page_params["before"] = before if before
++    preserved["page"] = page_params
++    "#{request.path}?#{preserved.to_query}"
++  end
++end
+diff --git a/db/migrate/20261121060000_add_cursor_pagination_indexes.rb b/db/migrate/20261121060000_add_cursor_pagination_indexes.rb
+new file mode 100644
+index 0000000..337035c
+--- /dev/null
++++ b/db/migrate/20261121060000_add_cursor_pagination_indexes.rb
+@@ -0,0 +1,20 @@
++class AddCursorPaginationIndexes < ActiveRecord::Migration[8.1]
++  def change
++    add_index :tickets,
++      [ :account_id, :requester_id, :status, :customer_updated_at, :id ],
++      name: "idx_tickets_on_account_requester_status_cust_updated_id"
++
++    add_index :comments,
++      [ :ticket_id, :public, :created_at, :id ],
++      name: "index_comments_on_ticket_id_and_public_and_created_at_and_id"
++
++    add_index :users,
++      [ :account_id, :id ],
++      name: "index_users_on_account_id_and_id"
++
++    add_index :users,
++      [ :account_id, :id ],
++      where: "role IN ('admin', 'agent') AND suspended_at IS NULL",
++      name: "index_users_on_account_id_and_id_active_staff"
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 63c19d8..c37e406 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.1].define(version: 2026_11_21_050000) do
++ActiveRecord::Schema[8.1].define(version: 2026_11_21_060000) do
+   # These are extensions that must be enabled in order to support this database
+   enable_extension "pg_catalog.plpgsql"
+ 
+@@ -74,6 +74,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_21_050000) do
+     t.index ["account_id"], name: "index_comments_on_account_id"
+     t.index ["author_id"], name: "index_comments_on_author_id"
+     t.index ["ticket_id", "created_at", "id"], name: "index_comments_on_ticket_id_and_created_at_and_id"
++    t.index ["ticket_id", "public", "created_at", "id"], name: "index_comments_on_ticket_id_and_public_and_created_at_and_id"
+     t.index ["ticket_id", "public"], name: "index_comments_on_ticket_id_and_public"
+     t.index ["ticket_id"], name: "index_comments_on_ticket_id"
+   end
+@@ -169,6 +170,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_21_050000) do
+     t.index ["account_id", "priority", "updated_at", "id"], name: "index_tickets_on_account_id_and_priority_and_updated_at_and_id"
+     t.index ["account_id", "reply_token"], name: "index_tickets_on_account_id_and_reply_token", unique: true
+     t.index ["account_id", "requester_id", "customer_updated_at", "id"], name: "index_tickets_on_account_requester_customer_updated_id"
++    t.index ["account_id", "requester_id", "status", "customer_updated_at", "id"], name: "idx_tickets_on_account_requester_status_cust_updated_id"
+     t.index ["account_id", "requester_id", "updated_at", "id"], name: "idx_on_account_id_requester_id_updated_at_id_ba73f495e1"
+     t.index ["account_id", "status", "updated_at", "id"], name: "index_tickets_on_account_id_and_status_and_updated_at_and_id"
+     t.index ["account_id", "updated_at", "id"], name: "index_tickets_on_account_id_and_updated_at_and_id"
+@@ -195,6 +197,8 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_21_050000) do
+     t.datetime "updated_at", null: false
+     t.datetime "suspended_at"
+     t.index ["account_id", "email"], name: "index_users_on_account_id_and_email", unique: true
++    t.index ["account_id", "id"], name: "index_users_on_account_id_and_id"
++    t.index ["account_id", "id"], name: "index_users_on_account_id_and_id_active_staff", where: "(((role)::text = ANY ((ARRAY['admin'::character varying, 'agent'::character varying])::text[])) AND (suspended_at IS NULL))"
+     t.index ["account_id", "role", "suspended_at", "id"], name: "index_users_on_account_id_and_role_and_suspended_at_and_id"
+     t.index ["account_id"], name: "index_users_on_account_id"
+     t.index ["email_verification_token_digest"], name: "index_users_on_email_verification_token_digest"
+diff --git a/test/integration/cursor_pagination_test.rb b/test/integration/cursor_pagination_test.rb
+new file mode 100644
+index 0000000..6a09e2f
+--- /dev/null
++++ b/test/integration/cursor_pagination_test.rb
+@@ -0,0 +1,738 @@
++require "test_helper"
++
++class CursorPaginationTest < ActionDispatch::IntegrationTest
++  private
++
++  def register_and_verify_customer!(subdomain:, name:, email:, password: "my-customer-password")
++    post "/api/v1/registrations",
++      params: { user: { name: name, email: email, password: password } },
++      headers: { "X-Helpdesk-Account" => subdomain },
++      as: :json
++    assert_response :created
++
++    token = extract_token_from_mail(
++      ActionMailer::Base.deliveries.last,
++      expected_path: "/verify-email",
++      expected_account: subdomain.downcase
++    )
++
++    post "/api/v1/email_verifications/confirm",
++      params: { email_verification: { token: token } },
++      headers: { "X-Helpdesk-Account" => subdomain },
++      as: :json
++    assert_response :ok
++
++    ActionMailer::Base.deliveries.clear
++    account = Account.find_by!(subdomain: subdomain.downcase)
++    User.find_by!(account: account, email: email.strip.downcase)
++  end
++
++  def auth_headers(subdomain, token)
++    {
++      "X-Helpdesk-Account" => subdomain,
++      "Authorization" => "Bearer #{token}"
++    }
++  end
++
++  public
++
++  test "empty and single-record cursor responses match exact envelope and legacy page-number API remains intact" do
++    acme, owner = register_and_verify_account!(account_name: "Acme", subdomain: "acme", email: "jo@acme.test")
++    customer = register_and_verify_customer!(subdomain: "acme", name: "Avery", email: "avery@example.test")
++
++    owner_token = sign_in!(subdomain: "acme", email: "jo@acme.test", password: "my-first-password").dig("session", "token")
++    customer_token = sign_in!(subdomain: "acme", email: "avery@example.test", password: "my-customer-password").dig("session", "token")
++    owner_headers = auth_headers("acme", owner_token)
++    customer_headers = auth_headers("acme", customer_token)
++
++    # Exact empty cursor response from prompt
++    get "/api/v1/tickets?page[size]=25&status=open", headers: owner_headers
++    assert_response :ok
++    empty_cursor = JSON.parse(response.body)
++    assert_equal(
++      {
++        "tickets" => [],
++        "meta" => {
++          "has_more" => false,
++          "after_cursor" => nil,
++          "before_cursor" => nil
++        },
++        "links" => {
++          "next" => nil,
++          "prev" => nil
++        }
++      },
++      empty_cursor
++    )
++
++    # Legacy page-number API without cursor params remains unchanged
++    get "/api/v1/tickets?status=open", headers: owner_headers
++    assert_response :ok
++    legacy_empty = JSON.parse(response.body)
++    assert_equal(
++      {
++        "tickets" => [],
++        "count" => 0,
++        "page" => 1,
++        "per_page" => 25,
++        "next_page" => nil,
++        "previous_page" => nil
++      },
++      legacy_empty
++    )
++
++    # Single-record page provides both first and last cursors (equal), has_more: false, null links
++    post "/api/v1/requests",
++      params: { request: { subject: "Only ticket", comment: { body: "Hello there" } } },
++      headers: customer_headers,
++      as: :json
++    assert_response :created
++    only_id = JSON.parse(response.body).dig("request", "id")
++
++    get "/api/v1/tickets", params: { page: { size: 25 }, status: "open" }, headers: owner_headers
++    assert_response :ok
++    single = JSON.parse(response.body)
++    assert_equal [ only_id ], single.fetch("tickets").map { |t| t.fetch("id") }
++    assert_equal false, single.dig("meta", "has_more")
++    assert_kind_of String, single.dig("meta", "after_cursor")
++    assert_equal single.dig("meta", "before_cursor"), single.dig("meta", "after_cursor")
++    assert_nil single.dig("links", "next")
++    assert_nil single.dig("links", "prev")
++
++    # Requesting after last or before first returns empty envelope
++    c_only = single.dig("meta", "after_cursor")
++    get "/api/v1/tickets", params: { page: { after: c_only, size: 25 }, status: "open" }, headers: owner_headers
++    assert_response :ok
++    assert_equal [], JSON.parse(response.body).fetch("tickets")
++    assert_equal({ "has_more" => false, "after_cursor" => nil, "before_cursor" => nil }, JSON.parse(response.body).fetch("meta"))
++    assert_equal({ "next" => nil, "prev" => nil }, JSON.parse(response.body).fetch("links"))
++
++    get "/api/v1/tickets", params: { page: { before: c_only, size: 25 }, status: "open" }, headers: owner_headers
++    assert_response :ok
++    assert_equal [], JSON.parse(response.body).fetch("tickets")
++    assert_equal({ "has_more" => false, "after_cursor" => nil, "before_cursor" => nil }, JSON.parse(response.body).fetch("meta"))
++    assert_equal({ "next" => nil, "prev" => nil }, JSON.parse(response.body).fetch("links"))
++  end
++
++  test "supports forward and backward cursor pagination and link following across all 9 collections with filters" do
++    base_time = Time.utc(2026, 11, 21, 9, 0, 0)
++    acme = owner = customer = nil
++    agents = []
++    groups = []
++    memberships = []
++    invitations = []
++    ticket_ids = []
++
++    travel_to(base_time) do
++      acme, owner = register_and_verify_account!(account_name: "Acme", subdomain: "acme", email: "jo@acme.test")
++      customer = register_and_verify_customer!(subdomain: "acme", name: "Avery", email: "avery@example.test")
++
++      4.times do |i|
++        agents << User.create!(
++          account: acme,
++          name: "Agent #{i + 1}",
++          email: "agent#{i + 1}@acme.test",
++          password: "agent-password",
++          role: "agent",
++          verified_at: Time.current
++        )
++      end
++
++      4.times do |i|
++        groups << Group.create!(account: acme, name: "Group #{i + 1}")
++      end
++
++      agents.each_with_index do |ag, idx|
++        memberships << GroupMembership.create!(account: acme, group: groups[0], user: ag, default: true)
++        memberships << GroupMembership.create!(account: acme, group: groups[1], user: ag, default: false) if idx < 2
++      end
++
++      4.times do |i|
++        inv = acme.invitations.new(invited_by: owner, email: "invite#{i + 1}@acme.test", role: "agent")
++        inv.assign_new_token!(Time.current)
++        inv.save!
++        invitations << inv
++      end
++    end
++
++    owner_token = sign_in!(subdomain: "acme", email: "jo@acme.test", password: "my-first-password").dig("session", "token")
++    customer_token = sign_in!(subdomain: "acme", email: "avery@example.test", password: "my-customer-password").dig("session", "token")
++    owner_headers = auth_headers("acme", owner_token)
++    customer_headers = auth_headers("acme", customer_token)
++
++    # Create 5 tickets at distinct times, plus 1 solved ticket to verify filter preservation
++    5.times do |i|
++      travel_to(base_time + (i + 1).minutes) do
++        t = Ticket.create!(
++          account: acme,
++          requester: customer,
++          group: groups[0],
++          assignee: agents[0],
++          subject: "Receipt issue #{i + 1}",
++          status: "open",
++          priority: "high"
++        )
++        Comment.create!(account: acme, ticket: t, author: customer, body: "Initial receipt body #{i + 1}", public: true)
++        ticket_ids << t.id
++      end
++    end
++
++    travel_to(base_time + 10.minutes) do
++      closed_t = Ticket.create!(
++        account: acme,
++        requester: customer,
++        subject: "Solved receipt ticket",
++        status: "solved",
++        priority: "high"
++      )
++      Comment.create!(account: acme, ticket: closed_t, author: customer, body: "Solved receipt", public: true)
++    end
++
++    # Expected open high-priority tickets newest first
++    expected_tickets = ticket_ids.reverse
++
++    # 1. Tickets (/api/v1/tickets) with multiple filters preserved in links
++    get "/api/v1/tickets",
++      params: {
++        page: { size: 2 },
++        status: "open",
++        priority: "high",
++        group_id: groups[0].id,
++        assignee_id: agents[0].id,
++        requester_id: customer.id,
++        q: "receipt"
++      },
++      headers: owner_headers
++    assert_response :ok
++    tp1 = JSON.parse(response.body)
++    assert_equal expected_tickets[0, 2], tp1.fetch("tickets").map { |t| t.fetch("id") }
++    assert_equal true, tp1.dig("meta", "has_more")
++    assert_nil tp1.dig("links", "prev")
++    assert_not_nil tp1.dig("links", "next")
++
++    get tp1.dig("links", "next"), headers: owner_headers
++    assert_response :ok
++    tp2 = JSON.parse(response.body)
++    assert_equal expected_tickets[2, 2], tp2.fetch("tickets").map { |t| t.fetch("id") }
++    assert_equal true, tp2.dig("meta", "has_more")
++    assert_not_nil tp2.dig("links", "next")
++    assert_not_nil tp2.dig("links", "prev")
++
++    get tp2.dig("links", "next"), headers: owner_headers
++    assert_response :ok
++    tp3 = JSON.parse(response.body)
++    assert_equal expected_tickets[4, 1], tp3.fetch("tickets").map { |t| t.fetch("id") }
++    assert_equal false, tp3.dig("meta", "has_more")
++    assert_nil tp3.dig("links", "next")
++    assert_not_nil tp3.dig("links", "prev")
++
++    # Follow prev links all the way back to page 1
++    get tp3.dig("links", "prev"), headers: owner_headers
++    assert_response :ok
++    tp2_back = JSON.parse(response.body)
++    assert_equal expected_tickets[2, 2], tp2_back.fetch("tickets").map { |t| t.fetch("id") }
++    assert_equal true, tp2_back.dig("meta", "has_more")
++    assert_not_nil tp2_back.dig("links", "prev")
++    assert_not_nil tp2_back.dig("links", "next")
++
++    get tp2_back.dig("links", "prev"), headers: owner_headers
++    assert_response :ok
++    tp1_back = JSON.parse(response.body)
++    assert_equal expected_tickets[0, 2], tp1_back.fetch("tickets").map { |t| t.fetch("id") }
++    assert_equal false, tp1_back.dig("meta", "has_more")
++    assert_nil tp1_back.dig("links", "prev")
++    assert_not_nil tp1_back.dig("links", "next")
++
++    # 2. Requests (/api/v1/requests) with status=open filter and exact-multiple check
++    get "/api/v1/requests", params: { page: { size: 2 }, status: "open" }, headers: customer_headers
++    assert_response :ok
++    rp1 = JSON.parse(response.body)
++    assert_equal expected_tickets[0, 2], rp1.fetch("requests").map { |r| r.fetch("id") }
++    assert_equal true, rp1.dig("meta", "has_more")
++
++    # Manual page[after] with different page[size]=3 (exact remaining 3 items -> has_more: false!)
++    get "/api/v1/requests",
++      params: { page: { after: rp1.dig("meta", "after_cursor"), size: 3 }, status: "open" },
++      headers: customer_headers
++    assert_response :ok
++    rp2 = JSON.parse(response.body)
++    assert_equal expected_tickets[2, 3], rp2.fetch("requests").map { |r| r.fetch("id") }
++    assert_equal false, rp2.dig("meta", "has_more")
++    assert_nil rp2.dig("links", "next")
++    assert_not_nil rp2.dig("links", "prev")
++
++    # 3 & 4. Ticket Comments (/api/v1/tickets/:id/comments) and Request Comments (/api/v1/requests/:id/comments)
++    target_ticket = Ticket.find(ticket_ids.first)
++    4.times do |i|
++      travel_to(base_time + (20 + i).minutes) do
++        Comment.create!(
++          account: acme,
++          ticket: target_ticket,
++          author: owner,
++          body: "Comment #{i + 2}",
++          public: i != 1 # one private note
++        )
++      end
++    end
++
++    # Staff sees all 5 comments oldest-first across 2-item cursor pages
++    all_comment_ids = target_ticket.comments.oldest_first.pluck(:id)
++    get "/api/v1/tickets/#{target_ticket.id}/comments", params: { page: { size: 2 } }, headers: owner_headers
++    assert_response :ok
++    sc1 = JSON.parse(response.body)
++    assert_equal all_comment_ids[0, 2], sc1.fetch("comments").map { |c| c.fetch("id") }
++    assert_equal true, sc1.dig("meta", "has_more")
++
++    get sc1.dig("links", "next"), headers: owner_headers
++    assert_response :ok
++    sc2 = JSON.parse(response.body)
++    assert_equal all_comment_ids[2, 2], sc2.fetch("comments").map { |c| c.fetch("id") }
++
++    get sc2.dig("links", "next"), headers: owner_headers
++    assert_response :ok
++    sc3 = JSON.parse(response.body)
++    assert_equal all_comment_ids[4, 1], sc3.fetch("comments").map { |c| c.fetch("id") }
++    assert_equal false, sc3.dig("meta", "has_more")
++
++    get sc3.dig("links", "prev"), headers: owner_headers
++    assert_response :ok
++    assert_equal all_comment_ids[2, 2], JSON.parse(response.body).fetch("comments").map { |c| c.fetch("id") }
++
++    # Customer sees only the 4 public comments (exact boundary: 2 pages of size 2)
++    pub_comment_ids = target_ticket.comments.where(public: true).oldest_first.pluck(:id)
++    assert_equal 4, pub_comment_ids.size
++    get "/api/v1/requests/#{target_ticket.id}/comments", params: { page: { size: 2 } }, headers: customer_headers
++    assert_response :ok
++    cc1 = JSON.parse(response.body)
++    assert_equal pub_comment_ids[0, 2], cc1.fetch("comments").map { |c| c.fetch("id") }
++    assert_equal true, cc1.dig("meta", "has_more")
++
++    get cc1.dig("links", "next"), headers: customer_headers
++    assert_response :ok
++    cc2 = JSON.parse(response.body)
++    assert_equal pub_comment_ids[2, 2], cc2.fetch("comments").map { |c| c.fetch("id") }
++    assert_equal false, cc2.dig("meta", "has_more")
++    assert_nil cc2.dig("links", "next")
++    assert_not_nil cc2.dig("links", "prev")
++
++    # 5. Users (/api/v1/users) with role=agent filter
++    expected_agent_ids = agents.map(&:id).sort
++    get "/api/v1/users", params: { page: { size: 2 }, role: "agent", suspended: "false" }, headers: owner_headers
++    assert_response :ok
++    up1 = JSON.parse(response.body)
++    assert_equal expected_agent_ids[0, 2], up1.fetch("users").map { |u| u.fetch("id") }
++    assert_equal true, up1.dig("meta", "has_more")
++
++    get up1.dig("links", "next"), headers: owner_headers
++    assert_response :ok
++    up2 = JSON.parse(response.body)
++    assert_equal expected_agent_ids[2, 2], up2.fetch("users").map { |u| u.fetch("id") }
++    assert_equal false, up2.dig("meta", "has_more")
++    assert_nil up2.dig("links", "next")
++
++    get up2.dig("links", "prev"), headers: owner_headers
++    assert_response :ok
++    assert_equal expected_agent_ids[0, 2], JSON.parse(response.body).fetch("users").map { |u| u.fetch("id") }
++
++    # 6. Staff (/api/v1/staff) - owner + 4 agents = 5 active staff
++    expected_staff_ids = ([ owner.id ] + agents.map(&:id)).sort
++    get "/api/v1/staff", params: { page: { size: 3 } }, headers: owner_headers
++    assert_response :ok
++    stp1 = JSON.parse(response.body)
++    assert_equal expected_staff_ids[0, 3], stp1.fetch("staff").map { |s| s.fetch("id") }
++    assert_equal true, stp1.dig("meta", "has_more")
++
++    # Omit page[size] when sending page[after] -> defaults to 25 and returns remaining 2
++    get "/api/v1/staff", params: { page: { after: stp1.dig("meta", "after_cursor") } }, headers: owner_headers
++    assert_response :ok
++    stp2 = JSON.parse(response.body)
++    assert_equal expected_staff_ids[3, 2], stp2.fetch("staff").map { |s| s.fetch("id") }
++    assert_equal false, stp2.dig("meta", "has_more")
++
++    # 7. Groups (/api/v1/groups) - 4 groups
++    expected_group_ids = groups.map(&:id).sort
++    get "/api/v1/groups", params: { page: { size: 2 } }, headers: owner_headers
++    assert_response :ok
++    gp1 = JSON.parse(response.body)
++    assert_equal expected_group_ids[0, 2], gp1.fetch("groups").map { |g| g.fetch("id") }
++
++    get gp1.dig("links", "next"), headers: owner_headers
++    assert_response :ok
++    gp2 = JSON.parse(response.body)
++    assert_equal expected_group_ids[2, 2], gp2.fetch("groups").map { |g| g.fetch("id") }
++    assert_equal false, gp2.dig("meta", "has_more")
++
++    get gp2.dig("links", "prev"), headers: owner_headers
++    assert_response :ok
++    assert_equal expected_group_ids[0, 2], JSON.parse(response.body).fetch("groups").map { |g| g.fetch("id") }
++
++    # 8. Group Memberships (/api/v1/group_memberships) with group_id filter
++    expected_gm_ids = acme.group_memberships.where(group_id: groups[0].id).ordered.pluck(:id)
++    get "/api/v1/group_memberships", params: { page: { size: 2 }, group_id: groups[0].id }, headers: owner_headers
++    assert_response :ok
++    gmp1 = JSON.parse(response.body)
++    assert_equal expected_gm_ids[0, 2], gmp1.fetch("group_memberships").map { |gm| gm.fetch("id") }
++
++    get gmp1.dig("links", "next"), headers: owner_headers
++    assert_response :ok
++    gmp2 = JSON.parse(response.body)
++    assert_equal expected_gm_ids[2, 2], gmp2.fetch("group_memberships").map { |gm| gm.fetch("id") }
++    assert_equal false, gmp2.dig("meta", "has_more")
++
++    # 9. Invitations (/api/v1/invitations) with status=pending filter
++    expected_inv_ids = invitations.map(&:id).sort
++    get "/api/v1/invitations", params: { page: { size: 2 }, status: "pending" }, headers: owner_headers
++    assert_response :ok
++    ip1 = JSON.parse(response.body)
++    assert_equal expected_inv_ids[0, 2], ip1.fetch("invitations").map { |inv| inv.fetch("id") }
++
++    get ip1.dig("links", "next"), headers: owner_headers
++    assert_response :ok
++    ip2 = JSON.parse(response.body)
++    assert_equal expected_inv_ids[2, 2], ip2.fetch("invitations").map { |inv| inv.fetch("id") }
++    assert_equal false, ip2.dig("meta", "has_more")
++
++    get ip2.dig("links", "prev"), headers: owner_headers
++    assert_response :ok
++    assert_equal expected_inv_ids[0, 2], JSON.parse(response.body).fetch("invitations").map { |inv| inv.fetch("id") }
++  end
++
++  test "keeps navigation stable while other people create, update, close, private-note, or delete records" do
++    base_time = Time.utc(2026, 11, 21, 10, 0, 0)
++    acme = owner = customer = nil
++    tickets = []
++
++    travel_to(base_time) do
++      acme, owner = register_and_verify_account!(account_name: "Acme", subdomain: "acme", email: "jo@acme.test")
++      customer = register_and_verify_customer!(subdomain: "acme", name: "Avery", email: "avery@example.test")
++    end
++
++    owner_token = sign_in!(subdomain: "acme", email: "jo@acme.test", password: "my-first-password").dig("session", "token")
++    customer_token = sign_in!(subdomain: "acme", email: "avery@example.test", password: "my-customer-password").dig("session", "token")
++    owner_headers = auth_headers("acme", owner_token)
++    customer_headers = auth_headers("acme", customer_token)
++
++    # Create T1..T6 one minute apart (newest is T6, oldest is T1)
++    6.times do |i|
++      travel_to(base_time + (i + 1).minutes) do
++        t = Ticket.create!(
++          account: acme,
++          requester: customer,
++          subject: "Ticket #{i + 1}",
++          status: "open"
++        )
++        Comment.create!(account: acme, ticket: t, author: customer, body: "Body #{i + 1}", public: true)
++        tickets << t
++      end
++    end
++
++    # Agent loads page 1 of open tickets (size 2): gets [T6, T5]
++    get "/api/v1/tickets", params: { page: { size: 2 }, status: "open" }, headers: owner_headers
++    assert_response :ok
++    p1 = JSON.parse(response.body)
++    assert_equal [ tickets[5].id, tickets[4].id ], p1.fetch("tickets").map { |t| t.fetch("id") }
++
++    # Customer also loads page 1 of open requests (size 2): gets [T6, T5]
++    get "/api/v1/requests", params: { page: { size: 2 }, status: "open" }, headers: customer_headers
++    assert_response :ok
++    cust_p1 = JSON.parse(response.body)
++    assert_equal [ tickets[5].id, tickets[4].id ], cust_p1.fetch("requests").map { |r| r.fetch("id") }
++
++    # Now OTHER PEOPLE WORK before page 2 is requested:
++    # 1. Two brand-new tickets T7 and T8 arrive at the top
++    # 2. Boundary ticket T5 gets replied to AND solved (so its updated_at jumps to top AND it leaves status=open!)
++    # 3. T4 gets a private staff note (bumps updated_at for staff, does NOT bump customer_updated_at for customer!)
++    t7 = t8 = nil
++    travel_to(base_time + 20.minutes) do
++      t7 = Ticket.create!(account: acme, requester: customer, subject: "Ticket 7", status: "open")
++      Comment.create!(account: acme, ticket: t7, author: customer, body: "New 7", public: true)
++    end
++    travel_to(base_time + 21.minutes) do
++      t8 = Ticket.create!(account: acme, requester: customer, subject: "Ticket 8", status: "open")
++      Comment.create!(account: acme, ticket: t8, author: customer, body: "New 8", public: true)
++    end
++    travel_to(base_time + 22.minutes) do
++      patch "/api/v1/tickets/#{tickets[4].id}",
++        params: { ticket: { status: "solved", comment: { body: "Solved T5", public: true } } },
++        headers: owner_headers,
++        as: :json
++      assert_response :ok
++    end
++    travel_to(base_time + 23.minutes) do
++      patch "/api/v1/tickets/#{tickets[3].id}",
++        params: { ticket: { comment: { body: "Internal private note on T4", public: false } } },
++        headers: owner_headers,
++        as: :json
++      assert_response :ok
++    end
++
++    # Agent follows p1.links.next (status=open):
++    # Even though T7, T8 arrived, T5 was solved & updated, and T4 moved above T6,
++    # cursor is anchored at T5's original (updated_at, id), so agent smoothly gets [T3, T2] without duplicating T6!
++    get p1.dig("links", "next"), headers: owner_headers
++    assert_response :ok
++    p2 = JSON.parse(response.body)
++    assert_equal [ tickets[2].id, tickets[1].id ], p2.fetch("tickets").map { |t| t.fetch("id") }
++    assert_equal true, p2.dig("meta", "has_more")
++
++    # Meanwhile Customer follows cust_p1.links.next (status=open):
++    # Private note on T4 did NOT change customer_updated_at, so customer still sees [T4, T3]!
++    get cust_p1.dig("links", "next"), headers: customer_headers
++    assert_response :ok
++    cust_p2 = JSON.parse(response.body)
++    assert_equal [ tickets[3].id, tickets[2].id ], cust_p2.fetch("requests").map { |r| r.fetch("id") }
++    assert_equal true, cust_p2.dig("meta", "has_more")
++
++    # Customer follows prev from cust_p2 -> gets [T6, T7] (since T5 was solved, T6 and T7 are the 2 open requests immediately before T4),
++    # AND has_more is true because T8 is still above T7!
++    get cust_p2.dig("links", "prev"), headers: customer_headers
++    assert_response :ok
++    cust_back = JSON.parse(response.body)
++    assert_equal [ t7.id, tickets[5].id ], cust_back.fetch("requests").map { |r| r.fetch("id") }
++    assert_equal true, cust_back.dig("meta", "has_more")
++    assert_not_nil cust_back.dig("links", "prev")
++
++    get cust_back.dig("links", "prev"), headers: customer_headers
++    assert_response :ok
++    cust_top = JSON.parse(response.body)
++    assert_equal [ t8.id ], cust_top.fetch("requests").map { |r| r.fetch("id") }
++    assert_equal false, cust_top.dig("meta", "has_more")
++    assert_nil cust_top.dig("links", "prev")
++
++    # Deleting boundary group while browsing /api/v1/groups keeps navigation stable
++    g1 = Group.create!(account: acme, name: "Alpha")
++    g2 = Group.create!(account: acme, name: "Bravo")
++    g3 = Group.create!(account: acme, name: "Charlie")
++    g4 = Group.create!(account: acme, name: "Delta")
++
++    get "/api/v1/groups", params: { page: { size: 2 } }, headers: owner_headers
++    assert_response :ok
++    gp1 = JSON.parse(response.body)
++    assert_equal [ g1.id, g2.id ], gp1.fetch("groups").map { |g| g.fetch("id") }
++
++    # Another admin deletes boundary group g2!
++    delete "/api/v1/groups/#{g2.id}", headers: owner_headers
++    assert_response :no_content
++
++    get gp1.dig("links", "next"), headers: owner_headers
++    assert_response :ok
++    gp2 = JSON.parse(response.body)
++    assert_equal [ g3.id, g4.id ], gp2.fetch("groups").map { |g| g.fetch("id") }
++    assert_equal false, gp2.dig("meta", "has_more")
++  end
++
++  test "tie-breaks identical timestamps and preserves microsecond timestamp precision" do
++    acme, owner = register_and_verify_account!(account_name: "Acme", subdomain: "acme", email: "jo@acme.test")
++    customer = register_and_verify_customer!(subdomain: "acme", name: "Avery", email: "avery@example.test")
++    owner_token = sign_in!(subdomain: "acme", email: "jo@acme.test", password: "my-first-password").dig("session", "token")
++    owner_headers = auth_headers("acme", owner_token)
++
++    exact_ts = Time.utc(2026, 11, 21, 12, 0, 0, 500_000)
++    same_ts_ids = []
++    5.times do |i|
++      t = Ticket.create!(
++        account: acme,
++        requester: customer,
++        subject: "Batch #{i}",
++        status: "open",
++        created_at: exact_ts,
++        updated_at: exact_ts,
++        customer_updated_at: exact_ts
++      )
++      same_ts_ids << t.id
++    end
++
++    # Also add 2 tickets separated by 1 single microsecond each
++    t_plus_1us = Ticket.create!(
++      account: acme,
++      requester: customer,
++      subject: "Plus 1us",
++      status: "open",
++      created_at: Time.utc(2026, 11, 21, 12, 0, 0, 500_001),
++      updated_at: Time.utc(2026, 11, 21, 12, 0, 0, 500_001),
++      customer_updated_at: Time.utc(2026, 11, 21, 12, 0, 0, 500_001)
++    )
++    t_plus_2us = Ticket.create!(
++      account: acme,
++      requester: customer,
++      subject: "Plus 2us",
++      status: "open",
++      created_at: Time.utc(2026, 11, 21, 12, 0, 0, 500_002),
++      updated_at: Time.utc(2026, 11, 21, 12, 0, 0, 500_002),
++      customer_updated_at: Time.utc(2026, 11, 21, 12, 0, 0, 500_002)
++    )
++
++    expected_order = [ t_plus_2us.id, t_plus_1us.id ] + same_ts_ids.reverse
++
++    # Walk forward 2 at a time
++    collected_forward = []
++    next_url = "/api/v1/tickets?page[size]=2"
++    while next_url
++      get next_url, headers: owner_headers
++      assert_response :ok
++      body = JSON.parse(response.body)
++      collected_forward.concat(body.fetch("tickets").map { |t| t.fetch("id") })
++      next_url = body.dig("links", "next")
++      last_body = body
++    end
++    assert_equal expected_order, collected_forward
++
++    # Walk backward from last page's before_cursor
++    collected_backward_pages = [ last_body.fetch("tickets").map { |t| t.fetch("id") } ]
++    prev_url = last_body.dig("links", "prev")
++    while prev_url
++      get prev_url, headers: owner_headers
++      assert_response :ok
++      body = JSON.parse(response.body)
++      collected_backward_pages.unshift(body.fetch("tickets").map { |t| t.fetch("id") })
++      prev_url = body.dig("links", "prev")
++    end
++    assert_equal expected_order, collected_backward_pages.flatten
++  end
++
++  test "rejects invalid, blank, contradictory, tampered, cross-collection, cross-ticket, cross-customer, and cross-tenant cursors with 422" do
++    acme, _ = register_and_verify_account!(account_name: "Acme", subdomain: "acme", email: "jo@acme.test")
++    globex, _ = register_and_verify_account!(account_name: "Globex", subdomain: "globex", email: "boss@globex.test")
++    avery = register_and_verify_customer!(subdomain: "acme", name: "Avery", email: "avery@acme.test")
++    jordan = register_and_verify_customer!(subdomain: "acme", name: "Jordan", email: "jordan@acme.test")
++
++    acme_staff_token = sign_in!(subdomain: "acme", email: "jo@acme.test", password: "my-first-password").dig("session", "token")
++    globex_staff_token = sign_in!(subdomain: "globex", email: "boss@globex.test", password: "my-first-password").dig("session", "token")
++    avery_token = sign_in!(subdomain: "acme", email: "avery@acme.test", password: "my-customer-password").dig("session", "token")
++    jordan_token = sign_in!(subdomain: "acme", email: "jordan@acme.test", password: "my-customer-password").dig("session", "token")
++
++    acme_headers = auth_headers("acme", acme_staff_token)
++    globex_headers = auth_headers("globex", globex_staff_token)
++    avery_headers = auth_headers("acme", avery_token)
++    jordan_headers = auth_headers("acme", jordan_token)
++
++    group = Group.create!(account: acme, name: "Support")
++    t1 = Ticket.create!(account: acme, requester: avery, subject: "T1", status: "open")
++    c1 = Comment.create!(account: acme, ticket: t1, author: avery, body: "C1", public: true)
++    t2 = Ticket.create!(account: acme, requester: avery, subject: "T2", status: "open")
++    Comment.create!(account: acme, ticket: t2, author: avery, body: "C2", public: true)
++
++    get "/api/v1/tickets", params: { page: { size: 1 } }, headers: acme_headers
++    ticket_cursor = JSON.parse(response.body).dig("meta", "after_cursor")
++
++    get "/api/v1/groups", params: { page: { size: 1 } }, headers: acme_headers
++    group_cursor = JSON.parse(response.body).dig("meta", "after_cursor")
++
++    get "/api/v1/requests", params: { page: { size: 1 } }, headers: avery_headers
++    avery_request_cursor = JSON.parse(response.body).dig("meta", "after_cursor")
++
++    get "/api/v1/tickets/#{t1.id}/comments", params: { page: { size: 1 } }, headers: acme_headers
++    t1_comment_cursor = JSON.parse(response.body).dig("meta", "after_cursor")
++
++    # Invalid sizes
++    [ 0, -3, "abc", "" ].each do |bad_size|
++      get "/api/v1/tickets?page[size]=#{bad_size}", headers: acme_headers
++      assert_response :unprocessable_entity
++    end
++
++    # Blank, malformed, unknown keys, or contradictory after+before
++    get "/api/v1/tickets?page[after]=", headers: acme_headers
++    assert_response :unprocessable_entity
++
++    get "/api/v1/tickets?page[before]=", headers: acme_headers
++    assert_response :unprocessable_entity
++
++    get "/api/v1/tickets?page[after]", headers: acme_headers
++    assert_response :unprocessable_entity
++
++    get "/api/v1/tickets?page[after]=not-a-valid-cursor", headers: acme_headers
++    assert_response :unprocessable_entity
++
++    get "/api/v1/tickets?page[before]=not-a-valid-cursor", headers: acme_headers
++    assert_response :unprocessable_entity
++
++    get "/api/v1/tickets", params: { page: { after: ticket_cursor, before: ticket_cursor, size: 5 } }, headers: acme_headers
++    assert_response :unprocessable_entity
++
++    get "/api/v1/tickets?page[foo]=bar", headers: acme_headers
++    assert_response :unprocessable_entity
++
++    # Tampered cursor
++    flipped_char = ticket_cursor[-1] == "A" ? "B" : "A"
++    tampered_cursor = ticket_cursor[0...-1] + flipped_char
++    get "/api/v1/tickets", params: { page: { after: tampered_cursor, size: 5 } }, headers: acme_headers
++    assert_response :unprocessable_entity
++
++    # Cross-collection cursor (groups cursor on tickets, tickets cursor on requests)
++    get "/api/v1/tickets", params: { page: { after: group_cursor, size: 5 } }, headers: acme_headers
++    assert_response :unprocessable_entity
++
++    get "/api/v1/requests", params: { page: { after: ticket_cursor, size: 5 } }, headers: avery_headers
++    assert_response :unprocessable_entity
++
++    # Cross-tenant cursor (Acme cursor used on Globex)
++    get "/api/v1/tickets", params: { page: { after: ticket_cursor, size: 5 } }, headers: globex_headers
++    assert_response :unprocessable_entity
++
++    # Cross-ticket comment cursor (t1 cursor used on t2)
++    get "/api/v1/tickets/#{t2.id}/comments", params: { page: { after: t1_comment_cursor, size: 5 } }, headers: acme_headers
++    assert_response :unprocessable_entity
++
++    # Cross-customer request cursor (Avery's cursor used by Jordan)
++    get "/api/v1/requests", params: { page: { after: avery_request_cursor, size: 5 } }, headers: jordan_headers
++    assert_response :unprocessable_entity
++  end
++
++  test "deep cursor pagination avoids COUNT and OFFSET queries and uses indexed keyset lookups" do
++    acme, _ = register_and_verify_account!(account_name: "Acme", subdomain: "acme", email: "jo@acme.test")
++    customer = register_and_verify_customer!(subdomain: "acme", name: "Avery", email: "avery@acme.test")
++    owner_token = sign_in!(subdomain: "acme", email: "jo@acme.test", password: "my-first-password").dig("session", "token")
++    owner_headers = auth_headers("acme", owner_token)
++
++    now = Time.utc(2026, 11, 21, 15, 0, 0)
++    rows = 1500.times.map do |i|
++      ts = now - i.seconds
++      {
++        account_id: acme.id,
++        requester_id: customer.id,
++        subject: "Deep ticket #{i}",
++        status: "open",
++        priority: "normal",
++        email_origin: false,
++        reply_token: SecureRandom.hex(16),
++        created_at: ts,
++        updated_at: ts,
++        customer_updated_at: ts
++      }
++    end
++    Ticket.insert_all!(rows)
++
++    # Grab a record deep in the list (1200th ticket) and encode cursor via page 1 -> jump
++    deep_anchor = acme.tickets.recently_active.offset(1200).first
++    # Fetch around deep_anchor by getting page at offset via cursor from 1199th
++    prev_record = acme.tickets.recently_active.offset(1199).limit(1).first
++
++    # Obtain valid cursor for prev_record by temporarily filtering or walking; easier: walk 48 pages of 25!
++    executed_sql = []
++    subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
++      sql = payload[:sql].to_s
++      next if payload[:name] == "SCHEMA" || sql.start_with?("BEGIN", "COMMIT", "SAVEPOINT", "RELEASE")
++      executed_sql << sql
++    end
++
++    cursor_url = "/api/v1/tickets?page[size]=25&status=open"
++    48.times do
++      executed_sql.clear
++      get cursor_url, headers: owner_headers
++      assert_response :ok
++      body = JSON.parse(response.body)
++      assert_equal 25, body.fetch("tickets").size
++      refute executed_sql.any? { |s| s.match?(/\bCOUNT\s*\(/i) }, "Expected no COUNT(*) query in cursor mode, got: #{executed_sql.inspect}"
++      refute executed_sql.any? { |s| s.match?(/\bOFFSET\b/i) }, "Expected no OFFSET query in cursor mode, got: #{executed_sql.inspect}"
++      cursor_url = body.dig("links", "next")
++    end
++
++    # Page 49 starts right at offset 1200 (deep_anchor)!
++    get cursor_url, headers: owner_headers
++    assert_response :ok
++    deep_page = JSON.parse(response.body)
++    assert_equal deep_anchor.id, deep_page.fetch("tickets").first.fetch("id")
++  ensure
++    ActiveSupport::Notifications.unsubscribe(subscriber) if subscriber
++  end
++end
