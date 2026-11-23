@@ -1,0 +1,540 @@
+diff --git a/app/services/images/copy_profile_images_to_active_storage.rb b/app/services/images/copy_profile_images_to_active_storage.rb
+new file mode 100644
+index 0000000..d47c97d
+--- /dev/null
++++ b/app/services/images/copy_profile_images_to_active_storage.rb
+@@ -0,0 +1,146 @@
++module Images
++  # Copies existing CarrierWave profile images for Users and Organizations into Active Storage.
++  #
++  # Designed to be safe to re-run if interrupted: records that already have an Active Storage
++  # `profile_image` attachment are skipped, and each record's attachment and cached article
++  # metadata are updated atomically.
++  class CopyProfileImagesToActiveStorage
++    BATCH_SIZE = 100
++    MODELS = [User, Organization].freeze
++
++    Result = Struct.new(:copied, :skipped, :failed, keyword_init: true)
++
++    class AlreadyAttachedError < StandardError; end
++    private_constant :AlreadyAttachedError
++
++    def self.call(...)
++      new(...).call
++    end
++
++    def initialize(models: MODELS, batch_size: BATCH_SIZE)
++      @models = models
++      @batch_size = batch_size
++    end
++
++    def call
++      counts = { copied: 0, skipped: 0, failed: 0 }
++
++      @models.each do |model_class|
++        pending_scope(model_class).find_each(batch_size: @batch_size) do |record|
++          outcome = copy_record(record)
++          counts[outcome] += 1
++        end
++      end
++
++      Result.new(**counts)
++    end
++
++    private
++
++    def pending_scope(model_class)
++      model_class
++        .where.not(profile_image: [nil, ""])
++        .where.missing(:profile_image_attachment)
++    end
++
++    def copy_record(record)
++      identifier = record.read_attribute(:profile_image)
++      return :skipped if identifier.blank? || attachment_exists?(record)
++
++      uploader = ProfileImageUploader.new(record, :profile_image)
++      uploader.retrieve_from_store!(identifier)
++      file = uploader.file
++
++      if file.nil? || !file.exists? || file.size.to_i <= 0
++        Rails.logger.warn(
++          "profile_images:copy skipped #{record.class.name}##{record.id}: " \
++          "missing or empty CarrierWave file (#{identifier})",
++        )
++        return :skipped
++      end
++
++      filename = File.basename(identifier.to_s).presence || "profile_image"
++      content_type = file.content_type.presence
++      blob = upload_blob(file, uploader, filename: filename, content_type: content_type)
++      return :skipped unless blob
++
++      attach_and_refresh_caches(record, blob)
++      :copied
++    rescue AlreadyAttachedError, ActiveRecord::RecordNotUnique
++      purge_orphan_blob(blob)
++      :skipped
++    rescue StandardError => e
++      purge_orphan_blob(blob)
++      Rails.logger.error(
++        "profile_images:copy failed for #{record.class.name}##{record.id}: #{e.class}: #{e.message}",
++      )
++      :failed
++    end
++
++    def attachment_exists?(record)
++      ActiveStorage::Attachment.exists?(
++        record_type: record.class.name,
++        record_id: record.id,
++        name: "profile_image",
++      )
++    end
++
++    def upload_blob(file, uploader, filename:, content_type:)
++      if file.is_a?(CarrierWave::SanitizedFile) && file.path.present? && File.exist?(file.path)
++        File.open(file.path, "rb") do |io|
++          ActiveStorage::Blob.create_and_upload!(
++            io: io,
++            filename: filename,
++            content_type: content_type,
++            identify: true,
++          )
++        end
++      else
++        bytes = uploader.read
++        return if bytes.blank?
++
++        ActiveStorage::Blob.create_and_upload!(
++          io: StringIO.new(bytes.b),
++          filename: filename,
++          content_type: content_type,
++          identify: true,
++        )
++      end
++    end
++
++    def attach_and_refresh_caches(record, blob)
++      ActiveRecord::Base.transaction do
++        record.lock!
++        raise AlreadyAttachedError if attachment_exists?(record)
++
++        ActiveStorage::Attachment.create!(
++          name: "profile_image",
++          record: record,
++          blob: blob,
++        )
++        refresh_cached_articles!(record)
++      end
++    end
++
++    def refresh_cached_articles!(record)
++      record.association(:profile_image_attachment).reset
++      cached_entity = Articles::CachedEntity.from_object(record)
++
++      case record
++      when User
++        Article.where(user_id: record.id).update_all(cached_user: cached_entity)
++      when Organization
++        Article.where(organization_id: record.id).update_all(cached_organization: cached_entity)
++      end
++    end
++
++    def purge_orphan_blob(blob)
++      return unless blob&.persisted?
++      return if ActiveStorage::Attachment.exists?(blob_id: blob.id)
++
++      blob.purge
++    rescue StandardError => e
++      Rails.logger.warn("profile_images:copy failed to purge orphan blob #{blob&.id}: #{e.message}")
++    end
++  end
++end
+diff --git a/app/services/moderator/banish_user.rb b/app/services/moderator/banish_user.rb
+index e53aaf8..7767149 100644
+--- a/app/services/moderator/banish_user.rb
++++ b/app/services/moderator/banish_user.rb
+@@ -53,7 +53,8 @@ def reassign_and_bust_username
+ 
+     def remove_profile_info
+       user.profile.clear!
+-      user.update_columns(profile_image: DEFAULT_PROFILE_IMAGE)
++      user.profile_image.purge if user.profile_image.attached?
++      user.update_columns(profile_image: nil)
+     end
+ 
+     def delete_vomit_reactions
+diff --git a/app/views/admin/organizations/show.html.erb b/app/views/admin/organizations/show.html.erb
+index 051f5b1..c867927 100644
+--- a/app/views/admin/organizations/show.html.erb
++++ b/app/views/admin/organizations/show.html.erb
+@@ -2,7 +2,7 @@
+ <header>
+   <section class="crayons-card flex flex-col l:flex-row gap-2 m:gap-4 l:gap-6 mb-2 m:mb-3 p-3 s:p-4 m:p-7">
+     <span class="crayons-logo crayons-logo--3xl">
+-      <img src="<%= @organization.profile_image %>" width="100%" height="100%" alt="<%= @organization.name %> profile picture">
++      <img src="<%= @organization.profile_image_url %>" width="100%" height="100%" alt="<%= @organization.name %> profile picture">
+     </span>
+     <div class="grid gap-2 flex-1">
+       <div class="s:flex items-center gap-5">
+diff --git a/lib/tasks/profile_images.rake b/lib/tasks/profile_images.rake
+new file mode 100644
+index 0000000..ad1f217
+--- /dev/null
++++ b/lib/tasks/profile_images.rake
+@@ -0,0 +1,8 @@
++namespace :profile_images do
++  desc "Copy existing CarrierWave profile images for users and organizations into Active Storage"
++  task copy: :environment do
++    result = Images::CopyProfileImagesToActiveStorage.call
++    puts "Profile images copy complete: copied=#{result.copied}, skipped=#{result.skipped}, failed=#{result.failed}"
++    raise "Failed to copy #{result.failed} profile image(s)" if result.failed.positive?
++  end
++end
+diff --git a/spec/requests/admin/organizations_spec.rb b/spec/requests/admin/organizations_spec.rb
+index 3f005a7..18fb998 100644
+--- a/spec/requests/admin/organizations_spec.rb
++++ b/spec/requests/admin/organizations_spec.rb
+@@ -26,9 +26,11 @@
+   end
+ 
+   describe "GET /admin/organizations/:id" do
+-    it "renders the correct organization" do
++    it "renders the correct organization and its profile image URL", :aggregate_failures do
+       get admin_organization_path(organization.id)
+       expect(response.body).to include(CGI.escapeHTML(organization.name))
++      expect(response.body).to include(organization.profile_image_url)
++      expect(response.body).not_to include("ActiveStorage::Attached::One")
+     end
+   end
+ 
+diff --git a/spec/requests/profile_images_migration_spec.rb b/spec/requests/profile_images_migration_spec.rb
+index a0add1a..b0549bf 100644
+--- a/spec/requests/profile_images_migration_spec.rb
++++ b/spec/requests/profile_images_migration_spec.rb
+@@ -96,4 +96,76 @@
+       expect(response.body).to include(expected_url)
+     end
+   end
++
++  describe "copying CarrierWave profile pictures into Active Storage and serving them" do
++    let(:created_upload_dirs) { [] }
++
++    after do
++      created_upload_dirs.each { |dir| FileUtils.rm_rf(dir) }
++    end
++
++    def seed_carrierwave_upload(record, fixture_name, filename)
++      source_path = Rails.root.join("spec/fixtures/files", fixture_name)
++      uploader = ProfileImageUploader.new(record, :profile_image)
++      dir = File.join(uploader.root, uploader.store_dir)
++      FileUtils.mkdir_p(dir)
++      created_upload_dirs << dir
++      FileUtils.cp(source_path, File.join(dir, filename))
++      record.update_column(:profile_image, filename)
++      record.reload
++      File.binread(source_path)
++    end
++
++    it "serves all existing User and Organization profile pictures from Active Storage after profile_images:copy",
++       :aggregate_failures do
++      legacy_user = create(:user, profile_image: nil)
++      user_bytes = seed_carrierwave_upload(legacy_user, "800x600.jpg", "existing-avatar.jpg")
++
++      legacy_org = create(:organization)
++      legacy_org.profile_image.purge
++      org_bytes = seed_carrierwave_upload(legacy_org, "800x600.png", "existing-org.png")
++
++      article = create(:article, user: legacy_user, organization: legacy_org, published: true)
++
++      Images::CopyProfileImagesToActiveStorage.call
++
++      legacy_user.reload
++      legacy_org.reload
++      article.reload
++
++      expect(legacy_user.profile_image_url).to start_with("/rails/active_storage/blobs/")
++      expect(legacy_org.profile_image_url).to start_with("/rails/active_storage/blobs/")
++
++      get api_profile_image_path(legacy_user.username)
++      expect(response).to have_http_status(:ok)
++      expect(response.parsed_body["profile_image"]).to eq(legacy_user.profile_image_url)
++
++      get "/#{legacy_user.username}"
++      expect(response).to have_http_status(:ok)
++      expect(response.body).to include(legacy_user.profile_image_url)
++
++      get legacy_user.profile_image_url
++      expect(response).to have_http_status(:redirect)
++      follow_redirect!
++      expect(response).to have_http_status(:ok)
++      expect(response.body.b).to eq(user_bytes)
++
++      get api_profile_image_path(legacy_org.username)
++      expect(response).to have_http_status(:ok)
++      expect(response.parsed_body["profile_image"]).to eq(legacy_org.profile_image_url)
++
++      get "/#{legacy_org.slug}"
++      expect(response).to have_http_status(:ok)
++      expect(response.body).to include(legacy_org.profile_image_url)
++
++      get legacy_org.profile_image_url
++      expect(response).to have_http_status(:redirect)
++      follow_redirect!
++      expect(response).to have_http_status(:ok)
++      expect(response.body.b).to eq(org_bytes)
++
++      expect(article.cached_user.profile_image_url).to eq(legacy_user.profile_image_url)
++      expect(article.cached_organization.profile_image_url).to eq(legacy_org.profile_image_url)
++    end
++  end
+ end
+diff --git a/spec/services/images/copy_profile_images_to_active_storage_spec.rb b/spec/services/images/copy_profile_images_to_active_storage_spec.rb
+new file mode 100644
+index 0000000..3f20cf3
+--- /dev/null
++++ b/spec/services/images/copy_profile_images_to_active_storage_spec.rb
+@@ -0,0 +1,189 @@
++require "rails_helper"
++
++RSpec.describe Images::CopyProfileImagesToActiveStorage do
++  let(:jpg_path) { Rails.root.join("spec/fixtures/files/800x600.jpg") }
++  let(:png_path) { Rails.root.join("spec/fixtures/files/800x600.png") }
++  let(:created_upload_dirs) { [] }
++
++  after do
++    created_upload_dirs.each { |dir| FileUtils.rm_rf(dir) }
++  end
++
++  def store_legacy_carrierwave_file(record, source_path, filename)
++    uploader = ProfileImageUploader.new(record, :profile_image)
++    dir = File.join(uploader.root, uploader.store_dir)
++    FileUtils.mkdir_p(dir)
++    created_upload_dirs << dir
++    FileUtils.cp(source_path, File.join(dir, filename))
++    record.update_column(:profile_image, filename)
++    record.reload
++  end
++
++  it "copies existing CarrierWave profile images for users and organizations to Active Storage", :aggregate_failures do
++    user = create(:user, profile_image: nil)
++    store_legacy_carrierwave_file(user, jpg_path, "legacy-user.jpg")
++
++    organization = create(:organization)
++    organization.profile_image.purge
++    store_legacy_carrierwave_file(organization, png_path, "legacy-org.png")
++
++    result = described_class.call
++
++    expect(result.copied).to eq(2)
++    expect(result.skipped).to eq(0)
++    expect(result.failed).to eq(0)
++
++    user.reload
++    expect(user.profile_image).to be_attached
++    expect(user.profile_image.download).to eq(File.binread(jpg_path))
++    expect(user.profile_image.blob.filename.to_s).to eq("legacy-user.jpg")
++    expect(user.profile_image.blob.content_type).to eq("image/jpeg")
++    expect(user.profile_image_url).to start_with("/rails/active_storage/blobs/")
++    expect(user.read_attribute(:profile_image)).to eq("legacy-user.jpg")
++
++    organization.reload
++    expect(organization.profile_image).to be_attached
++    expect(organization.profile_image.download).to eq(File.binread(png_path))
++    expect(organization.profile_image.blob.filename.to_s).to eq("legacy-org.png")
++    expect(organization.profile_image.blob.content_type).to eq("image/png")
++    expect(organization.profile_image_url).to start_with("/rails/active_storage/blobs/")
++    expect(organization.read_attribute(:profile_image)).to eq("legacy-org.png")
++  end
++
++  it "is idempotent and skips records that already have Active Storage attachments", :aggregate_failures do
++    user = create(:user, profile_image: nil)
++    store_legacy_carrierwave_file(user, jpg_path, "legacy-user.jpg")
++
++    existing_upload_user = create(:user, profile_image: fixture_file_upload("800x600.png", "image/png"))
++    existing_upload_user.update_column(:profile_image, "older-avatar.jpg")
++    store_legacy_carrierwave_file(existing_upload_user, jpg_path, "older-avatar.jpg")
++
++    first_result = described_class.call
++    expect(first_result.copied).to eq(1)
++
++    expect(existing_upload_user.reload.profile_image.download).to eq(File.binread(png_path))
++
++    second_result = nil
++    expect do
++      second_result = described_class.call
++    end.not_to change(ActiveStorage::Blob, :count)
++
++    expect(second_result.copied).to eq(0)
++    expect(second_result.skipped).to eq(0)
++    expect(second_result.failed).to eq(0)
++  end
++
++  it "resumes cleanly after an interruption or per-record failure", :aggregate_failures do
++    user1 = create(:user, profile_image: nil)
++    user2 = create(:user, profile_image: nil)
++    store_legacy_carrierwave_file(user1, jpg_path, "user1.jpg")
++    store_legacy_carrierwave_file(user2, png_path, "user2.png")
++
++    call_count = 0
++    allow(ActiveStorage::Blob).to receive(:create_and_upload!).and_wrap_original do |original, **kwargs|
++      call_count += 1
++      raise StandardError, "Simulated interruption" if call_count == 2
++
++      original.call(**kwargs)
++    end
++
++    first_result = described_class.call
++    expect(first_result.copied).to eq(1)
++    expect(first_result.failed).to eq(1)
++    expect(user1.reload.profile_image).to be_attached
++    expect(user2.reload.profile_image).not_to be_attached
++
++    allow(ActiveStorage::Blob).to receive(:create_and_upload!).and_call_original
++
++    resume_result = described_class.call
++    expect(resume_result.copied).to eq(1)
++    expect(resume_result.failed).to eq(0)
++    expect(user2.reload.profile_image).to be_attached
++    expect(user2.profile_image.download).to eq(File.binread(png_path))
++  end
++
++  it "updates cached_user and cached_organization on existing articles", :aggregate_failures do
++    user = create(:user, profile_image: nil)
++    store_legacy_carrierwave_file(user, jpg_path, "author.jpg")
++
++    organization = create(:organization)
++    organization.profile_image.purge
++    store_legacy_carrierwave_file(organization, png_path, "org.png")
++
++    article = create(:article, user: user, organization: organization)
++    expect(article.cached_user.profile_image_url).to eq("/uploads/user/profile_image/#{user.id}/author.jpg")
++    expect(article.cached_organization.profile_image_url).to eq(
++      "/uploads/organization/profile_image/#{organization.id}/org.png",
++    )
++
++    described_class.call
++
++    article.reload
++    user.reload
++    organization.reload
++    expect(article.cached_user.profile_image_url).to eq(user.profile_image_url)
++    expect(article.cached_user.profile_image_90).to eq(user.profile_image_90)
++    expect(article.cached_organization.profile_image_url).to eq(organization.profile_image_url)
++    expect(article.cached_organization.profile_image_90).to eq(organization.profile_image_90)
++  end
++
++  it "skips missing CarrierWave files and legacy external URLs without failing", :aggregate_failures do
++    missing_user = create(:user, profile_image: nil)
++    missing_user.update_column(:profile_image, "nonexistent.png")
++
++    banished_like_user = create(:user, profile_image: nil)
++    banished_like_user.update_column(:profile_image, Moderator::BanishUser::DEFAULT_PROFILE_IMAGE)
++
++    valid_user = create(:user, profile_image: nil)
++    store_legacy_carrierwave_file(valid_user, jpg_path, "valid.jpg")
++
++    result = described_class.call
++
++    expect(result.copied).to eq(1)
++    expect(result.skipped).to eq(2)
++    expect(result.failed).to eq(0)
++    expect(missing_user.reload.profile_image).not_to be_attached
++    expect(banished_like_user.reload.profile_image).not_to be_attached
++    expect(valid_user.reload.profile_image).to be_attached
++  end
++
++  it "reads remote CarrierWave storage files via uploader.read when file is not a local SanitizedFile",
++     :aggregate_failures do
++    user = create(:user, profile_image: nil)
++    user.update_column(:profile_image, "fog-avatar.png")
++    png_bytes = File.binread(png_path)
++
++    remote_file = instance_double(
++      CarrierWave::Storage::Fog::File,
++      exists?: true,
++      size: png_bytes.bytesize,
++      content_type: "image/png",
++      path: "uploads/user/profile_image/#{user.id}/fog-avatar.png",
++    )
++    uploader = instance_double(ProfileImageUploader, file: remote_file, read: png_bytes)
++    allow(uploader).to receive(:retrieve_from_store!).with("fog-avatar.png")
++    allow(ProfileImageUploader).to receive(:new).with(user, :profile_image).and_return(uploader)
++
++    result = described_class.call
++
++    expect(result.copied).to eq(1)
++    expect(result.failed).to eq(0)
++    expect(user.reload.profile_image).to be_attached
++    expect(user.profile_image.download).to eq(png_bytes)
++  end
++
++  it "copies profile images even when a legacy record has attributes that fail current validations",
++     :aggregate_failures do
++    user = create(:user, profile_image: nil)
++    store_legacy_carrierwave_file(user, jpg_path, "legacy-invalid-user.jpg")
++    user.update_column(:name, "")
++
++    expect(user.valid?).to be(false)
++
++    result = described_class.call
++
++    expect(result.copied).to eq(1)
++    expect(result.failed).to eq(0)
++    expect(user.reload.profile_image).to be_attached
++  end
++end
+diff --git a/spec/services/moderator/banish_user_spec.rb b/spec/services/moderator/banish_user_spec.rb
+index 6ff78c9..eee0c66 100644
+--- a/spec/services/moderator/banish_user_spec.rb
++++ b/spec/services/moderator/banish_user_spec.rb
+@@ -82,4 +82,17 @@
+       .and change { user.offender_feedback_messages.first.status }.from("Open").to("Resolved")
+       .and change(Organization, :count).by(-1)
+   end
++
++  it "purges the user's Active Storage profile image and clears the legacy column", :aggregate_failures do
++    user.update_column(:profile_image, "legacy-avatar.png")
++
++    sidekiq_perform_enqueued_jobs do
++      described_class.call(user: user, admin: admin)
++    end
++
++    user.reload
++    expect(user.profile_image).not_to be_attached
++    expect(user.read_attribute(:profile_image)).to be_nil
++    expect(user.profile_image_url).to be_nil
++  end
+ end
+diff --git a/spec/tasks/profile_images_spec.rb b/spec/tasks/profile_images_spec.rb
+new file mode 100644
+index 0000000..e443acf
+--- /dev/null
++++ b/spec/tasks/profile_images_spec.rb
+@@ -0,0 +1,26 @@
++require "rails_helper"
++
++RSpec.describe "profile_images:copy", type: :task do
++  before do
++    Rake::Task["profile_images:copy"].reenable
++  end
++
++  it "runs Images::CopyProfileImagesToActiveStorage and prints summary" do
++    result = Images::CopyProfileImagesToActiveStorage::Result.new(copied: 3, skipped: 1, failed: 0)
++    allow(Images::CopyProfileImagesToActiveStorage).to receive(:call).and_return(result)
++
++    expect { Rake::Task["profile_images:copy"].invoke }.to output(
++      "Profile images copy complete: copied=3, skipped=1, failed=0\n",
++    ).to_stdout
++  end
++
++  it "raises an error if any profile image copy fails" do
++    result = Images::CopyProfileImagesToActiveStorage::Result.new(copied: 1, skipped: 0, failed: 2)
++    allow(Images::CopyProfileImagesToActiveStorage).to receive(:call).and_return(result)
++
++    expect { Rake::Task["profile_images:copy"].invoke }.to raise_error(
++      RuntimeError,
++      "Failed to copy 2 profile image(s)",
++    )
++  end
++end

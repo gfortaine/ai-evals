@@ -1,0 +1,300 @@
+diff --git a/app/models/book/access_import.rb b/app/models/book/access_import.rb
+index 4d920cf..97fb534 100644
+--- a/app/models/book/access_import.rb
++++ b/app/models/book/access_import.rb
+@@ -2,24 +2,70 @@ class Book::AccessImport
+   Result = Struct.new(:accesses, :duplicate_index)
+ 
+   def initialize(book, grants)
+-    @book, @grants = book, grants
++    @book = book
++    @grants = grants.to_a
+   end
+ 
+   def import
+-    accesses = []
+-    duplicate_index = nil
++    return Result.new([], nil) if @grants.empty?
++
++    if (bad_index = find_bad_index)
++      return Result.new([], bad_index)
++    end
++
++    rows = @grants.map do |grant|
++      { user_id: cast_user_id(grant[:user_id]), level: grant[:level].to_s }
++    end
++
++    accesses = nil
++    conflict_index = nil
+ 
+     Access.transaction do
++      inserted_ids = @book.accesses.insert_all!(rows, returning: %w[ id ]).rows.flatten
++      accesses_by_id = @book.accesses.where(id: inserted_ids).index_by(&:id)
++      accesses = inserted_ids.map { |id| accesses_by_id.fetch(id) }
++    rescue ActiveRecord::RecordNotUnique
++      conflict_index = find_existing_conflict_index
++      raise ActiveRecord::Rollback
++    end
++
++    return Result.new([], conflict_index) if conflict_index
++
++    @book.accesses.reset
++    accesses.each do |access|
++      Book::AccessNotificationJob.perform_later(access)
++    end
++
++    Result.new(accesses, nil)
++  end
++
++  private
++    def find_bad_index
++      user_ids = @grants.filter_map { |grant| cast_user_id(grant[:user_id]) }.uniq
++      existing_user_ids = @book.accesses.where(user_id: user_ids).pluck(:user_id).to_set
++      seen_user_ids = Set.new
++
+       @grants.each_with_index do |grant, index|
+-        access = @book.accesses.create!(user_id: grant[:user_id], level: grant[:level])
+-        Book::AccessNotificationJob.perform_later(access)
+-        accesses << access
+-      rescue ActiveRecord::RecordNotUnique
+-        duplicate_index = index
+-        raise ActiveRecord::Rollback
++        return index unless valid_level?(grant[:level])
++
++        user_id = cast_user_id(grant[:user_id])
++        return index if existing_user_ids.include?(user_id) || !seen_user_ids.add?(user_id)
+       end
++
++      nil
+     end
+ 
+-    duplicate_index ? Result.new([], duplicate_index) : Result.new(accesses, nil)
+-  end
++    def find_existing_conflict_index
++      user_ids = @grants.filter_map { |grant| cast_user_id(grant[:user_id]) }.uniq
++      existing_user_ids = @book.accesses.where(user_id: user_ids).pluck(:user_id).to_set
++      @grants.index { |grant| existing_user_ids.include?(cast_user_id(grant[:user_id])) } || 0
++    end
++
++    def cast_user_id(user_id)
++      Access.type_for_attribute(:user_id).cast(user_id)
++    end
++
++    def valid_level?(level)
++      (level.is_a?(String) || level.is_a?(Symbol)) && Access.levels.key?(level.to_s)
++    end
+ end
+diff --git a/test/models/book/access_import_test.rb b/test/models/book/access_import_test.rb
+new file mode 100644
+index 0000000..79d5fe4
+--- /dev/null
++++ b/test/models/book/access_import_test.rb
+@@ -0,0 +1,208 @@
++require "test_helper"
++
++class Book::AccessImportTest < ActiveSupport::TestCase
++  include ActiveJob::TestHelper
++
++  setup do
++    @book = Book.create!(title: "Import Book", everyone_access: false)
++    @users = 16.times.map do |i|
++      User.create!(name: "Roster User #{i}", email_address: "roster#{i}@example.com", password_digest: "x", role: :member)
++    end
++  end
++
++  test "keeps Result struct shape" do
++    assert_equal %i[ accesses duplicate_index ], Book::AccessImport::Result.members
++  end
++
++  test "imports valid grants and enqueues notifications" do
++    grants = [
++      { user_id: @users[0].id, level: "reader" },
++      { user_id: @users[1].id, level: :editor }
++    ]
++
++    result = nil
++    assert_enqueued_jobs 2, only: Book::AccessNotificationJob do
++      result = Book::AccessImport.new(@book, grants).import
++    end
++
++    assert_instance_of Book::AccessImport::Result, result
++    assert_nil result.duplicate_index
++    assert_equal 2, result.accesses.size
++    assert_equal [ @users[0].id, @users[1].id ], result.accesses.map(&:user_id)
++    assert_equal [ "reader", "editor" ], result.accesses.map(&:level)
++    assert result.accesses.all?(&:persisted?)
++    assert_equal 2, @book.accesses.count
++  end
++
++  test "imports only new grants when book already has other accesses" do
++    existing_user = users(:david)
++    @book.accesses.create!(user: existing_user, level: :editor)
++    @book.accesses.load
++
++    grants = [
++      { user_id: @users[0].id, level: "reader" },
++      { user_id: @users[1].id, level: "editor" }
++    ]
++
++    result = nil
++    assert_enqueued_jobs 2, only: Book::AccessNotificationJob do
++      result = Book::AccessImport.new(@book, grants).import
++    end
++
++    assert_nil result.duplicate_index
++    assert_equal [ @users[0].id, @users[1].id ], result.accesses.map(&:user_id)
++    assert_equal 3, @book.accesses.size
++  end
++
++  test "enqueued notification jobs can be performed" do
++    grants = [
++      { user_id: @users[0].id, level: "reader" },
++      { user_id: @users[1].id, level: "editor" }
++    ]
++
++    assert_performed_jobs 2, only: Book::AccessNotificationJob do
++      perform_enqueued_jobs do
++        Book::AccessImport.new(@book, grants).import
++      end
++    end
++  end
++
++  test "empty grants returns empty result without notifications" do
++    result = nil
++    assert_no_enqueued_jobs do
++      result = Book::AccessImport.new(@book, []).import
++    end
++
++    assert_equal [], result.accesses
++    assert_nil result.duplicate_index
++  end
++
++  test "rejects duplicate against existing access without creating accesses or notifying" do
++    @book.accesses.create!(user: @users[1], level: :reader)
++
++    grants = [
++      { user_id: @users[0].id, level: "reader" },
++      { user_id: @users[1].id, level: "editor" },
++      { user_id: @users[2].id, level: "reader" }
++    ]
++
++    result = nil
++    assert_no_difference -> { @book.accesses.count } do
++      assert_no_enqueued_jobs do
++        result = Book::AccessImport.new(@book, grants).import
++      end
++    end
++
++    assert_equal [], result.accesses
++    assert_equal 1, result.duplicate_index
++  end
++
++  test "rejects duplicate within grants without creating accesses or notifying" do
++    grants = [
++      { user_id: @users[0].id, level: "reader" },
++      { user_id: @users[1].id, level: "editor" },
++      { user_id: @users[0].id, level: "editor" }
++    ]
++
++    result = nil
++    assert_no_difference -> { @book.accesses.count } do
++      assert_no_enqueued_jobs do
++        result = Book::AccessImport.new(@book, grants).import
++      end
++    end
++
++    assert_equal [], result.accesses
++    assert_equal 2, result.duplicate_index
++  end
++
++  test "rejects unknown level like any other bad row without raising or notifying" do
++    [ "admin", :owner, "READER", "", nil, 0 ].each do |bad_level|
++      grants = [
++        { user_id: @users[0].id, level: "reader" },
++        { user_id: @users[1].id, level: bad_level },
++        { user_id: @users[2].id, level: "editor" }
++      ]
++
++      result = nil
++      assert_nothing_raised do
++        assert_no_difference -> { @book.accesses.count } do
++          assert_no_enqueued_jobs do
++            result = Book::AccessImport.new(@book, grants).import
++          end
++        end
++      end
++
++      assert_equal [], result.accesses
++      assert_equal 1, result.duplicate_index
++    end
++  end
++
++  test "returns earliest bad row index across duplicate and unknown level" do
++    @book.accesses.create!(user: @users[0], level: :reader)
++
++    grants_dup_first = [
++      { user_id: @users[0].id, level: "reader" },
++      { user_id: @users[1].id, level: "wizard" }
++    ]
++    result = Book::AccessImport.new(@book, grants_dup_first).import
++    assert_equal [], result.accesses
++    assert_equal 0, result.duplicate_index
++
++    grants_level_first = [
++      { user_id: @users[1].id, level: "wizard" },
++      { user_id: @users[0].id, level: "reader" }
++    ]
++    result = Book::AccessImport.new(@book, grants_level_first).import
++    assert_equal [], result.accesses
++    assert_equal 0, result.duplicate_index
++  end
++
++  test "sixteen names cost the same number of queries as four when accepted" do
++    book4 = Book.create!(title: "Book 4", everyone_access: false)
++    book16 = Book.create!(title: "Book 16", everyone_access: false)
++
++    grants4 = @users.first(4).map { |u| { user_id: u.id, level: "reader" } }
++    grants16 = @users.first(16).map { |u| { user_id: u.id, level: "reader" } }
++
++    q4 = count_queries { Book::AccessImport.new(book4, grants4).import }
++    q16 = count_queries { Book::AccessImport.new(book16, grants16).import }
++
++    assert_equal q4, q16
++  end
++
++  test "sixteen names cost the same number of queries as four when turned down" do
++    book4 = Book.create!(title: "Book 4 Rejected", everyone_access: false)
++    book16 = Book.create!(title: "Book 16 Rejected", everyone_access: false)
++    book4.accesses.create!(user: @users[3], level: :reader)
++    book16.accesses.create!(user: @users[15], level: :reader)
++
++    grants4 = @users.first(4).map { |u| { user_id: u.id, level: "reader" } }
++    grants16 = @users.first(16).map { |u| { user_id: u.id, level: "reader" } }
++
++    q4 = count_queries { Book::AccessImport.new(book4, grants4).import }
++    q16 = count_queries { Book::AccessImport.new(book16, grants16).import }
++
++    assert_equal q4, q16
++
++    bad_level_4 = [ { user_id: @users[0].id, level: "bogus" } ] + @users[1..3].map { |u| { user_id: u.id, level: "reader" } }
++    bad_level_16 = @users.first(15).map { |u| { user_id: u.id, level: "reader" } } + [ { user_id: @users[15].id, level: "bogus" } ]
++
++    q4_bad = count_queries { Book::AccessImport.new(@book, bad_level_4).import }
++    q16_bad = count_queries { Book::AccessImport.new(@book, bad_level_16).import }
++
++    assert_equal q4_bad, q16_bad
++  end
++
++  private
++    def count_queries(&block)
++      count = 0
++      sub = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
++        next if payload[:name] == "SCHEMA" || payload[:sql].match?(/\A(BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE)/)
++        count += 1
++      end
++      block.call
++      count
++    ensure
++      ActiveSupport::Notifications.unsubscribe(sub) if sub
++    end
++end

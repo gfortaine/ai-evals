@@ -1,0 +1,1251 @@
+diff --git a/app/controllers/concerns/magic_link_authentication.rb b/app/controllers/concerns/magic_link_authentication.rb
+new file mode 100644
+index 0000000..f0efe57
+--- /dev/null
++++ b/app/controllers/concerns/magic_link_authentication.rb
+@@ -0,0 +1,69 @@
++module MagicLinkAuthentication
++  extend ActiveSupport::Concern
++
++  PENDING_AUTHENTICATION_EXPIRATION = 1.hour
++
++  included do
++    helper_method :email_address_pending_authentication
++  end
++
++  private
++    def redirect_to_session_magic_link(magic_link = nil, email_address: nil)
++      email_address ||= magic_link.identity.email_address
++      token = set_pending_authentication_token(email_address)
++
++      respond_to do |format|
++        format.html { redirect_to session_magic_link_url(script_name: nil) }
++        format.json { render json: { pending_authentication_token: token }, status: :created }
++      end
++    end
++
++    def set_pending_authentication_token(email_address)
++      pending_authentication_verifier.generate(email_address, expires_in: PENDING_AUTHENTICATION_EXPIRATION).tap do |token|
++        cookies[:pending_authentication_token] = {
++          value: token,
++          path: "/",
++          httponly: true,
++          same_site: :lax,
++          expires: PENDING_AUTHENTICATION_EXPIRATION.from_now
++        }
++      end
++    end
++
++    def clear_pending_authentication_token
++      cookies.delete(:pending_authentication_token, path: "/")
++    end
++
++    def email_address_pending_authentication
++      @email_address_pending_authentication ||= pending_authentication_verifier.verified(pending_authentication_token)
++    end
++
++    def pending_authentication_token
++      cookies[:pending_authentication_token] || params[:pending_authentication_token]
++    end
++
++    def pending_authentication_verifier
++      Rails.application.message_verifier(:pending_authentication)
++    end
++
++    def set_pending_join_code(join_code)
++      cookies.signed[:pending_join_code_id] = {
++        value: join_code.id,
++        path: "/",
++        httponly: true,
++        same_site: :lax,
++        expires: PENDING_AUTHENTICATION_EXPIRATION.from_now
++      }
++    end
++
++    def clear_pending_join_code
++      cookies.delete(:pending_join_code_id, path: "/")
++    end
++
++    def consume_pending_join_code
++      if join_code_id = cookies.signed[:pending_join_code_id]
++        clear_pending_join_code
++        Account::JoinCode.find_by(id: join_code_id)
++      end
++    end
++end
+diff --git a/app/controllers/join_codes_controller.rb b/app/controllers/join_codes_controller.rb
+index 7331536..d9b51b4 100644
+--- a/app/controllers/join_codes_controller.rb
++++ b/app/controllers/join_codes_controller.rb
+@@ -1,4 +1,6 @@
+ class JoinCodesController < ApplicationController
++  include MagicLinkAuthentication
++
+   allow_unauthenticated_access
+   rate_limit to: 10, within: 3.minutes, only: :create, with: -> { head :too_many_requests }
+ 
+@@ -22,16 +24,18 @@ class JoinCodesController < ApplicationController
+         redirect_to new_users_verification_url(script_name: @join_code.account.slug)
+       end
+     else
+-      redirect_to join_path(code: @join_code.code), alert: "Joining by email isn't available yet. Sign in with a passkey first."
++      identity = @identity || Identity.find_or_create_by!(email_address: @email_address)
++      set_pending_join_code(@join_code)
++      redirect_to_session_magic_link identity.send_magic_link
+     end
+   end
+ 
+   private
+     def set_identity
+-      email_address = params.expect(:email_address)
+-      head :unprocessable_entity unless Identity.new(email_address: email_address).valid?
++      @email_address = params.expect(:email_address)
++      head :unprocessable_entity unless Identity.new(email_address: @email_address).valid?
+ 
+-      @identity = Identity.find_by(email_address: email_address)
++      @identity = Identity.find_by(email_address: @email_address)
+     end
+ 
+     def set_join_code
+diff --git a/app/controllers/sessions/magic_links_controller.rb b/app/controllers/sessions/magic_links_controller.rb
+new file mode 100644
+index 0000000..49daca1
+--- /dev/null
++++ b/app/controllers/sessions/magic_links_controller.rb
+@@ -0,0 +1,121 @@
++class Sessions::MagicLinksController < ApplicationController
++  include MagicLinkAuthentication
++
++  disallow_account_scope
++  allow_unauthenticated_access
++  rate_limit to: 10, within: 15.minutes, only: :create, with: :rate_limit_exceeded
++  before_action :ensure_email_address_pending_authentication
++
++  layout "public"
++
++  def show
++  end
++
++  def create
++    if magic_link = find_and_consume_magic_link
++      sign_in magic_link
++    else
++      invalid_code
++    end
++  end
++
++  private
++    def ensure_email_address_pending_authentication
++      unless email_address_pending_authentication.present?
++        respond_to do |format|
++          format.html do
++            if authenticated?
++              redirect_to root_url
++            else
++              redirect_to new_session_path, alert: "Enter your email address to sign in."
++            end
++          end
++
++          format.json { render json: { message: "Enter your email address to sign in." }, status: :unauthorized }
++        end
++      end
++    end
++
++    def find_and_consume_magic_link
++      if identity = Identity.find_by(email_address: email_address_pending_authentication)
++        identity.magic_links.consume(code)
++      end
++    end
++
++    def code
++      params[:code]
++    end
++
++    def sign_in(magic_link)
++      clear_pending_authentication_token
++      terminate_session if Current.session
++      start_new_session_for magic_link.identity
++
++      if join_code = consume_pending_join_code
++        complete_join(join_code, magic_link.identity)
++      elsif magic_link.for_sign_up?
++        redirect_after_sign_up
++      else
++        redirect_after_sign_in
++      end
++    end
++
++    def complete_join(join_code, identity)
++      if join_code.active?
++        join_code.redeem_if { |account| identity.join(account) }
++      end
++
++      if user = User.active.find_by(account: join_code.account, identity: identity)
++        user.verify
++
++        respond_to do |format|
++          format.html do
++            if user.setup?
++              redirect_to landing_url(script_name: join_code.account.slug)
++            else
++              redirect_to new_users_join_url(script_name: join_code.account.slug)
++            end
++          end
++
++          format.json { render json: { session_token: session_token } }
++        end
++      else
++        respond_to do |format|
++          format.html { redirect_to join_url(code: join_code.code, script_name: join_code.account.slug) }
++          format.json { render json: { message: "That join code is no longer active." }, status: :gone }
++        end
++      end
++    end
++
++    def redirect_after_sign_up
++      respond_to do |format|
++        format.html { redirect_to new_signup_completion_path }
++        format.json { render json: { session_token: session_token, requires_signup_completion: true } }
++      end
++    end
++
++    def redirect_after_sign_in
++      respond_to do |format|
++        format.html { redirect_to after_authentication_url }
++        format.json { render json: { session_token: session_token } }
++      end
++    end
++
++    def invalid_code
++      message = "Try another code."
++
++      respond_to do |format|
++        format.html { redirect_to session_magic_link_path, alert: message }
++        format.json { render json: { message: message }, status: :unauthorized }
++      end
++    end
++
++    def rate_limit_exceeded
++      message = "Try again later."
++
++      respond_to do |format|
++        format.html { redirect_to session_magic_link_path, alert: message }
++        format.json { render json: { message: message }, status: :too_many_requests }
++      end
++    end
++end
+diff --git a/app/controllers/sessions_controller.rb b/app/controllers/sessions_controller.rb
+index 2b28f5d..4f98e30 100644
+--- a/app/controllers/sessions_controller.rb
++++ b/app/controllers/sessions_controller.rb
+@@ -1,5 +1,6 @@
+ class SessionsController < ApplicationController
+   include ActionPack::Passkey::Request
++  include MagicLinkAuthentication
+ 
+   disallow_account_scope
+   require_unauthenticated_access except: :destroy
+@@ -12,7 +13,15 @@ class SessionsController < ApplicationController
+   end
+ 
+   def create
+-    email_sign_in_unavailable
++    clear_pending_join_code
++
++    if identity = Identity.find_by(email_address: email_address)
++      redirect_to_session_magic_link identity.send_magic_link
++    elsif valid_email_address?
++      redirect_to_session_magic_link email_address: normalized_email_address
++    else
++      invalid_email_address
++    end
+   end
+ 
+   def destroy
+@@ -25,6 +34,22 @@ class SessionsController < ApplicationController
+   end
+ 
+   private
++    def email_address
++      @email_address ||= params.expect(:email_address)
++    end
++
++    def valid_email_address?
++      candidate_identity.valid?
++    end
++
++    def normalized_email_address
++      candidate_identity.email_address
++    end
++
++    def candidate_identity
++      @candidate_identity ||= Identity.new(email_address: email_address)
++    end
++
+     def rate_limit_exceeded
+       rate_limit_exceeded_message = "Try again later."
+ 
+@@ -34,12 +59,12 @@ class SessionsController < ApplicationController
+       end
+     end
+ 
+-    def email_sign_in_unavailable
+-      message = "Signing in by email isn't available yet. Use a passkey."
++    def invalid_email_address
++      message = "Please enter a valid email address."
+ 
+       respond_to do |format|
+         format.html { redirect_to new_session_path, alert: message }
+-        format.json { render json: { message: message }, status: :not_implemented }
++        format.json { render json: { message: message }, status: :unprocessable_entity }
+       end
+     end
+ end
+diff --git a/app/controllers/signups_controller.rb b/app/controllers/signups_controller.rb
+index 804d746..465eaeb 100644
+--- a/app/controllers/signups_controller.rb
++++ b/app/controllers/signups_controller.rb
+@@ -1,4 +1,6 @@
+ class SignupsController < ApplicationController
++  include MagicLinkAuthentication
++
+   wrap_parameters :signup, include: %i[ email_address ]
+ 
+   disallow_account_scope
+@@ -16,7 +18,8 @@ class SignupsController < ApplicationController
+   def create
+     signup = Signup.new(signup_params)
+     if signup.valid?(:identity_creation)
+-      redirect_to new_signup_path, alert: "Signing up by email isn't available yet."
++      clear_pending_join_code
++      redirect_to_session_magic_link signup.create_identity.send_magic_link(for: :sign_up)
+     else
+       head :unprocessable_entity
+     end
+diff --git a/app/mailers/magic_link_mailer.rb b/app/mailers/magic_link_mailer.rb
+new file mode 100644
+index 0000000..3467008
+--- /dev/null
++++ b/app/mailers/magic_link_mailer.rb
+@@ -0,0 +1,8 @@
++class MagicLinkMailer < ApplicationMailer
++  def sign_in_instructions(magic_link)
++    @magic_link = magic_link
++    @identity = @magic_link.identity
++
++    mail to: @identity.email_address, subject: "Your Fizzy code is #{@magic_link.code}"
++  end
++end
+diff --git a/app/models/identity.rb b/app/models/identity.rb
+index 16f05a7..71525a5 100644
+--- a/app/models/identity.rb
++++ b/app/models/identity.rb
+@@ -4,6 +4,7 @@ class Identity < ApplicationRecord
+   has_passkeys name: :email_address, display_name: -> { Current.user&.name || email_address }
+ 
+   has_many :access_tokens, dependent: :destroy
++  has_many :magic_links, dependent: :destroy
+   has_many :sessions, dependent: :destroy
+   has_many :users, dependent: :nullify
+   has_many :accounts, through: :users
+@@ -21,6 +22,14 @@ class Identity < ApplicationRecord
+     end
+   end
+ 
++  def send_magic_link(**attributes)
++    attributes[:purpose] = attributes.delete(:for) if attributes.key?(:for)
++
++    magic_links.create!(**attributes).tap do |magic_link|
++      MagicLinkMailer.sign_in_instructions(magic_link).deliver_later
++    end
++  end
++
+   def users_with_active_accounts
+     users.joins(:account).merge(Account.active).includes(:account)
+   end
+diff --git a/app/models/magic_link.rb b/app/models/magic_link.rb
+new file mode 100644
+index 0000000..fb31abe
+--- /dev/null
++++ b/app/models/magic_link.rb
+@@ -0,0 +1,43 @@
++class MagicLink < ApplicationRecord
++  CODE_LENGTH = 6
++  EXPIRATION_TIME = 15.minutes
++
++  belongs_to :identity
++
++  enum :purpose, %w[ sign_in sign_up ].index_by(&:itself), prefix: :for, default: :sign_in
++
++  scope :active, -> { where("expires_at > ?", Time.current) }
++  scope :stale, -> { where("expires_at <= ?", Time.current) }
++
++  before_validation :generate_code, on: :create
++  before_validation :set_expiration, on: :create
++
++  validates :code, presence: true, uniqueness: true
++
++  class << self
++    def consume(code)
++      if (sanitized_code = Code.sanitize(code)).present?
++        active.find_by(code: sanitized_code)&.consume
++      end
++    end
++
++    def cleanup
++      stale.delete_all
++    end
++  end
++
++  def consume
++    if self.class.where(id: id).delete_all == 1
++      self
++    end
++  end
++
++  private
++    def generate_code
++      self.code ||= Code.generate
++    end
++
++    def set_expiration
++      self.expires_at ||= EXPIRATION_TIME.from_now
++    end
++end
+diff --git a/app/models/magic_link/code.rb b/app/models/magic_link/code.rb
+new file mode 100644
+index 0000000..7465179
+--- /dev/null
++++ b/app/models/magic_link/code.rb
+@@ -0,0 +1,21 @@
++class MagicLink::Code
++  ALPHABET = %w[ 0 1 2 3 4 5 6 7 8 9 A B C D E F G H J K M N P Q R S T V W X Y Z ].freeze
++
++  class << self
++    def generate
++      loop do
++        candidate = Array.new(MagicLink::CODE_LENGTH) { ALPHABET[SecureRandom.random_number(ALPHABET.length)] }.join
++        break candidate unless MagicLink.exists?(code: candidate)
++      end
++    end
++
++    def sanitize(code)
++      if code.present?
++        code.to_s.upcase
++          .gsub(/[^A-Z0-9]/, "")
++          .tr("OIL", "011")
++          .presence
++      end
++    end
++  end
++end
+diff --git a/app/views/mailers/magic_link_mailer/sign_in_instructions.html.erb b/app/views/mailers/magic_link_mailer/sign_in_instructions.html.erb
+new file mode 100644
+index 0000000..e51b6c6
+--- /dev/null
++++ b/app/views/mailers/magic_link_mailer/sign_in_instructions.html.erb
+@@ -0,0 +1,13 @@
++<% if @magic_link.for_sign_up? %>
++  <h1 class="title">Welcome to Fizzy!</h1>
++  <p class="subtitle">Please enter this 6-character verification code on the sign-up page:</p>
++<% else %>
++  <h1 class="title">Sign in to Fizzy</h1>
++  <p class="subtitle">Please enter this 6-character verification code on the sign-in page:</p>
++<% end %>
++
++<p><strong style="font-family: monospace; font-size: 1.5em; letter-spacing: 0.2em;"><%= @magic_link.code %></strong></p>
++
++<p>This code will work for <%= distance_of_time_in_words(MagicLink::EXPIRATION_TIME) %>.</p>
++
++<p class="footer">Need help? <%= mail_to "support@fizzy.do", "Send us an email" %>.</p>
+diff --git a/app/views/mailers/magic_link_mailer/sign_in_instructions.text.erb b/app/views/mailers/magic_link_mailer/sign_in_instructions.text.erb
+new file mode 100644
+index 0000000..9fdfe4b
+--- /dev/null
++++ b/app/views/mailers/magic_link_mailer/sign_in_instructions.text.erb
+@@ -0,0 +1,15 @@
++<% if @magic_link.for_sign_up? %>
++Welcome to Fizzy!
++
++Please enter this 6-character verification code on the sign-up page:
++<% else %>
++Sign in to Fizzy
++
++Please enter this 6-character verification code on the sign-in page:
++<% end %>
++
++<%= @magic_link.code %>
++
++This code will work for <%= distance_of_time_in_words(MagicLink::EXPIRATION_TIME) %>.
++
++Need help? Send us an email at support@fizzy.do.
+diff --git a/app/views/sessions/magic_links/show.html.erb b/app/views/sessions/magic_links/show.html.erb
+new file mode 100644
+index 0000000..7622822
+--- /dev/null
++++ b/app/views/sessions/magic_links/show.html.erb
+@@ -0,0 +1,26 @@
++<% @page_title = "Check your email" %>
++
++<div class="panel panel--centered flex flex-column gap-half <%= "shake" if flash[:alert] %>">
++  <h1 class="txt-x-large font-weight-black margin-none"><%= @page_title %></h1>
++
++  <p class="margin-none">
++    Then enter the verification code we sent to <strong><%= email_address_pending_authentication %></strong>:
++  </p>
++
++  <%= form_with url: session_magic_link_path, class: "flex flex-column gap-half margin-block-start", data: { controller: "form" } do |form| %>
++    <%= form.text_field :code, required: true, class: "input center", autofocus: true, autocorrect: "off", autocapitalize: "characters", spellcheck: "false", autocomplete: "one-time-code", placeholder: "••••••", aria: { label: "Verification code" } %>
++
++    <% if flash[:alert] %>
++      <p class="txt-negative txt-small margin-none"><%= flash[:alert] %></p>
++    <% end %>
++
++    <button type="submit" class="btn btn--link center" data-form-target="submit">
++      <span>Continue</span>
++      <%= icon_tag "arrow-right" %>
++    </button>
++  <% end %>
++</div>
++
++<% content_for :footer do %>
++  <%= render "sessions/footer" %>
++<% end %>
+diff --git a/config/recurring.yml b/config/recurring.yml
+index 2e87481..ede56c2 100644
+--- a/config/recurring.yml
++++ b/config/recurring.yml
+@@ -21,6 +21,9 @@ production: &production
+   cleanup_webhook_deliveries:
+     command: "Webhook::Delivery.cleanup"
+     schedule: every 15 minutes
++  cleanup_magic_links:
++    command: "MagicLink.cleanup"
++    schedule: every hour at minute 30
+   cleanup_exports:
+     command: "Export.cleanup"
+     schedule: every hour at minute 20
+diff --git a/config/routes.rb b/config/routes.rb
+index 697ea50..13a8441 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -162,6 +162,7 @@ Rails.application.routes.draw do
+       resources :transfers
+       resource :menu
+       resource :passkey, only: :create
++      resource :magic_link, only: %i[ show create ]
+     end
+   end
+ 
+diff --git a/db/migrate/20260710000000_create_magic_links.rb b/db/migrate/20260710000000_create_magic_links.rb
+new file mode 100644
+index 0000000..ac0fabe
+--- /dev/null
++++ b/db/migrate/20260710000000_create_magic_links.rb
+@@ -0,0 +1,16 @@
++class CreateMagicLinks < ActiveRecord::Migration[8.2]
++  def change
++    create_table :magic_links, id: :uuid do |t|
++      t.uuid :identity_id, null: false
++      t.string :code, null: false
++      t.string :purpose, null: false, default: "sign_in"
++      t.datetime :expires_at, null: false
++
++      t.timestamps
++
++      t.index :identity_id
++      t.index :code, unique: true
++      t.index :expires_at
++    end
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index f4e4483..f60dd6e 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
++ActiveRecord::Schema[8.2].define(version: 2026_07_10_000000) do
+   create_table "accesses", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+     t.datetime "accessed_at"
+     t.uuid "account_id", null: false
+@@ -361,6 +361,18 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.index ["identity_id"], name: "index_access_token_on_identity_id"
+   end
+ 
++  create_table "magic_links", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
++    t.string "code", null: false
++    t.datetime "created_at", null: false
++    t.datetime "expires_at", null: false
++    t.uuid "identity_id", null: false
++    t.string "purpose", default: "sign_in", null: false
++    t.datetime "updated_at", null: false
++    t.index ["code"], name: "index_magic_links_on_code", unique: true
++    t.index ["expires_at"], name: "index_magic_links_on_expires_at"
++    t.index ["identity_id"], name: "index_magic_links_on_identity_id"
++  end
++
+   create_table "mentions", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+     t.uuid "account_id", null: false
+     t.datetime "created_at", null: false
+diff --git a/db/schema_sqlite.rb b/db/schema_sqlite.rb
+index 64e1c1c..c1ee689 100644
+--- a/db/schema_sqlite.rb
++++ b/db/schema_sqlite.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
++ActiveRecord::Schema[8.2].define(version: 2026_07_10_000000) do
+   create_table "accesses", id: :uuid, force: :cascade do |t|
+     t.datetime "accessed_at"
+     t.uuid "account_id", null: false
+@@ -361,6 +361,18 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.index ["identity_id"], name: "index_access_token_on_identity_id"
+   end
+ 
++  create_table "magic_links", id: :uuid, force: :cascade do |t|
++    t.uuid "identity_id", null: false
++    t.string "code", limit: 255, null: false
++    t.string "purpose", limit: 255, default: "sign_in", null: false
++    t.datetime "expires_at", null: false
++    t.datetime "created_at", null: false
++    t.datetime "updated_at", null: false
++    t.index ["code"], name: "index_magic_links_on_code", unique: true
++    t.index ["expires_at"], name: "index_magic_links_on_expires_at"
++    t.index ["identity_id"], name: "index_magic_links_on_identity_id"
++  end
++
+   create_table "mentions", id: :uuid, force: :cascade do |t|
+     t.uuid "account_id", null: false
+     t.datetime "created_at", null: false
+diff --git a/test/controllers/join_codes_controller_test.rb b/test/controllers/join_codes_controller_test.rb
+index 7c55e80..4dd3bce 100644
+--- a/test/controllers/join_codes_controller_test.rb
++++ b/test/controllers/join_codes_controller_test.rb
+@@ -1,6 +1,8 @@
+ require "test_helper"
+ 
+ class JoinCodesControllerTest < ActionDispatch::IntegrationTest
++  include ActionMailer::TestHelper
++
+   setup do
+     @account = accounts("37s")
+     @join_code = account_join_codes(:"37s")
+@@ -59,6 +61,102 @@ class JoinCodesControllerTest < ActionDispatch::IntegrationTest
+     assert_redirected_to new_users_verification_url(script_name: @account.slug)
+   end
+ 
++  test "create for unauthenticated new identity sends email code and joins account" do
++    assert_difference -> { Identity.count }, 1 do
++      assert_emails 1 do
++        post join_path(code: @join_code.code, script_name: @account.slug), params: { email_address: "joiner@example.com" }
++      end
++    end
++
++    assert_redirected_to session_magic_link_url(script_name: nil)
++
++    code = ActionMailer::Base.deliveries.last.subject[/[0-9A-HJ-KM-NP-TV-Z]{6}/]
++    assert_not_nil code
++
++    untenanted do
++      assert_difference -> { User.count }, 1 do
++        assert_difference -> { @join_code.reload.usage_count }, 1 do
++          post session_magic_link_path(script_name: nil), params: { code: code }
++        end
++      end
++    end
++
++    assert cookies[:session_token].present?
++    assert_redirected_to new_users_join_url(script_name: @account.slug)
++
++    user = User.active.find_by!(account: @account, identity: Identity.find_by!(email_address: "joiner@example.com"))
++    assert user.verified?
++
++    post users_joins_path(script_name: @account.slug), params: { user: { name: "New Joiner" } }
++    assert_redirected_to landing_path(script_name: @account.slug)
++    assert_equal "New Joiner", user.reload.name
++  end
++
++  test "create for unauthenticated existing setup user sends email code and lands on account" do
++    identity = identities(:jz)
++
++    assert_no_difference -> { Identity.count } do
++      assert_no_difference -> { User.count } do
++        assert_emails 1 do
++          post join_path(code: @join_code.code, script_name: @account.slug), params: { email_address: identity.email_address }
++        end
++      end
++    end
++
++    assert_redirected_to session_magic_link_url(script_name: nil)
++
++    code = ActionMailer::Base.deliveries.last.subject[/[0-9A-HJ-KM-NP-TV-Z]{6}/]
++
++    untenanted do
++      assert_no_difference -> { @join_code.reload.usage_count } do
++        post session_magic_link_path(script_name: nil), params: { code: code }
++      end
++    end
++
++    assert cookies[:session_token].present?
++    assert_redirected_to landing_url(script_name: @account.slug)
++  end
++
++  test "create when signed in as a different identity sends email code and joins with entered email" do
++    sign_in_as :jz
++
++    assert_no_difference -> { Identity.count } do
++      assert_emails 1 do
++        post join_path(code: @join_code.code, script_name: @account.slug), params: { email_address: identities(:mike).email_address }
++      end
++    end
++
++    assert_redirected_to session_magic_link_url(script_name: nil)
++
++    code = ActionMailer::Base.deliveries.last.subject[/[0-9A-HJ-KM-NP-TV-Z]{6}/]
++
++    untenanted do
++      assert_difference -> { User.count }, 1 do
++        post session_magic_link_path(script_name: nil), params: { code: code }
++      end
++    end
++
++    assert_redirected_to new_users_join_url(script_name: @account.slug)
++    assert @account.users.active.exists?(identity: identities(:mike))
++  end
++
++  test "create when join code becomes inactive before entering code" do
++    assert_emails 1 do
++      post join_path(code: @join_code.code, script_name: @account.slug), params: { email_address: "latecomer@example.com" }
++    end
++
++    @join_code.update!(usage_count: @join_code.usage_limit)
++    code = ActionMailer::Base.deliveries.last.subject[/[0-9A-HJ-KM-NP-TV-Z]{6}/]
++
++    untenanted do
++      assert_no_difference -> { User.count } do
++        post session_magic_link_path(script_name: nil), params: { code: code }
++      end
++    end
++
++    assert_redirected_to join_url(code: @join_code.code, script_name: @account.slug)
++  end
++
+   test "create with invalid email address" do
+     # Avoid Sentry exceptions when attackers try to stuff invalid emails into the system
+     without_action_dispatch_exception_handling do
+diff --git a/test/controllers/sessions/magic_links_controller_test.rb b/test/controllers/sessions/magic_links_controller_test.rb
+new file mode 100644
+index 0000000..19cff7d
+--- /dev/null
++++ b/test/controllers/sessions/magic_links_controller_test.rb
+@@ -0,0 +1,222 @@
++require "test_helper"
++
++class Sessions::MagicLinksControllerTest < ActionDispatch::IntegrationTest
++  include ActionMailer::TestHelper
++
++  setup do
++    @identity = identities(:kevin)
++  end
++
++  test "show without pending authentication redirects to new session" do
++    untenanted do
++      get session_magic_link_path
++
++      assert_redirected_to new_session_path
++    end
++  end
++
++  test "show when already signed in without pending authentication redirects to root" do
++    sign_in_as @identity
++
++    untenanted do
++      get session_magic_link_path
++
++      assert_redirected_to root_url
++    end
++  end
++
++  test "show renders code field after requesting sign-in code" do
++    untenanted do
++      assert_emails 1 do
++        post session_path, params: { email_address: @identity.email_address }
++      end
++
++      assert_redirected_to session_magic_link_path
++      follow_redirect!
++
++      assert_response :success
++      assert_select "input[name=code]"
++      assert_in_body @identity.email_address
++    end
++  end
++
++  test "create with valid code signs in and consumes code" do
++    untenanted do
++      assert_emails 1 do
++        post session_path, params: { email_address: @identity.email_address }
++      end
++
++      code = extract_code_from_last_email
++
++      post session_magic_link_path, params: { code: code }
++
++      assert_redirected_to landing_path
++      assert cookies[:session_token].present?
++      assert_nil @identity.magic_links.find_by(code: code)
++    end
++  end
++
++  test "create works with lowercase and spaces in code" do
++    untenanted do
++      assert_emails 1 do
++        post session_path, params: { email_address: @identity.email_address }
++      end
++
++      code = extract_code_from_last_email
++      formatted_code = " #{code[0..2].downcase} #{code[3..5].downcase} "
++
++      post session_magic_link_path, params: { code: formatted_code }
++
++      assert_redirected_to landing_path
++      assert cookies[:session_token].present?
++    end
++  end
++
++  test "create with wrong code does not sign in and allows retry" do
++    untenanted do
++      assert_emails 1 do
++        post session_path, params: { email_address: @identity.email_address }
++      end
++
++      code = extract_code_from_last_email
++
++      post session_magic_link_path, params: { code: "WRONGC" }
++      assert_redirected_to session_magic_link_path
++      assert_not cookies[:session_token].present?
++      assert_equal "Try another code.", flash[:alert]
++
++      post session_magic_link_path, params: { code: code }
++      assert_redirected_to landing_path
++      assert cookies[:session_token].present?
++    end
++  end
++
++  test "create with expired code does not sign in" do
++    untenanted do
++      assert_emails 1 do
++        post session_path, params: { email_address: @identity.email_address }
++      end
++
++      code = extract_code_from_last_email
++
++      travel MagicLink::EXPIRATION_TIME + 1.second
++
++      post session_magic_link_path, params: { code: code }
++
++      assert_redirected_to session_magic_link_path
++      assert_not cookies[:session_token].present?
++    end
++  end
++
++  test "create rejects another identity's code" do
++    other_magic_link = identities(:david).magic_links.create!
++
++    untenanted do
++      assert_emails 1 do
++        post session_path, params: { email_address: @identity.email_address }
++      end
++
++      post session_magic_link_path, params: { code: other_magic_link.code }
++
++      assert_redirected_to session_magic_link_path
++      assert_not cookies[:session_token].present?
++      assert MagicLink.exists?(other_magic_link.id)
++    end
++  end
++
++  test "create via JSON" do
++    untenanted do
++      assert_emails 1 do
++        post session_path(format: :json), params: { email_address: @identity.email_address }
++      end
++
++      assert_response :created
++      token = @response.parsed_body["pending_authentication_token"]
++      assert token.present?
++
++      code = extract_code_from_last_email
++
++      post session_magic_link_path(format: :json), params: { code: code, pending_authentication_token: token }
++
++      assert_response :success
++      assert @response.parsed_body["session_token"].present?
++    end
++  end
++
++  test "create with invalid code via JSON" do
++    untenanted do
++      assert_emails 1 do
++        post session_path(format: :json), params: { email_address: @identity.email_address }
++      end
++
++      token = @response.parsed_body["pending_authentication_token"]
++
++      post session_magic_link_path(format: :json), params: { code: "BADCOD", pending_authentication_token: token }
++
++      assert_response :unauthorized
++      assert_equal "Try another code.", @response.parsed_body["message"]
++    end
++  end
++
++  test "create is rate limited" do
++    untenanted do
++      post session_path, params: { email_address: @identity.email_address }
++
++      Rails.cache.stubs(:increment).returns(11)
++
++      post session_magic_link_path, params: { code: "ABC123" }
++
++      assert_redirected_to session_magic_link_path
++      assert_equal "Try again later.", flash[:alert]
++    end
++  end
++
++test "create redirects to return_to_after_authenticating when present" do
++  card = cards(:logo)
++
++  get card_path(card)
++  assert_redirected_to new_session_path(script_name: nil)
++
++  untenanted do
++    assert_emails 1 do
++      post session_path(script_name: nil), params: { email_address: @identity.email_address }
++    end
++
++    code = extract_code_from_last_email
++
++    post session_magic_link_path(script_name: nil), params: { code: code }
++
++    assert_redirected_to card_url(card, script_name: card.account.slug)
++  end
++end
++
++test "abandoned join flow does not interfere with subsequent sign-in" do
++  account = accounts("37s")
++  join_code = account_join_codes(:"37s")
++  mike = identities(:mike)
++
++  assert_emails 1 do
++    post join_path(code: join_code.code, script_name: account.slug), params: { email_address: mike.email_address }
++  end
++
++  untenanted do
++    assert_emails 1 do
++      post session_path(script_name: nil), params: { email_address: mike.email_address }
++    end
++
++    code = extract_code_from_last_email
++
++    assert_no_difference -> { User.count } do
++      post session_magic_link_path(script_name: nil), params: { code: code }
++    end
++
++    assert_redirected_to landing_path(script_name: nil)
++  end
++end
++
++  private
++    def extract_code_from_last_email
++      email = ActionMailer::Base.deliveries.last
++      email.subject[/[0-9A-HJ-KM-NP-TV-Z]{6}/]
++    end
++end
+diff --git a/test/controllers/sessions_controller_test.rb b/test/controllers/sessions_controller_test.rb
+index 0016ba1..823f557 100644
+--- a/test/controllers/sessions_controller_test.rb
++++ b/test/controllers/sessions_controller_test.rb
+@@ -1,6 +1,8 @@
+ require "test_helper"
+ 
+ class SessionsControllerTest < ActionDispatch::IntegrationTest
++  include ActionMailer::TestHelper
++
+   test "new" do
+     untenanted do
+       get new_session_path
+@@ -18,6 +20,79 @@ class SessionsControllerTest < ActionDispatch::IntegrationTest
+     end
+   end
+ 
++  test "create sends email code for existing identity" do
++    identity = identities(:kevin)
++
++    untenanted do
++      assert_emails 1 do
++        post session_path, params: { email_address: identity.email_address }
++      end
++
++      assert_redirected_to session_magic_link_path
++    end
++
++    email = ActionMailer::Base.deliveries.last
++    assert_equal [ identity.email_address ], email.to
++    assert_match(/[0-9A-HJ-KM-NP-TV-Z]{6}/, email.subject)
++  end
++
++  test "create normalizes email address" do
++    identity = identities(:kevin)
++
++    untenanted do
++      assert_emails 1 do
++        post session_path, params: { email_address: "  #{identity.email_address.upcase}  " }
++      end
++
++      assert_redirected_to session_magic_link_path
++    end
++  end
++
++  test "create for unknown email does not send email or create identity" do
++    untenanted do
++      assert_no_difference -> { Identity.count } do
++        assert_no_emails do
++          post session_path, params: { email_address: "nobody@example.com" }
++        end
++      end
++
++      assert_redirected_to session_magic_link_path
++    end
++  end
++
++  test "create with invalid email address" do
++    untenanted do
++      assert_no_emails do
++        post session_path, params: { email_address: "not-a-valid-email" }
++      end
++
++      assert_redirected_to new_session_path
++      assert_equal "Please enter a valid email address.", flash[:alert]
++    end
++  end
++
++  test "create with invalid email address via JSON" do
++    untenanted do
++      assert_no_emails do
++        post session_path(format: :json), params: { email_address: "not-a-valid-email" }
++      end
++
++      assert_response :unprocessable_entity
++      assert_equal "Please enter a valid email address.", @response.parsed_body["message"]
++    end
++  end
++
++  test "create is rate limited" do
++    Rails.cache.stubs(:increment).returns(11)
++
++    untenanted do
++      post session_path, params: { email_address: identities(:kevin).email_address }
++
++      assert_redirected_to new_session_path
++      assert_equal "Try again later.", flash[:alert]
++    end
++  end
++
+   test "destroy" do
+     sign_in_as :kevin
+ 
+diff --git a/test/controllers/signups_controller_test.rb b/test/controllers/signups_controller_test.rb
+index 77d4ceb..ac4db08 100644
+--- a/test/controllers/signups_controller_test.rb
++++ b/test/controllers/signups_controller_test.rb
+@@ -1,6 +1,8 @@
+ require "test_helper"
+ 
+ class SignupsControllerTest < ActionDispatch::IntegrationTest
++  include ActionMailer::TestHelper
++
+   test "new" do
+     untenanted do
+       get new_signup_path
+@@ -20,6 +22,38 @@ class SignupsControllerTest < ActionDispatch::IntegrationTest
+     end
+   end
+ 
++  test "create sends email code and completes sign up" do
++    Account.any_instance.expects(:setup_customer_template).once
++
++    untenanted do
++      assert_difference -> { Identity.count }, 1 do
++        assert_emails 1 do
++          post signup_path, params: { signup: { email_address: "brandnew@example.com" } }
++        end
++      end
++
++      assert_redirected_to session_magic_link_path
++      follow_redirect!
++      assert_response :success
++      assert_select "input[name=code]"
++
++      code = ActionMailer::Base.deliveries.last.subject[/[0-9A-HJ-KM-NP-TV-Z]{6}/]
++      assert_not_nil code
++
++      post session_magic_link_path, params: { code: code }
++      assert_redirected_to new_signup_completion_path
++      assert cookies[:session_token].present?
++
++      assert_difference -> { Account.count }, 1 do
++        post signup_completion_path, params: { signup: { full_name: "Brand New" } }
++      end
++
++      account = Account.order(:created_at).last
++      assert_redirected_to landing_url(script_name: account.slug)
++      assert account.users.exists?(name: "Brand New", role: :owner)
++    end
++  end
++
+   test "create with invalid email address" do
+     without_action_dispatch_exception_handling do
+       untenanted do
+diff --git a/test/mailers/magic_link_mailer_test.rb b/test/mailers/magic_link_mailer_test.rb
+new file mode 100644
+index 0000000..9f3feaa
+--- /dev/null
++++ b/test/mailers/magic_link_mailer_test.rb
+@@ -0,0 +1,30 @@
++require "test_helper"
++
++class MagicLinkMailerTest < ActionMailer::TestCase
++  test "sign_in_instructions includes code in subject and body" do
++    identity = identities(:kevin)
++    magic_link = identity.magic_links.create!
++    email = MagicLinkMailer.sign_in_instructions(magic_link)
++
++    assert_emails 1 do
++      email.deliver_now
++    end
++
++    assert_equal [ identity.email_address ], email.to
++    assert_includes email.subject, magic_link.code
++    assert email.html_part.present?, "Email should have HTML part"
++    assert email.text_part.present?, "Email should have text part"
++    assert_includes email.html_part.body.to_s, magic_link.code
++    assert_includes email.text_part.body.to_s, magic_link.code
++    assert_match /15 minutes/i, email.text_part.body.to_s
++  end
++
++  test "sign_in_instructions for sign_up" do
++    identity = identities(:kevin)
++    magic_link = identity.magic_links.create!(purpose: :sign_up)
++    email = MagicLinkMailer.sign_in_instructions(magic_link)
++
++    assert_includes email.subject, magic_link.code
++    assert_match /sign-up/i, email.text_part.body.to_s
++  end
++end
+diff --git a/test/mailers/previews/magic_link_mailer_preview.rb b/test/mailers/previews/magic_link_mailer_preview.rb
+new file mode 100644
+index 0000000..1cb7820
+--- /dev/null
++++ b/test/mailers/previews/magic_link_mailer_preview.rb
+@@ -0,0 +1,6 @@
++class MagicLinkMailerPreview < ActionMailer::Preview
++  def sign_in_instructions
++    magic_link = MagicLink.new(identity: Identity.first, code: "ABC123", expires_at: MagicLink::EXPIRATION_TIME.from_now)
++    MagicLinkMailer.sign_in_instructions(magic_link)
++  end
++end
+diff --git a/test/models/magic_link_test.rb b/test/models/magic_link_test.rb
+new file mode 100644
+index 0000000..ebb108e
+--- /dev/null
++++ b/test/models/magic_link_test.rb
+@@ -0,0 +1,83 @@
++require "test_helper"
++
++class MagicLinkTest < ActiveSupport::TestCase
++  include ActionMailer::TestHelper
++
++  setup do
++    @identity = identities(:kevin)
++  end
++
++  test "creates a 6-character code with a 15-minute expiration" do
++    freeze_time do
++      magic_link = @identity.magic_links.create!
++
++      assert_equal 6, magic_link.code.length
++      assert_match(/\A[0-9A-HJ-KM-NP-TV-Z]{6}\z/, magic_link.code)
++      assert_equal 15.minutes.from_now, magic_link.expires_at
++      assert magic_link.for_sign_in?
++    end
++  end
++
++  test "active and stale scopes respect 15-minute expiration" do
++    magic_link = @identity.magic_links.create!
++
++    assert_includes MagicLink.active, magic_link
++    assert_not_includes MagicLink.stale, magic_link
++
++    travel 15.minutes - 1.second
++    assert_includes MagicLink.active, magic_link
++    assert_not_includes MagicLink.stale, magic_link
++
++    travel 2.seconds
++    assert_not_includes MagicLink.active, magic_link
++    assert_includes MagicLink.stale, magic_link
++  end
++
++  test "consume finds and destroys active magic link" do
++    magic_link = @identity.magic_links.create!
++
++    assert_equal magic_link, MagicLink.consume(magic_link.code)
++    assert_nil MagicLink.find_by(id: magic_link.id)
++    assert_nil MagicLink.consume(magic_link.code)
++  end
++
++  test "consume normalizes case, whitespace, and lookalike characters" do
++    magic_link = @identity.magic_links.create!(code: "01AB23")
++
++    assert_equal magic_link, MagicLink.consume(" o l a b - 2 3 ")
++  end
++
++  test "consume does not return expired magic links" do
++    magic_link = @identity.magic_links.create!
++
++    travel MagicLink::EXPIRATION_TIME + 1.second
++    assert_nil MagicLink.consume(magic_link.code)
++    assert MagicLink.exists?(magic_link.id)
++  end
++
++  test "consume scoped to identity does not consume another identity's magic link" do
++    other_magic_link = identities(:david).magic_links.create!
++
++    assert_nil @identity.magic_links.consume(other_magic_link.code)
++    assert MagicLink.exists?(other_magic_link.id)
++  end
++
++  test "cleanup removes stale magic links and preserves active ones" do
++    stale_link = @identity.magic_links.create!
++    travel 16.minutes
++    active_link = @identity.magic_links.create!
++
++    MagicLink.cleanup
++
++    assert_not MagicLink.exists?(stale_link.id)
++    assert MagicLink.exists?(active_link.id)
++  end
++
++  test "Identity#send_magic_link creates magic link and sends email" do
++    assert_emails 1 do
++      magic_link = @identity.send_magic_link(for: :sign_up)
++      assert magic_link.persisted?
++      assert magic_link.for_sign_up?
++    end
++  end
++end

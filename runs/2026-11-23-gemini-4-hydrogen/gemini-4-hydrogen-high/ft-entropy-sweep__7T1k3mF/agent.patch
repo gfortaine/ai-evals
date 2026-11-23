@@ -1,0 +1,539 @@
+diff --git a/app/models/account/data_transfer/card_record_set.rb b/app/models/account/data_transfer/card_record_set.rb
+new file mode 100644
+index 0000000..949cef2
+--- /dev/null
++++ b/app/models/account/data_transfer/card_record_set.rb
+@@ -0,0 +1,38 @@
++class Account::DataTransfer::CardRecordSet < Account::DataTransfer::RecordSet
++  def initialize(account)
++    super(account: account, model: Card)
++  end
++
++  private
++    def import_batch(files)
++      batch_data = files.map do |file|
++        data = load(file)
++        data.slice(*attributes).merge("account_id" => account.id).tap do |record_data|
++          record_data["active"] = (record_data["status"] == "published") unless record_data.key?("active")
++          record_data["updated_at"] = Time.current if record_data.key?("updated_at")
++        end
++      end
++
++      model.insert_all!(batch_data)
++    end
++
++    def check_record(file_path)
++      data = load(file_path)
++      expected_id = File.basename(file_path, ".json")
++
++      unless data["id"].to_s == expected_id
++        raise IntegrityError, "#{model} record ID mismatch: expected #{expected_id}, got #{data['id']}"
++      end
++
++      missing = (attributes - [ "active" ]) - data.keys
++      if missing.any?
++        raise IntegrityError, "#{file_path} is missing required fields: #{missing.join(', ')}"
++      end
++
++      if model.exists?(id: data["id"])
++        raise ConflictError, "#{model} record with ID #{data['id']} already exists"
++      end
++
++      check_associations_dont_exist(data)
++    end
++end
+diff --git a/app/models/account/data_transfer/manifest.rb b/app/models/account/data_transfer/manifest.rb
+index 11aaf6a..96d69dd 100644
+--- a/app/models/account/data_transfer/manifest.rb
++++ b/app/models/account/data_transfer/manifest.rb
+@@ -36,8 +36,10 @@ class Account::DataTransfer::Manifest
+         *record_sets_for(
+           ::Board::Publication,
+           ::Webhook,
+-          ::Access,
+-          ::Card,
++          ::Access
++        ),
++        Account::DataTransfer::CardRecordSet.new(account),
++        *record_sets_for(
+           ::Comment,
+           ::Step,
+           ::Assignment,
+diff --git a/app/models/account/import.rb b/app/models/account/import.rb
+index 2bf1b88..50b7fea 100644
+--- a/app/models/account/import.rb
++++ b/app/models/account/import.rb
+@@ -48,6 +48,7 @@ class Account::Import < ApplicationRecord
+     end
+ 
+     add_importer_to_all_access_boards
++    reconcile_active_cards
+     reconcile_cards_count
+     reconcile_account_storage
+ 
+@@ -79,6 +80,11 @@ class Account::Import < ApplicationRecord
+       ImportMailer.failed(self).deliver_later
+     end
+ 
++    def reconcile_active_cards
++      account.cards.where(id: Closure.where(account_id: account.id).select(:card_id)).update_all(active: false)
++      account.cards.where(id: Card::NotNow.where(account_id: account.id).select(:card_id)).update_all(active: false)
++    end
++
+     def reconcile_cards_count
+       account.update_column :cards_count, [ account.cards_count, account.cards.maximum(:number).to_i ].max
+     end
+diff --git a/app/models/card/entropic.rb b/app/models/card/entropic.rb
+index ebaad78..77e2c54 100644
+--- a/app/models/card/entropic.rb
++++ b/app/models/card/entropic.rb
+@@ -3,21 +3,38 @@ module Card::Entropic
+ 
+   included do
+     scope :due_to_be_postponed, -> do
+-      active
++      now = Time.now
++      scope = active
+         .joins(board: :account)
+         .left_outer_joins(board: :entropy)
+         .joins("LEFT OUTER JOIN entropies AS account_entropies ON account_entropies.account_id = accounts.id AND account_entropies.container_type = 'Account' AND account_entropies.container_id = accounts.id")
+-        .where("last_active_at <= #{connection.date_subtract('?', 'COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period)')}", Time.now)
++        .where("last_active_at <= #{connection.date_subtract('?', 'COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period)')}", now)
++
++      if min_period = Entropy.minimum(:auto_postpone_period)
++        scope = scope.where("cards.last_active_at <= ?", now - min_period + 1.second)
++      end
++
++      scope
+     end
+ 
+     scope :postponing_soon, -> do
+       now = Time.now
+-      active
++      scope = active
+         .joins(board: :account)
+         .left_outer_joins(board: :entropy)
+         .joins("LEFT OUTER JOIN entropies AS account_entropies ON account_entropies.account_id = accounts.id AND account_entropies.container_type = 'Account' AND account_entropies.container_id = accounts.id")
+         .where("last_active_at > #{connection.date_subtract('?', 'COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period)')}", now)
+         .where("last_active_at <= #{connection.date_subtract('?', 'COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period) * 0.75')}", now)
++
++      if min_period = Entropy.minimum(:auto_postpone_period)
++        scope = scope.where("cards.last_active_at <= ?", now - (min_period * 0.75) + 1.second)
++      end
++
++      if max_period = Entropy.maximum(:auto_postpone_period)
++        scope = scope.where("cards.last_active_at > ?", now - max_period - 1.second)
++      end
++
++      scope
+     end
+ 
+     delegate :auto_postpone_period, to: :board
+@@ -25,7 +42,7 @@ module Card::Entropic
+ 
+   class_methods do
+     def auto_postpone_all_due
+-      due_to_be_postponed.find_each do |card|
++      due_to_be_postponed.preload(:account).find_each do |card|
+         card.auto_postpone(user: card.account.system_user)
+       end
+     end
+diff --git a/app/models/card/not_now.rb b/app/models/card/not_now.rb
+index f99aaee..53fde95 100644
+--- a/app/models/card/not_now.rb
++++ b/app/models/card/not_now.rb
+@@ -2,4 +2,24 @@ class Card::NotNow < ApplicationRecord
+   belongs_to :account, default: -> { card.account }
+   belongs_to :card, class_name: "::Card", touch: true
+   belongs_to :user, optional: true
++
++  after_create :deactivate_card
++  after_destroy :reactivate_card, unless: :destroyed_by_association
++
++  private
++    def deactivate_card
++      Card.where(id: card_id).update_all(active: false)
++      if association(:card).loaded?
++        card.active = false
++        card.clear_attribute_changes([ :active ])
++      end
++    end
++
++    def reactivate_card
++      updated = Card.where(id: card_id, status: "published").where.missing(:closure).update_all(active: true)
++      if association(:card).loaded?
++        card.active = (updated > 0)
++        card.clear_attribute_changes([ :active ])
++      end
++    end
+ end
+diff --git a/app/models/card/postponable.rb b/app/models/card/postponable.rb
+index ab58960..ef0d807 100644
+--- a/app/models/card/postponable.rb
++++ b/app/models/card/postponable.rb
+@@ -5,7 +5,9 @@ module Card::Postponable
+     has_one :not_now, dependent: :destroy, class_name: "Card::NotNow"
+ 
+     scope :postponed, -> { open.published.joins(:not_now) }
+-    scope :active, -> { open.published.where.missing(:not_now) }
++    scope :active, -> { where(active: true) }
++
++    before_save :sync_active, if: -> { new_record? || status_changed? }
+   end
+ 
+   def postponed?
+@@ -45,4 +47,13 @@ module Card::Postponable
+       not_now&.destroy
+     end
+   end
++
++  private
++    def sync_active
++      self.active = if new_record?
++        published? && association(:closure).target.nil? && association(:not_now).target.nil?
++      else
++        active?
++      end
++    end
+ end
+diff --git a/app/models/closure.rb b/app/models/closure.rb
+index 512de66..1642489 100644
+--- a/app/models/closure.rb
++++ b/app/models/closure.rb
+@@ -2,4 +2,24 @@ class Closure < ApplicationRecord
+   belongs_to :account, default: -> { card.account }
+   belongs_to :card, touch: true
+   belongs_to :user, optional: true
++
++  after_create :deactivate_card
++  after_destroy :reactivate_card, unless: :destroyed_by_association
++
++  private
++    def deactivate_card
++      Card.where(id: card_id).update_all(active: false)
++      if association(:card).loaded?
++        card.active = false
++        card.clear_attribute_changes([ :active ])
++      end
++    end
++
++    def reactivate_card
++      updated = Card.where(id: card_id, status: "published").where.missing(:not_now).update_all(active: true)
++      if association(:card).loaded?
++        card.active = (updated > 0)
++        card.clear_attribute_changes([ :active ])
++      end
++    end
+ end
+diff --git a/db/migrate/20260219000000_add_active_to_cards.rb b/db/migrate/20260219000000_add_active_to_cards.rb
+new file mode 100644
+index 0000000..54c384c
+--- /dev/null
++++ b/db/migrate/20260219000000_add_active_to_cards.rb
+@@ -0,0 +1,19 @@
++class AddActiveToCards < ActiveRecord::Migration[8.2]
++  def change
++    add_column :cards, :active, :boolean, default: false, null: false
++
++    reversible do |dir|
++      dir.up do
++        execute(<<~SQL)
++          UPDATE cards
++          SET active = #{connection.quoted_true}
++          WHERE status = 'published'
++            AND NOT EXISTS (SELECT 1 FROM closures WHERE closures.card_id = cards.id)
++            AND NOT EXISTS (SELECT 1 FROM card_not_nows WHERE card_not_nows.card_id = cards.id)
++        SQL
++      end
++    end
++
++    add_index :cards, [ :active, :last_active_at ]
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 99e6be9..e2e5e01 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.2].define(version: 2026_02_18_120000) do
++ActiveRecord::Schema[8.2].define(version: 2026_02_19_000000) do
+   create_table "accesses", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+     t.datetime "accessed_at"
+     t.uuid "account_id", null: false
+@@ -226,9 +226,11 @@ ActiveRecord::Schema[8.2].define(version: 2026_02_18_120000) do
+     t.bigint "number", null: false
+     t.string "status", default: "drafted", null: false
+     t.string "title"
++    t.boolean "active", default: false, null: false
+     t.datetime "updated_at", null: false
+     t.index ["account_id", "last_active_at", "status"], name: "index_cards_on_account_id_and_last_active_at_and_status"
+     t.index ["account_id", "number"], name: "index_cards_on_account_id_and_number", unique: true
++    t.index ["active", "last_active_at"], name: "index_cards_on_active_and_last_active_at"
+     t.index ["board_id"], name: "index_cards_on_board_id"
+     t.index ["column_id"], name: "index_cards_on_column_id"
+   end
+diff --git a/db/schema_sqlite.rb b/db/schema_sqlite.rb
+index 00125d1..b4597bc 100644
+--- a/db/schema_sqlite.rb
++++ b/db/schema_sqlite.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.2].define(version: 2026_02_18_120000) do
++ActiveRecord::Schema[8.2].define(version: 2026_02_19_000000) do
+   create_table "accesses", id: :uuid, force: :cascade do |t|
+     t.datetime "accessed_at"
+     t.uuid "account_id", null: false
+@@ -227,8 +227,10 @@ ActiveRecord::Schema[8.2].define(version: 2026_02_18_120000) do
+     t.string "status", limit: 255, default: "drafted", null: false
+     t.string "title", limit: 255
+     t.datetime "updated_at", null: false
++    t.boolean "active", default: false, null: false
+     t.index ["account_id", "last_active_at", "status"], name: "index_cards_on_account_id_and_last_active_at_and_status"
+     t.index ["account_id", "number"], name: "index_cards_on_account_id_and_number", unique: true
++    t.index ["active", "last_active_at"], name: "index_cards_on_active_and_last_active_at"
+     t.index ["board_id"], name: "index_cards_on_board_id"
+     t.index ["column_id"], name: "index_cards_on_column_id"
+   end
+diff --git a/test/fixtures/cards.yml b/test/fixtures/cards.yml
+index 4785ee8..059179c 100644
+--- a/test/fixtures/cards.yml
++++ b/test/fixtures/cards.yml
+@@ -8,6 +8,7 @@ logo:
+   due_on: <%= 3.days.from_now %>
+   created_at: <%= 1.week.ago %>
+   status: published
++  active: true
+   last_active_at: <%= 1.week.ago %>
+   account: 37s_uuid
+ 
+@@ -20,6 +21,7 @@ layout:
+   title: Layout is broken
+   created_at: <%= 1.week.ago %>
+   status: published
++  active: true
+   last_active_at: <%= 1.week.ago %>
+   account: 37s_uuid
+ 
+@@ -32,6 +34,7 @@ text:
+   title: The text is too small
+   created_at: <%= 1.week.ago %>
+   status: published
++  active: true
+   last_active_at: <%= 1.week.ago %>
+   account: 37s_uuid
+ 
+@@ -44,6 +47,7 @@ shipping:
+   title: We need to ship the app
+   created_at: <%= 1.week.ago %>
+   status: published
++  active: false
+   last_active_at: <%= 1.week.ago %>
+   account: 37s_uuid
+ 
+@@ -55,6 +59,7 @@ buy_domain:
+   title: Buy domain
+   created_at: <%= 1.week.ago %>
+   status: published
++  active: true
+   last_active_at: <%= 1.week.ago %>
+   account: 37s_uuid
+ 
+@@ -66,6 +71,7 @@ radio:
+   title: I want to play my radio at a reasonable volume
+   created_at: <%= 1.week.ago %>
+   status: published
++  active: true
+   last_active_at: <%= 1.week.ago %>
+   account: initech_uuid
+ 
+@@ -77,6 +83,7 @@ paycheck:
+   title: I haven't received my paycheck
+   created_at: <%= 1.week.ago %>
+   status: published
++  active: true
+   last_active_at: <%= 1.week.ago %>
+   account: initech_uuid
+ 
+@@ -88,5 +95,6 @@ unfinished_thoughts:
+   title: Some unfinished thoughts
+   created_at: <%= 1.week.ago %>
+   status: drafted
++  active: false
+   last_active_at: <%= 1.week.ago %>
+   account: initech_uuid
+diff --git a/test/models/account/import_test.rb b/test/models/account/import_test.rb
+index c1e9c2f..626c02a 100644
+--- a/test/models/account/import_test.rb
++++ b/test/models/account/import_test.rb
+@@ -220,6 +220,63 @@ class Account::ImportTest < ActiveSupport::TestCase
+     export_tempfile&.unlink
+   end
+ 
++  test "export and import reconciles active cards for exports missing active attribute" do
++    source_account = accounts("37s")
++    exporter = users(:david)
++    identity = exporter.identity
++
++    Current.set(account: source_account, user: exporter) do
++      cards(:text).postpone
++    end
++
++    active_card_id = cards(:logo).id
++    closed_card_id = cards(:shipping).id
++    postponed_card_id = cards(:text).id
++
++    export = Account::Export.create!(account: source_account, user: exporter)
++    export.build
++
++    legacy_tempfile = Tempfile.new([ "legacy_export", ".zip" ])
++    legacy_tempfile.binmode
++    export.file.open do |f|
++      reader = ZipFile::Reader.new(f)
++      writer = ZipFile::Writer.new(legacy_tempfile)
++      reader.glob("**/*").each do |entry_path|
++        raw = reader.read(entry_path)
++        if entry_path.start_with?("data/cards/") && entry_path.end_with?(".json")
++          data = JSON.parse(raw)
++          data.delete("active")
++          writer.add_file(entry_path, data.to_json)
++        else
++          writer.add_file(entry_path, raw)
++        end
++      end
++      writer.close
++    end
++    legacy_tempfile.rewind
++
++    source_account.destroy!
++
++    target_account = Account.create_with_owner(account: { name: "Import Test" }, owner: { identity: identity, name: exporter.name })
++    import = Account::Import.create!(identity: identity, account: target_account)
++    Current.set(account: target_account) do
++      import.file.attach(io: File.open(legacy_tempfile.path), filename: "export.zip", content_type: "application/zip")
++    end
++
++    import.check
++    assert_not import.failed?
++
++    import.process
++    assert import.completed?
++
++    assert target_account.cards.find(active_card_id).active
++    assert_not target_account.cards.find(closed_card_id).active
++    assert_not target_account.cards.find(postponed_card_id).active
++  ensure
++    legacy_tempfile&.close
++    legacy_tempfile&.unlink
++  end
++
+   private
+     def account_digest(account)
+       {
+diff --git a/test/models/card/entropic_test.rb b/test/models/card/entropic_test.rb
+index 848cfa7..e1e345c 100644
+--- a/test/models/card/entropic_test.rb
++++ b/test/models/card/entropic_test.rb
+@@ -85,4 +85,51 @@ class Card::EntropicTest < ActiveSupport::TestCase
+ 
+     assert_equal(cards(:logo, :radio).to_set, Card.postponing_soon.to_set)
+   end
++
++  test "due_to_be_postponed excludes closed, postponed, and drafted cards" do
++    freeze_time
++
++    cards(:shipping).update!(last_active_at: 100.days.ago)
++    cards(:unfinished_thoughts).update!(last_active_at: 100.days.ago)
++    cards(:text).postpone
++    cards(:text).update!(last_active_at: 100.days.ago)
++
++    due = Card.due_to_be_postponed.to_a
++    assert_not_includes due, cards(:shipping)
++    assert_not_includes due, cards(:unfinished_thoughts)
++    assert_not_includes due, cards(:text)
++  end
++
++  test "due_to_be_postponed handles mixed entropy periods across boards" do
++    freeze_time
++
++    entropies(:writebook_board).update!(auto_postpone_period: 3.days)
++    entropies(:miltons_wish_list_board).update!(auto_postpone_period: 90.days)
++
++    cards(:logo).update!(last_active_at: 4.days.ago)
++    cards(:layout).update!(last_active_at: 2.days.ago)
++    cards(:radio).update!(last_active_at: 10.days.ago)
++    cards(:paycheck).update!(last_active_at: 91.days.ago)
++
++    due = Card.due_to_be_postponed.to_a
++    assert_includes due, cards(:logo)
++    assert_includes due, cards(:paycheck)
++    assert_not_includes due, cards(:layout)
++    assert_not_includes due, cards(:radio)
++  end
++
++  test "due_to_be_postponed handles empty entropies table" do
++    Entropy.delete_all
++    assert_empty Card.due_to_be_postponed
++  end
++
++  if ActiveRecord::Base.connection.adapter_name == "SQLite"
++    test "due_to_be_postponed batch query uses the active and last_active_at index" do
++      sql = Card.due_to_be_postponed.order(:id).limit(1000).to_sql
++      plan = ActiveRecord::Base.connection.exec_query("EXPLAIN QUERY PLAN #{sql}").map { |row| row["detail"] }.join("\n")
++
++      assert_includes plan, "index_cards_on_active_and_last_active_at"
++      assert_not_includes plan, "SCAN cards"
++    end
++  end
+ end
+diff --git a/test/models/card/postponable_test.rb b/test/models/card/postponable_test.rb
+index 0bafd3e..ca000be 100644
+--- a/test/models/card/postponable_test.rb
++++ b/test/models/card/postponable_test.rb
+@@ -57,4 +57,42 @@ class Card::PostponableTest < ActiveSupport::TestCase
+     assert_includes Card.active, text
+     assert_not_includes Card.active, logo
+   end
++
++  test "active column stays synchronized across lifecycle transitions" do
++    card = boards(:writebook).cards.create!(creator: users(:david), status: :drafted, title: "Draft card")
++    assert_not card.active
++    assert_not_includes Card.active, card
++
++    card.publish
++    assert card.active
++    assert_includes Card.active, card
++
++    card.close
++    assert_not card.active
++    assert_not card.reload.active
++    assert_not_includes Card.active, card
++
++    card.postpone
++    assert_not card.active
++    assert_not card.reload.active
++    assert_not_includes Card.active, card
++
++    card.resume
++    assert card.reload.active
++    assert_includes Card.active, card
++
++    card.postpone
++    assert_not card.reload.active
++
++    card.close
++    assert_not card.reload.active
++
++    card.reopen
++    assert card.reload.active
++    assert_includes Card.active, card
++
++    card.drafted!
++    assert_not card.reload.active
++    assert_not_includes Card.active, card
++  end
+ end

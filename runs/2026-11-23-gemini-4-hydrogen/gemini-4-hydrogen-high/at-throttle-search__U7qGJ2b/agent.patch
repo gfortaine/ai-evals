@@ -1,0 +1,322 @@
+diff --git a/app/controllers/books/searches_controller.rb b/app/controllers/books/searches_controller.rb
+index 5268c55..8252297 100644
+--- a/app/controllers/books/searches_controller.rb
++++ b/app/controllers/books/searches_controller.rb
+@@ -1,9 +1,16 @@
+ class Books::SearchesController < ApplicationController
+   allow_unauthenticated_access
+ 
++  before_action :enforce_rate_limit, only: :create
++
+   include BookScoped
+ 
+   def create
+     @leaves = @book.leaves.active.search(params[:search]).favoring_title.limit(50)
+   end
++
++  private
++    def enforce_rate_limit
++      head :too_many_requests unless SearchRateLimiter.allow?(request.remote_ip)
++    end
+ end
+diff --git a/app/models/search_rate_limiter.rb b/app/models/search_rate_limiter.rb
+new file mode 100644
+index 0000000..911c817
+--- /dev/null
++++ b/app/models/search_rate_limiter.rb
+@@ -0,0 +1,127 @@
++require "securerandom"
++
++class SearchRateLimiter
++  LIMIT = 30
++  WINDOW = 1.minute
++
++  REDIS_LUA_SCRIPT = <<~LUA
++    local key = KEYS[1]
++    local now = tonumber(ARGV[1])
++    local cutoff = tonumber(ARGV[2])
++    local limit = tonumber(ARGV[3])
++    local ttl_ms = tonumber(ARGV[4])
++    local member = ARGV[5]
++
++    redis.call("ZREMRANGEBYSCORE", key, "-inf", cutoff)
++    local count = redis.call("ZCARD", key)
++    if count >= limit then
++      return 0
++    end
++    redis.call("ZADD", key, now, member)
++    redis.call("PEXPIRE", key, ttl_ms)
++    return 1
++  LUA
++
++  class << self
++    def instance
++      @instance ||= new
++    end
++
++    def allow?(identifier)
++      instance.allow?(identifier)
++    end
++  end
++
++  def initialize(limit: LIMIT, window: WINDOW)
++    @limit = limit
++    @window = window
++    @mutex = Mutex.new
++    @fallback_store = ActiveSupport::Cache::MemoryStore.new
++  end
++
++  def allow?(identifier)
++    cache_key = "rate-limit:books/searches:#{identifier.presence || "unknown"}"
++    store = resolve_store
++
++    if redis_store?(store)
++      allow_with_redis?(store, cache_key)
++    else
++      allow_with_cache?(store, cache_key)
++    end
++  end
++
++  private
++    def resolve_store
++      if usable_store?(Rails.cache)
++        Rails.cache
++      elsif usable_store?(ActionController::Base.cache_store)
++        ActionController::Base.cache_store
++      else
++        @fallback_store
++      end
++    end
++
++    def usable_store?(store)
++      store && !store.is_a?(ActiveSupport::Cache::NullStore)
++    end
++
++    def redis_store?(store)
++      defined?(ActiveSupport::Cache::RedisCacheStore) && store.is_a?(ActiveSupport::Cache::RedisCacheStore)
++    end
++
++    def allow_with_cache?(store, cache_key)
++      now = Time.now.to_f
++      cutoff = now - @window.to_f
++
++      @mutex.synchronize do
++        timestamps = Array(store.read(cache_key)).select { |ts| ts > cutoff }
++        if timestamps.size >= @limit
++          false
++        else
++          timestamps << now
++          store.write(cache_key, timestamps, expires_in: @window)
++          true
++        end
++      end
++    end
++
++    def allow_with_redis?(store, cache_key)
++      now_ms = Time.now.to_f * 1000.0
++      cutoff_ms = now_ms - (@window.to_f * 1000.0)
++      ttl_ms = (@window.to_f * 1000.0).ceil
++      member = "#{now_ms}:#{SecureRandom.hex(8)}"
++      redis_key = store.options[:namespace].present? ? "#{store.options[:namespace]}:#{cache_key}" : cache_key
++
++      result = with_redis_client(store.redis, redis_key) do |client|
++        client.eval(
++          REDIS_LUA_SCRIPT,
++          keys: [ redis_key ],
++          argv: [ now_ms, cutoff_ms, @limit, ttl_ms, member ]
++        )
++      end
++
++      result == 1
++    rescue ::Redis::BaseError, *connection_pool_errors
++      allow_with_cache?(@fallback_store, cache_key)
++    end
++
++    def with_redis_client(redis, redis_key)
++      if redis.respond_to?(:with)
++        redis.with do |client|
++          client = client.node_for(redis_key) if defined?(::Redis::Distributed) && client.is_a?(::Redis::Distributed)
++          yield client
++        end
++      else
++        client = (defined?(::Redis::Distributed) && redis.is_a?(::Redis::Distributed)) ? redis.node_for(redis_key) : redis
++        yield client
++      end
++    end
++
++    def connection_pool_errors
++      if defined?(::ConnectionPool)
++        [ ::ConnectionPool::Error, ::ConnectionPool::TimeoutError ]
++      else
++        []
++      end
++    end
++end
+diff --git a/config/environments/test.rb b/config/environments/test.rb
+index 75f22c6..f251542 100644
+--- a/config/environments/test.rb
++++ b/config/environments/test.rb
+@@ -23,7 +23,7 @@ Rails.application.configure do
+   # Show full error reports and disable caching.
+   config.consider_all_requests_local = true
+   config.action_controller.perform_caching = false
+-  config.cache_store = :null_store
++  config.cache_store = :memory_store
+ 
+   # Render exception templates for rescuable exceptions and raise for other exceptions.
+   config.action_dispatch.show_exceptions = :rescuable
+diff --git a/test/controllers/books/searches_rate_limit_test.rb b/test/controllers/books/searches_rate_limit_test.rb
+new file mode 100644
+index 0000000..c0a01da
+--- /dev/null
++++ b/test/controllers/books/searches_rate_limit_test.rb
+@@ -0,0 +1,149 @@
++require "test_helper"
++
++class Books::SearchesRateLimitTest < ActionDispatch::IntegrationTest
++  setup do
++    Rails.cache.clear
++    books(:handbook).update!(published: true)
++    books(:manual).update!(published: true)
++    Leaf.reindex_all
++  end
++
++  teardown do
++    Rails.cache.clear
++  end
++
++  test "allows 30 search requests in a minute and refuses the 31st with 429" do
++    headers = { "REMOTE_ADDR" => "198.51.100.10" }
++
++    30.times do
++      post book_search_path(books(:handbook)), params: { search: "Thanks" }, headers: headers
++      assert_response :success
++    end
++
++    post book_search_path(books(:handbook)), params: { search: "Thanks" }, headers: headers
++    assert_response :too_many_requests
++  end
++
++  test "enforces the 30-request limit per address across all published books" do
++    headers = { "REMOTE_ADDR" => "198.51.100.11" }
++
++    15.times do
++      post book_search_path(books(:handbook)), params: { search: "Thanks" }, headers: headers
++      assert_response :success
++    end
++
++    15.times do
++      post book_search_path(books(:manual)), params: { search: "manual" }, headers: headers
++      assert_response :success
++    end
++
++    post book_search_path(books(:manual)), params: { search: "manual" }, headers: headers
++    assert_response :too_many_requests
++  end
++
++  test "enforces the limit over a sliding one-minute stretch" do
++    headers = { "REMOTE_ADDR" => "198.51.100.12" }
++
++    freeze_time do
++      15.times do
++        post book_search_path(books(:handbook)), params: { search: "Thanks" }, headers: headers
++        assert_response :success
++      end
++
++      travel 45.seconds
++      15.times do
++        post book_search_path(books(:handbook)), params: { search: "Thanks" }, headers: headers
++        assert_response :success
++      end
++
++      travel 20.seconds
++      15.times do
++        post book_search_path(books(:handbook)), params: { search: "Thanks" }, headers: headers
++        assert_response :success
++      end
++
++      post book_search_path(books(:handbook)), params: { search: "Thanks" }, headers: headers
++      assert_response :too_many_requests
++    end
++  end
++
++  test "automatically serves the address again within five minutes after burst stops" do
++    headers = { "REMOTE_ADDR" => "198.51.100.13" }
++
++    freeze_time do
++      30.times do
++        post book_search_path(books(:handbook)), params: { search: "Thanks" }, headers: headers
++        assert_response :success
++      end
++
++      post book_search_path(books(:handbook)), params: { search: "Thanks" }, headers: headers
++      assert_response :too_many_requests
++
++      travel 5.minutes
++      post book_search_path(books(:handbook)), params: { search: "Thanks" }, headers: headers
++      assert_response :success
++      assert_select "a", text: /Thanks for reading/i
++    end
++  end
++
++  test "does not affect readers at a different address without signing in" do
++    blocked_headers = { "REMOTE_ADDR" => "198.51.100.14" }
++    other_headers = { "REMOTE_ADDR" => "198.51.100.15" }
++
++    31.times do
++      post book_search_path(books(:handbook)), params: { search: "Thanks" }, headers: blocked_headers
++    end
++    assert_response :too_many_requests
++
++    post book_search_path(books(:handbook)), params: { search: "Thanks" }, headers: other_headers
++    assert_response :success
++    assert_select "a", text: /Thanks for reading/i
++  end
++
++  test "refused address can still open the book and its pages" do
++    headers = { "REMOTE_ADDR" => "198.51.100.16" }
++
++    31.times do
++      post book_search_path(books(:handbook)), params: { search: "Thanks" }, headers: headers
++    end
++    assert_response :too_many_requests
++
++    get book_slug_path(books(:handbook)), headers: headers
++    assert_response :success
++
++    get leafable_slug_path(leaves(:welcome_page)), headers: headers
++    assert_response :success
++  end
++
++  test "still enforces rate limit when Rails.cache is NullStore" do
++    original_cache = Rails.cache
++    original_controller_cache = ActionController::Base.cache_store
++    Rails.cache = ActiveSupport::Cache::NullStore.new
++    ActionController::Base.cache_store = ActiveSupport::Cache::NullStore.new
++
++    headers = { "REMOTE_ADDR" => "198.51.100.17" }
++    30.times do
++      post book_search_path(books(:handbook)), params: { search: "Thanks" }, headers: headers
++      assert_response :success
++    end
++
++    post book_search_path(books(:handbook)), params: { search: "Thanks" }, headers: headers
++    assert_response :too_many_requests
++  ensure
++    Rails.cache = original_cache
++    ActionController::Base.cache_store = original_controller_cache
++  end
++
++test "rate limits by forwarded client IP when behind a trusted proxy" do
++  30.times do
++    post book_search_path(books(:handbook)), params: { search: "Thanks" }, headers: { "X-Forwarded-For" => "198.51.100.20" }
++    assert_response :success
++  end
++
++  post book_search_path(books(:handbook)), params: { search: "Thanks" }, headers: { "X-Forwarded-For" => "198.51.100.20" }
++  assert_response :too_many_requests
++
++  post book_search_path(books(:handbook)), params: { search: "Thanks" }, headers: { "X-Forwarded-For" => "198.51.100.21" }
++  assert_response :success
++end
++end

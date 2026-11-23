@@ -1,0 +1,1263 @@
+diff --git a/config/environments/test.rb b/config/environments/test.rb
+index 12709d5..5dfa3fe 100644
+--- a/config/environments/test.rb
++++ b/config/environments/test.rb
+@@ -13,6 +13,9 @@ Rails.application.configure do
+   # While tests run files are not watched, reloading is not necessary.
+   config.enable_reloading = false
+ 
++  # Avoid writing verbose SQL/debug logs to log/test.log during test runs.
++  config.log_level = ENV.fetch('RAILS_LOG_LEVEL', :warn)
++
+   # Eager loading loads your entire application. When running a single test locally,
+   # this is usually not necessary, and can slow down your test suite. However, it's
+   # recommended that you enable it in continuous integration systems to ensure eager
+diff --git a/docs/test_suite_optimization.md b/docs/test_suite_optimization.md
+new file mode 100644
+index 0000000..2afcae1
+--- /dev/null
++++ b/docs/test_suite_optimization.md
+@@ -0,0 +1,79 @@
++# Test Suite Optimization Notes & Plan
++
++## Phase 1: `spec/models` + Global Configuration
++
++### Baseline Metrics (`spec/models` — 1,795 examples)
++- **Clean runtime**: `2m 25.1s` (145.1s)
++- **RSpecDissect**: `141.5s` total, `116.3s` (82.2%) in setup
++- **SQL (`sql.active_record`)**: `113,956` queries (`22.43s`, ~63.5 queries/example)
++- **Sidekiq inline jobs (`sidekiq.inline`)**: `3,908` inline job executions (`37.70s` / `26.9%` in EventProf; `42.86s` in `TriggerWebhookWorker` alone across `3,829` calls)
++- **Fabrication (`FactoryProf`)**: `4,721` total calls (`3,243` top-level), `126.46s` (`89%` of total time)
++  - `status`: `1,003` calls (`68.30s`, `68.1ms`/call)
++  - `bookmark`: `1,019` calls (`17` top-level, `34.67s`, `34.0ms`/call — triggered by `Fabricate(:status)` `after_create`)
++  - `account`: `1,194` calls (`31.51s`, `26.4ms`/call)
++  - `media_attachment`: `40` calls (`6.27s`, `156.7ms`/call)
++  - `notification`: `76` calls (`6.42s`, `84.5ms`/call)
++  - `user`: `93` calls (`3.51s`, `37.7ms`/call)
++
++### Root Causes Identified
++1. **`TriggerWebhookWorker` running inline on every model save (`~30%` of runtime)**:
++   - `spec/rails_helper.rb` enabled `Sidekiq.testing!(:inline)` globally.
++   - `Account`, `User`, `Status`, and `Report` `after_commit` callbacks enqueue `TriggerWebhookWorker`.
++   - Even with 0 `Webhook` rows in the DB, `TriggerWebhookWorker` reloaded the record from Postgres and serialized the full payload via `REST::Admin::WebhookEventSerializer` before discovering `Webhook.enabled...pluck(:id)` was empty.
++   - Out of 1,795 model examples, only 3 failed under `Sidekiq.testing!(:fake)` — all 3 used `ActionMailer::TestHelper#capture_emails`, which relies on `deliver_later` executing immediately.
++2. **Verbose Rails debug/SQL logging in test (`~7.6%` of runtime + 123 MB `log/test.log`)**:
++   - `config/environments/test.rb` had no `config.log_level`, defaulting to `:debug`.
++   - `ActiveRecord::LogSubscriber#sql` formatted, colorized, and wrote every SQL query to `log/test.log`.
++3. **Stray `ActiveRecord.verbose_query_logs = true` in a spec file**:
++   - `spec/models/concerns/status/fetch_replies_concern_spec.rb:6` left `ActiveRecord.verbose_query_logs = true` enabled globally, polluting all subsequent examples with stacktrace collection per SQL query.
++4. **Per-example `rails_helper.rb` overhead**:
++   - `Rails.application.reload_routes_unless_loaded` ran before every single example (~1.88ms/call, ~3.4s in `spec/models`, ~18s+ across the full suite).
++   - `allow(Resolv::DNS).to receive(:open)...` ran `rspec-mocks` setup/teardown before every example.
++5. **Repeated DB setup in slow model specs**:
++   - Suites like `AccountStatusesCleanupPolicy`, `TagFeed`, `PublicFeed`, `Trends::Statuses`, `Status`, `Notification`, `Status::ThreadingConcern`, `Status::FetchRepliesConcern`, `Account::Interactions`, `Form::Import`, etc. recreated large graphs of `Status`/`Account`/`Tag` records per example via `let`/`let!`/`before`.
++   - **Important codebase gotcha for `let_it_be` with `Account`**: `Account` caches `account_stat` association state (`Account::Counters#update_count!` checks `association(:account_stat).loaded?`) AND memoizes relationship ivars (`@following`, `@blocking`, `@muting`, `@domain_blocking`). Use `refind: true` (not `reload: true`) for `let_it_be(:account, ...)` whenever the account may be mutated or queried for relationships.
++
++### Changes Applied in Phase 1
++1. **`config/environments/test.rb`**:
++   - Set `config.log_level = ENV.fetch('RAILS_LOG_LEVEL', :warn)`.
++2. **`spec/rails_helper.rb`**:
++   - Required `test_prof/recipes/rspec/let_it_be` (enables `let_it_be` and `before_all`).
++   - Moved `Rails.application.reload_routes_unless_loaded` from `config.before` to `config.before :suite`.
++   - Replaced per-example `allow(Resolv::DNS).to receive(:open)` mock with a lightweight singleton guard on `Resolv::DNS.open` (respects `type: :system` and `rspec-mocks` stubbing).
++   - Added `SidekiqInlineCaptureEmails` wrapping `ActionMailer::TestHelper#capture_emails` in `Sidekiq::Testing.inline!`.
++   - Set `Sidekiq.testing!(:fake)` + `Sidekiq::Worker.clear_all` in `config.before :each, type: :model` (with `:sidekiq_inline` tag opt-in).
++3. **`spec/models/**/*_spec.rb` & `spec/support/examples/models/concerns/reviewable.rb`**:
++   - Removed stray `ActiveRecord.verbose_query_logs = true` from `spec/models/concerns/status/fetch_replies_concern_spec.rb`.
++   - Converted repeated shared setup in the slowest model specs (`account_statuses_cleanup_policy_spec.rb`, `tag_feed_spec.rb`, `public_feed_spec.rb`, `trends/statuses_spec.rb`, `status_spec.rb`, `notification_spec.rb`, `concerns/status/threading_concern_spec.rb`, `concerns/status/fetch_replies_concern_spec.rb`, `concerns/account/interactions_spec.rb`, `form/import_spec.rb`, `account_spec.rb`, `account_suggestions/friends_of_friends_source_spec.rb`, `admin/account_action_spec.rb`, `collection_spec.rb`, `concerns/account/mappings_spec.rb`, `form/custom_emoji_batch_spec.rb`, `status/visibility_spec.rb`, `status_pin_spec.rb`, `web/push_subscription_spec.rb`, `account/search_spec.rb`, and `reviewable.rb`) to `let_it_be` / `before_all`.
++
++### Phase 1 Results (`spec/models` — 1,795 examples, 0 failures)
++- **Clean runtime**: `145.1s` -> **`40.09s`** (**72.4% faster / 3.62x speedup**)
++- **SQL queries**: `113,956` -> `44,916` (**-60.6%**)
++- **Factory calls**: `4,721` (`126.46s`) -> `2,809` (`34.66s`) (**-40.5% calls, -72.6% time**)
++- **Per-call `status` time**: `68.1ms` -> `27.5ms` (**-60%**)
++- **Per-call `account` time**: `26.4ms` -> `13.2ms` (**-50%**)
++
++---
++
++## Plan for Future Phases
++
++### Phase 2: `spec/requests`
++1. Profile `spec/requests` baseline (`--profile 25`, `FPROF=1`, `RD_PROF=1`, `EVENT_PROF=sql.active_record`, `EVENT_PROF=sidekiq.inline`).
++2. Evaluate extending `Sidekiq.testing!(:fake)` (or specifically stubbing/faking `TriggerWebhookWorker` unless `:webhooks` / `:sidekiq_inline`) to `type: :request`:
++   - In `spec/requests`, many endpoints trigger `Status` / `Account` / `Report` writes, which currently run `TriggerWebhookWorker` inline.
++   - Check which request specs rely on inline Sidekiq jobs (e.g., `capture_emails` is already wrapped with `Sidekiq::Testing.inline!`; check `Admin` / `ActivityPub` / `OAuth` request specs).
++3. Check `Devise::Test::IntegrationHelpers` / `sign_in` overhead in `type: :request` (see `rails_helper.rb` `SessionActivation` monkey-patch and `let_it_be` for shared users/accounts/tokens/statuses across request examples).
++4. Check `Fabricate` usage in `spec/requests` with `RSpecDissect` (`RD_PROF=1`) and convert shared read-only setup to `let_it_be(..., refind: true)` / `before_all`.
++5. Check `config.before(:each, type: :request)` / rack middleware / view rendering / Vite / asset compilation overhead.
++
++### Phase 3: Factories (`spec/fabricators/`)
++Observations from Phase 1 profiling (for when factories are in scope):
++1. **`spec/fabricators/status_fabricator.rb`**:
++   - `after_create { |status| Fabricate(:bookmark, status: status) }` creates an extra `bookmark` + a SECOND `account` + a SECOND `user` (with BCrypt hashing!) + TWO `login_activity` records on EVERY `Fabricate(:status)` call! That accounted for `1,015` of the `1,019` `bookmark` calls (`34.5s` in baseline!) and doubled `account`/`user`/`login_activity` creation.
++2. **`spec/fabricators/user_fabricator.rb`**:
++   - `after_create { |user| 2.times { Fabricate(:login_activity, user: user) } }` creates 2 `login_activity` rows on every `User` (and every local `Account`, since `account_fabricator` builds a `:user`!).
++   - `password '123456789'` runs `BCrypt::Password.create` (`cost = 4`, ~3.2-3.8% of total CPU time) on every `User` / local `Account`. Precomputing a static `encrypted_password` hash for `'123456789'` (when password isn't overridden) would eliminate BCrypt overhead from `Fabricate(:account)` / `Fabricate(:user)` completely!
++3. **`spec/fabricators/account_fabricator.rb`**:
++   - `user { |attrs| attrs[:domain].nil? ? Fabricate.build(:user, account: nil) : nil }` forces a `User` (and 2 `login_activity` rows + BCrypt hash) to be created for every local `Account`, even when tests don't need a `User`.
++4. **Default `TestProf::FactoryDefault` (`test_prof/recipes/rspec/factory_default`)**:
++   - Can also reduce implicit parent creations in nested fabricators (`bookmark`, `notification`, `status`, etc.).
+diff --git a/spec/models/account/search_spec.rb b/spec/models/account/search_spec.rb
+index a806dbd..9c1b3ee 100644
+--- a/spec/models/account/search_spec.rb
++++ b/spec/models/account/search_spec.rb
+@@ -4,7 +4,7 @@ require 'rails_helper'
+ 
+ RSpec.describe Account::Search do
+   describe '.search_for' do
+-    before do
++    before_all do
+       _missing = Fabricate(
+         :account,
+         display_name: 'Missing',
+diff --git a/spec/models/account_spec.rb b/spec/models/account_spec.rb
+index 70d349d..5f69acb 100644
+--- a/spec/models/account_spec.rb
++++ b/spec/models/account_spec.rb
+@@ -261,15 +261,16 @@ RSpec.describe Account do
+   end
+ 
+   describe '#favourited?' do
+-    subject { Fabricate(:account) }
++    subject { account }
+ 
+-    let(:original_status) do
++    let_it_be(:account, refind: true) { Fabricate(:account) }
++    let_it_be(:original_status) do
+       author = Fabricate(:account, username: 'original')
+       Fabricate(:status, account: author)
+     end
+ 
+     context 'when the status is a reblog of another status' do
+-      let(:original_reblog) do
++      let_it_be(:original_reblog) do
+         author = Fabricate(:account, username: 'original_reblogger')
+         Fabricate(:status, reblog: original_status, account: author)
+       end
+@@ -299,15 +300,16 @@ RSpec.describe Account do
+   end
+ 
+   describe '#reblogged?' do
+-    subject { Fabricate(:account) }
++    subject { account }
+ 
+-    let(:original_status) do
++    let_it_be(:account, refind: true) { Fabricate(:account) }
++    let_it_be(:original_status) do
+       author = Fabricate(:account, username: 'original')
+       Fabricate(:status, account: author)
+     end
+ 
+     context 'when the status is a reblog of another status' do
+-      let(:original_reblog) do
++      let_it_be(:original_reblog) do
+         author = Fabricate(:account, username: 'original_reblogger')
+         Fabricate(:status, reblog: original_status, account: author)
+       end
+diff --git a/spec/models/account_statuses_cleanup_policy_spec.rb b/spec/models/account_statuses_cleanup_policy_spec.rb
+index 548e110..0a061f3 100644
+--- a/spec/models/account_statuses_cleanup_policy_spec.rb
++++ b/spec/models/account_statuses_cleanup_policy_spec.rb
+@@ -3,7 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe AccountStatusesCleanupPolicy do
+-  let(:account) { Fabricate(:account, username: 'alice', domain: nil) }
++  let_it_be(:account, reload: true) { Fabricate(:account, username: 'alice', domain: nil) }
+ 
+   describe 'Validations' do
+     subject { Fabricate.build :account_statuses_cleanup_policy }
+@@ -17,7 +17,7 @@ RSpec.describe AccountStatusesCleanupPolicy do
+     context 'when widening a policy' do
+       subject { account_statuses_cleanup_policy.last_inspected }
+ 
+-      let!(:account_statuses_cleanup_policy) do
++      let_it_be(:account_statuses_cleanup_policy, reload: true) do
+         Fabricate(:account_statuses_cleanup_policy,
+                   account: account,
+                   keep_direct: true,
+@@ -30,7 +30,7 @@ RSpec.describe AccountStatusesCleanupPolicy do
+                   min_reblogs: 1)
+       end
+ 
+-      before do
++      before_all do
+         account_statuses_cleanup_policy.record_last_inspected(42)
+       end
+ 
+@@ -263,23 +263,23 @@ RSpec.describe AccountStatusesCleanupPolicy do
+   describe '#statuses_to_delete' do
+     subject { account_statuses_cleanup_policy.statuses_to_delete }
+ 
+-    let!(:unrelated_status)  { Fabricate(:status, created_at: 3.years.ago) }
+-    let!(:very_old_status)   { Fabricate(:status, created_at: 3.years.ago, account: account) }
+-    let!(:pinned_status)     { Fabricate(:status, created_at: 1.year.ago, account: account) }
+-    let!(:direct_message)    { Fabricate(:status, created_at: 1.year.ago, account: account, visibility: :direct) }
+-    let!(:self_faved)        { Fabricate(:status, created_at: 1.year.ago, account: account) }
+-    let!(:self_bookmarked)   { Fabricate(:status, created_at: 1.year.ago, account: account) }
+-    let!(:status_with_poll)  { Fabricate(:status, created_at: 1.year.ago, account: account, poll_attributes: { account: account, voters_count: 0, options: %w(a b), expires_in: 2.days }) }
+-    let!(:status_with_media) { Fabricate(:status, created_at: 1.year.ago, account: account) }
+-    let!(:faved_primary) { Fabricate(:status, created_at: 1.year.ago, account: account) }
+-    let!(:faved_secondary) { Fabricate(:status, created_at: 1.year.ago, account: account) }
+-    let!(:reblogged_primary) { Fabricate(:status, created_at: 1.year.ago, account: account) }
+-    let!(:reblogged_secondary) { Fabricate(:status, created_at: 1.year.ago, account: account) }
+-    let!(:recent_status) { Fabricate(:status, created_at: 2.days.ago, account: account) }
+-
+-    let(:account_statuses_cleanup_policy) { Fabricate(:account_statuses_cleanup_policy, account: account) }
+-
+-    before do
++    let_it_be(:unrelated_status)    { Fabricate(:status, created_at: 3.years.ago) }
++    let_it_be(:very_old_status)     { Fabricate(:status, created_at: 3.years.ago, account: account) }
++    let_it_be(:pinned_status)       { Fabricate(:status, created_at: 1.year.ago, account: account) }
++    let_it_be(:direct_message)      { Fabricate(:status, created_at: 1.year.ago, account: account, visibility: :direct) }
++    let_it_be(:self_faved)          { Fabricate(:status, created_at: 1.year.ago, account: account) }
++    let_it_be(:self_bookmarked)     { Fabricate(:status, created_at: 1.year.ago, account: account) }
++    let_it_be(:status_with_poll)    { Fabricate(:status, created_at: 1.year.ago, account: account, poll_attributes: { account: account, voters_count: 0, options: %w(a b), expires_in: 2.days }) }
++    let_it_be(:status_with_media)   { Fabricate(:status, created_at: 1.year.ago, account: account) }
++    let_it_be(:faved_primary)       { Fabricate(:status, created_at: 1.year.ago, account: account) }
++    let_it_be(:faved_secondary)     { Fabricate(:status, created_at: 1.year.ago, account: account) }
++    let_it_be(:reblogged_primary)   { Fabricate(:status, created_at: 1.year.ago, account: account) }
++    let_it_be(:reblogged_secondary) { Fabricate(:status, created_at: 1.year.ago, account: account) }
++    let_it_be(:recent_status)       { Fabricate(:status, created_at: 2.days.ago, account: account) }
++
++    let_it_be(:account_statuses_cleanup_policy, reload: true) { Fabricate(:account_statuses_cleanup_policy, account: account) }
++
++    before_all do
+       Fabricate(:media_attachment, account: account, status: status_with_media)
+       Fabricate(:status_pin, account: account, status: pinned_status)
+       Fabricate(:favourite, account: account, status: self_faved)
+diff --git a/spec/models/account_suggestions/friends_of_friends_source_spec.rb b/spec/models/account_suggestions/friends_of_friends_source_spec.rb
+index af1e6e9..b2649f3 100644
+--- a/spec/models/account_suggestions/friends_of_friends_source_spec.rb
++++ b/spec/models/account_suggestions/friends_of_friends_source_spec.rb
+@@ -6,17 +6,17 @@ RSpec.describe AccountSuggestions::FriendsOfFriendsSource do
+   describe '#get' do
+     subject { described_class.new }
+ 
+-    let!(:bob) { Fabricate(:account, discoverable: true, hide_collections: false) }
+-    let!(:alice) { Fabricate(:account, discoverable: true, hide_collections: true) }
+-    let!(:eve) { Fabricate(:account, discoverable: true, hide_collections: false) }
+-    let!(:mallory) { Fabricate(:account, discoverable: false, hide_collections: false) }
+-    let!(:eugen) { Fabricate(:account, discoverable: true, hide_collections: false) }
+-    let!(:neil) { Fabricate(:account, discoverable: true, hide_collections: false) }
+-    let!(:john) { Fabricate(:account, discoverable: true, hide_collections: false) }
+-    let!(:jerk) { Fabricate(:account, discoverable: true, hide_collections: false) }
+-    let!(:larry) { Fabricate(:account, discoverable: true, hide_collections: false) }
+-    let!(:morty) { Fabricate(:account, discoverable: true, hide_collections: false, memorial: true) }
+-    let!(:joyce) { Fabricate(:account, discoverable: true, hide_collections: false) }
++    let_it_be(:bob, refind: true) { Fabricate(:account, discoverable: true, hide_collections: false) }
++    let_it_be(:alice, refind: true) { Fabricate(:account, discoverable: true, hide_collections: true) }
++    let_it_be(:eve, refind: true) { Fabricate(:account, discoverable: true, hide_collections: false) }
++    let_it_be(:mallory, refind: true) { Fabricate(:account, discoverable: false, hide_collections: false) }
++    let_it_be(:eugen, refind: true) { Fabricate(:account, discoverable: true, hide_collections: false) }
++    let_it_be(:neil, refind: true) { Fabricate(:account, discoverable: true, hide_collections: false) }
++    let_it_be(:john, refind: true) { Fabricate(:account, discoverable: true, hide_collections: false) }
++    let_it_be(:jerk, refind: true) { Fabricate(:account, discoverable: true, hide_collections: false) }
++    let_it_be(:larry, refind: true) { Fabricate(:account, discoverable: true, hide_collections: false) }
++    let_it_be(:morty, refind: true) { Fabricate(:account, discoverable: true, hide_collections: false, memorial: true) }
++    let_it_be(:joyce, refind: true) { Fabricate(:account, discoverable: true, hide_collections: false) }
+ 
+     context 'with follows and blocks' do
+       before do
+diff --git a/spec/models/admin/account_action_spec.rb b/spec/models/admin/account_action_spec.rb
+index 5339084..9918223 100644
+--- a/spec/models/admin/account_action_spec.rb
++++ b/spec/models/admin/account_action_spec.rb
+@@ -6,10 +6,10 @@ RSpec.describe Admin::AccountAction do
+   let(:account_action) { described_class.new }
+ 
+   describe '#save!' do
+-    subject              { account_action.save! }
++    subject { account_action.save! }
+ 
+-    let(:account)        { Fabricate(:admin_user).account }
+-    let(:target_account) { Fabricate(:account) }
++    let_it_be(:account, refind: true)        { Fabricate(:admin_user).account }
++    let_it_be(:target_account, refind: true) { Fabricate(:account) }
+     let(:type)           { 'disable' }
+     let(:text)           { nil }
+ 
+diff --git a/spec/models/collection_spec.rb b/spec/models/collection_spec.rb
+index 3512bf4..d0046bb 100644
+--- a/spec/models/collection_spec.rb
++++ b/spec/models/collection_spec.rb
+@@ -94,14 +94,15 @@ RSpec.describe Collection do
+   end
+ 
+   describe '#item_for' do
+-    subject { Fabricate(:collection) }
++    subject { collection }
+ 
+-    let!(:accepted_items) { Fabricate.times(2, :collection_item, collection: subject, state: :accepted) }
+-    let!(:pending_item) { Fabricate(:collection_item, collection: subject, state: :pending) }
++    let_it_be(:collection, refind: true) { Fabricate(:collection) }
++    let_it_be(:accepted_items) { Fabricate.times(2, :collection_item, collection: collection, state: :accepted) }
++    let_it_be(:pending_item) { Fabricate(:collection_item, collection: collection, state: :pending) }
+ 
+-    before do
++    before_all do
+       %i(rejected revoked).each do |state|
+-        Fabricate(:collection_item, collection: subject, state:)
++        Fabricate(:collection_item, collection: collection, state:)
+       end
+     end
+ 
+diff --git a/spec/models/concerns/account/interactions_spec.rb b/spec/models/concerns/account/interactions_spec.rb
+index 5bca795..10868b3 100644
+--- a/spec/models/concerns/account/interactions_spec.rb
++++ b/spec/models/concerns/account/interactions_spec.rb
+@@ -3,8 +3,8 @@
+ require 'rails_helper'
+ 
+ RSpec.describe Account::Interactions do
+-  let(:account)            { Fabricate(:account) }
+-  let(:target_account)     { Fabricate(:account) }
++  let_it_be(:account, refind: true)        { Fabricate(:account) }
++  let_it_be(:target_account, refind: true) { Fabricate(:account) }
+ 
+   describe '#follow!' do
+     it 'creates and returns Follow' do
+diff --git a/spec/models/concerns/account/mappings_spec.rb b/spec/models/concerns/account/mappings_spec.rb
+index 80c66ae..bb1d2e4 100644
+--- a/spec/models/concerns/account/mappings_spec.rb
++++ b/spec/models/concerns/account/mappings_spec.rb
+@@ -3,13 +3,14 @@
+ require 'rails_helper'
+ 
+ RSpec.describe Account::Mappings do
+-  let(:account)            { Fabricate(:account) }
++  let_it_be(:account, refind: true) { Fabricate(:account) }
+   let(:account_id)         { account.id }
+   let(:account_ids)        { [account_id] }
+-  let(:target_account)     { Fabricate(:account) }
+   let(:target_account_id)  { target_account.id }
+   let(:target_account_ids) { [target_account_id] }
+ 
++  let_it_be(:target_account, refind: true) { Fabricate(:account) }
++
+   describe '.following_map' do
+     subject { Account.following_map(target_account_ids, account_id) }
+ 
+diff --git a/spec/models/concerns/status/fetch_replies_concern_spec.rb b/spec/models/concerns/status/fetch_replies_concern_spec.rb
+index e9c81d4..6f79e41 100644
+--- a/spec/models/concerns/status/fetch_replies_concern_spec.rb
++++ b/spec/models/concerns/status/fetch_replies_concern_spec.rb
+@@ -3,28 +3,29 @@
+ require 'rails_helper'
+ 
+ RSpec.describe Status::FetchRepliesConcern do
+-  ActiveRecord.verbose_query_logs = true
+-
+-  let!(:alice)  { Fabricate(:account, username: 'alice') }
+-  let!(:bob)    { Fabricate(:account, username: 'bob', domain: 'other.com') }
+-
+-  let!(:account) { alice }
+-  let!(:status_old) { Fabricate(:status, account: account, fetched_replies_at: 1.year.ago, created_at: 1.year.ago) }
+-  let!(:status_fetched_recently) { Fabricate(:status, account: account, fetched_replies_at: 1.second.ago, created_at: 1.year.ago) }
+-  let!(:status_created_recently) { Fabricate(:status, account: account, created_at: 1.second.ago) }
+-  let!(:status_never_fetched) { Fabricate(:status, account: account, created_at: 1.year.ago) }
++  let_it_be(:alice, refind: true) { Fabricate(:account, username: 'alice') }
++  let_it_be(:bob, refind: true)   { Fabricate(:account, username: 'bob', domain: 'other.com') }
++
++  shared_context 'with reply-fetchable statuses' do |account_sym|
++    let_it_be(:status_old) { Fabricate(:status, account: public_send(account_sym), fetched_replies_at: 1.year.ago, created_at: 1.year.ago) }
++    let_it_be(:status_fetched_recently) { Fabricate(:status, account: public_send(account_sym), fetched_replies_at: 1.second.ago, created_at: 1.year.ago) }
++    let_it_be(:status_created_recently) { Fabricate(:status, account: public_send(account_sym), created_at: 1.second.ago) }
++    let_it_be(:status_never_fetched) { Fabricate(:status, account: public_send(account_sym), created_at: 1.year.ago) }
++  end
+ 
+   describe 'should_fetch_replies' do
+     let!(:statuses) { Status.should_fetch_replies.all }
+ 
+     context 'with a local status' do
++      include_context 'with reply-fetchable statuses', :alice
++
+       it 'never fetches local replies' do
+         expect(statuses).to eq([])
+       end
+     end
+ 
+     context 'with a remote status' do
+-      let(:account) { bob }
++      include_context 'with reply-fetchable statuses', :bob
+ 
+       it 'fetches old statuses' do
+         expect(statuses).to include(status_old)
+@@ -48,13 +49,15 @@ RSpec.describe Status::FetchRepliesConcern do
+     let!(:statuses) { Status.should_not_fetch_replies.all }
+ 
+     context 'with a local status' do
++      include_context 'with reply-fetchable statuses', :alice
++
+       it 'does not fetch local statuses' do
+         expect(statuses).to include(status_old, status_never_fetched, status_fetched_recently, status_never_fetched)
+       end
+     end
+ 
+     context 'with a remote status' do
+-      let(:account) { bob }
++      include_context 'with reply-fetchable statuses', :bob
+ 
+       it 'fetches old statuses' do
+         expect(statuses).to_not include(status_old)
+@@ -75,8 +78,8 @@ RSpec.describe Status::FetchRepliesConcern do
+   end
+ 
+   describe 'unsubscribed' do
+-    let!(:spike)  { Fabricate(:account, username: 'spike', domain: 'other.com') }
+-    let!(:status) { Fabricate(:status, account: bob, updated_at: 1.day.ago) }
++    let_it_be(:spike)  { Fabricate(:account, username: 'spike', domain: 'other.com') }
++    let_it_be(:status) { Fabricate(:status, account: bob, updated_at: 1.day.ago) }
+ 
+     context 'when the status is from an account with only remote followers after last update' do
+       before do
+diff --git a/spec/models/concerns/status/threading_concern_spec.rb b/spec/models/concerns/status/threading_concern_spec.rb
+index a13487c..108c0ec 100644
+--- a/spec/models/concerns/status/threading_concern_spec.rb
++++ b/spec/models/concerns/status/threading_concern_spec.rb
+@@ -4,14 +4,14 @@ require 'rails_helper'
+ 
+ RSpec.describe Status::ThreadingConcern do
+   describe '#ancestors' do
+-    let!(:alice)  { Fabricate(:account, username: 'alice') }
+-    let!(:bob)    { Fabricate(:account, username: 'bob', domain: 'example.com') }
+-    let!(:jeff)   { Fabricate(:account, username: 'jeff') }
+-    let!(:status) { Fabricate(:status, account: alice) }
+-    let!(:reply_to_status) { Fabricate(:status, thread: status, account: jeff) }
+-    let!(:reply_to_first_reply) { Fabricate(:status, thread: reply_to_status, account: bob) }
+-    let!(:reply_to_second_reply) { Fabricate(:status, thread: reply_to_first_reply, account: alice) }
+-    let!(:viewer) { Fabricate(:account, username: 'viewer') }
++    let_it_be(:alice, reload: true)  { Fabricate(:account, username: 'alice') }
++    let_it_be(:bob, reload: true)    { Fabricate(:account, username: 'bob', domain: 'example.com') }
++    let_it_be(:jeff, reload: true)   { Fabricate(:account, username: 'jeff') }
++    let_it_be(:status, reload: true) { Fabricate(:status, account: alice) }
++    let_it_be(:reply_to_status, reload: true) { Fabricate(:status, thread: status, account: jeff) }
++    let_it_be(:reply_to_first_reply, reload: true) { Fabricate(:status, thread: reply_to_status, account: bob) }
++    let_it_be(:reply_to_second_reply, reload: true) { Fabricate(:status, thread: reply_to_first_reply, account: alice) }
++    let_it_be(:viewer, reload: true) { Fabricate(:account, username: 'viewer') }
+ 
+     it 'returns conversation history' do
+       expect(reply_to_second_reply.ancestors(4)).to include(status, reply_to_status, reply_to_first_reply)
+@@ -79,14 +79,14 @@ RSpec.describe Status::ThreadingConcern do
+   end
+ 
+   describe '#descendants' do
+-    let!(:alice)  { Fabricate(:account, username: 'alice') }
+-    let!(:bob)    { Fabricate(:account, username: 'bob', domain: 'example.com') }
+-    let!(:jeff)   { Fabricate(:account, username: 'jeff') }
+-    let!(:status) { Fabricate(:status, account: alice) }
+-    let!(:reply_to_status_from_alice) { Fabricate(:status, thread: status, account: alice) }
+-    let!(:reply_to_status_from_bob) { Fabricate(:status, thread: status, account: bob) }
+-    let!(:reply_to_alice_reply_from_jeff) { Fabricate(:status, thread: reply_to_status_from_alice, account: jeff) }
+-    let!(:viewer) { Fabricate(:account, username: 'viewer') }
++    let_it_be(:alice, reload: true)  { Fabricate(:account, username: 'alice') }
++    let_it_be(:bob, reload: true)    { Fabricate(:account, username: 'bob', domain: 'example.com') }
++    let_it_be(:jeff, reload: true)   { Fabricate(:account, username: 'jeff') }
++    let_it_be(:status, reload: true) { Fabricate(:status, account: alice) }
++    let_it_be(:reply_to_status_from_alice, reload: true) { Fabricate(:status, thread: status, account: alice) }
++    let_it_be(:reply_to_status_from_bob, reload: true) { Fabricate(:status, thread: status, account: bob) }
++    let_it_be(:reply_to_alice_reply_from_jeff, reload: true) { Fabricate(:status, thread: reply_to_status_from_alice, account: jeff) }
++    let_it_be(:viewer, reload: true) { Fabricate(:account, username: 'viewer') }
+ 
+     it 'returns replies' do
+       expect(status.descendants(4)).to include(reply_to_status_from_alice, reply_to_status_from_bob, reply_to_alice_reply_from_jeff)
+diff --git a/spec/models/form/custom_emoji_batch_spec.rb b/spec/models/form/custom_emoji_batch_spec.rb
+index ca9740d..8c5ba52 100644
+--- a/spec/models/form/custom_emoji_batch_spec.rb
++++ b/spec/models/form/custom_emoji_batch_spec.rb
+@@ -7,7 +7,8 @@ RSpec.describe Form::CustomEmojiBatch do
+     subject { described_class.new({ current_account: account }.merge(options)) }
+ 
+     let(:options) { {} }
+-    let(:account) { Fabricate(:admin_user).account }
++
++    let_it_be(:account, refind: true) { Fabricate(:admin_user).account }
+ 
+     context 'with empty custom_emoji_ids' do
+       let(:options) { { custom_emoji_ids: [] } }
+@@ -18,8 +19,8 @@ RSpec.describe Form::CustomEmojiBatch do
+     end
+ 
+     describe 'the update action' do
+-      let(:custom_emoji) { Fabricate(:custom_emoji, category: Fabricate(:custom_emoji_category)) }
+-      let(:custom_emoji_category) { Fabricate(:custom_emoji_category) }
++      let_it_be(:custom_emoji, refind: true) { Fabricate(:custom_emoji, category: Fabricate(:custom_emoji_category)) }
++      let_it_be(:custom_emoji_category) { Fabricate(:custom_emoji_category) }
+ 
+       context 'without anything to change' do
+         let(:options) { { action: 'update' } }
+diff --git a/spec/models/form/import_spec.rb b/spec/models/form/import_spec.rb
+index 7d7b4f3..39cac86 100644
+--- a/spec/models/form/import_spec.rb
++++ b/spec/models/form/import_spec.rb
+@@ -5,7 +5,7 @@ require 'rails_helper'
+ RSpec.describe Form::Import do
+   subject { described_class.new(current_account: account, type: import_type, mode: import_mode, data: data) }
+ 
+-  let(:account)     { Fabricate(:account) }
++  let_it_be(:account, reload: true) { Fabricate(:account) }
+   let(:data)        { fixture_file_upload(import_file) }
+   let(:import_mode) { 'merge' }
+ 
+diff --git a/spec/models/notification_spec.rb b/spec/models/notification_spec.rb
+index 08427a5..b7309b4 100644
+--- a/spec/models/notification_spec.rb
++++ b/spec/models/notification_spec.rb
+@@ -5,11 +5,12 @@ require 'rails_helper'
+ RSpec.describe Notification do
+   describe '#target_status' do
+     let(:notification) { Fabricate(:notification, activity: activity) }
+-    let(:status)       { Fabricate(:status) }
+     let(:reblog)       { Fabricate(:status, reblog: status) }
+     let(:favourite)    { Fabricate(:favourite, status: status) }
+     let(:mention)      { Fabricate(:mention, status: status) }
+ 
++    let_it_be(:status) { Fabricate(:status) }
++
+     context 'when Activity is reblog' do
+       let(:activity) { reblog }
+ 
+@@ -163,9 +164,9 @@ RSpec.describe Notification do
+   end
+ 
+   describe '.paginate_groups_by_max_id' do
+-    let(:account) { Fabricate(:account) }
++    let_it_be(:account) { Fabricate(:account) }
+ 
+-    let!(:notifications) do
++    let_it_be(:notifications) do
+       ['group-1', 'group-1', nil, 'group-2', nil, 'group-1', 'group-2', 'group-1']
+         .map { |group_key| Fabricate(:notification, account: account, group_key: group_key) }
+     end
+@@ -193,9 +194,9 @@ RSpec.describe Notification do
+   end
+ 
+   describe '.paginate_groups_by_min_id' do
+-    let(:account) { Fabricate(:account) }
++    let_it_be(:account) { Fabricate(:account) }
+ 
+-    let!(:notifications) do
++    let_it_be(:notifications) do
+       ['group-1', 'group-1', nil, 'group-2', nil, 'group-1', 'group-2', 'group-1']
+         .map { |group_key| Fabricate(:notification, account: account, group_key: group_key) }
+     end
+diff --git a/spec/models/public_feed_spec.rb b/spec/models/public_feed_spec.rb
+index 312ade2..a81e42f 100644
+--- a/spec/models/public_feed_spec.rb
++++ b/spec/models/public_feed_spec.rb
+@@ -46,10 +46,10 @@ RSpec.describe PublicFeed do
+ 
+       let(:viewer) { nil }
+ 
+-      let!(:local_account)  { Fabricate(:account, domain: nil) }
+-      let!(:remote_account) { Fabricate(:account, domain: 'test.com') }
+-      let!(:local_status)   { Fabricate(:status, account: local_account) }
+-      let!(:remote_status)  { Fabricate(:status, account: remote_account) }
++      let_it_be(:local_account)  { Fabricate(:account, domain: nil) }
++      let_it_be(:remote_account) { Fabricate(:account, domain: 'test.com') }
++      let_it_be(:local_status)   { Fabricate(:status, account: local_account) }
++      let_it_be(:remote_status)  { Fabricate(:status, account: remote_account) }
+ 
+       context 'without a viewer' do
+         let(:viewer) { nil }
+@@ -75,10 +75,10 @@ RSpec.describe PublicFeed do
+     context 'with a local_only option set' do
+       subject { described_class.new(viewer, local: true).get(20).map(&:id) }
+ 
+-      let!(:local_account)  { Fabricate(:account, domain: nil) }
+-      let!(:remote_account) { Fabricate(:account, domain: 'test.com') }
+-      let!(:local_status)   { Fabricate(:status, account: local_account) }
+-      let!(:remote_status)  { Fabricate(:status, account: remote_account) }
++      let_it_be(:local_account)  { Fabricate(:account, domain: nil) }
++      let_it_be(:remote_account) { Fabricate(:account, domain: 'test.com') }
++      let_it_be(:local_status)   { Fabricate(:status, account: local_account) }
++      let_it_be(:remote_status)  { Fabricate(:status, account: remote_account) }
+ 
+       context 'without a viewer' do
+         let(:viewer) { nil }
+@@ -108,10 +108,10 @@ RSpec.describe PublicFeed do
+     context 'with a remote_only option set' do
+       subject { described_class.new(viewer, remote: true).get(20).map(&:id) }
+ 
+-      let!(:local_account)  { Fabricate(:account, domain: nil) }
+-      let!(:remote_account) { Fabricate(:account, domain: 'test.com') }
+-      let!(:local_status)   { Fabricate(:status, account: local_account) }
+-      let!(:remote_status)  { Fabricate(:status, account: remote_account) }
++      let_it_be(:local_account)  { Fabricate(:account, domain: nil) }
++      let_it_be(:remote_account) { Fabricate(:account, domain: 'test.com') }
++      let_it_be(:local_status)   { Fabricate(:status, account: local_account) }
++      let_it_be(:remote_status)  { Fabricate(:status, account: remote_account) }
+ 
+       context 'without a viewer' do
+         let(:viewer) { nil }
+@@ -214,10 +214,10 @@ RSpec.describe PublicFeed do
+ 
+         let(:viewer) { nil }
+ 
+-        let!(:local_account)  { Fabricate(:account, domain: nil) }
+-        let!(:remote_account) { Fabricate(:account, domain: 'test.com') }
+-        let!(:local_status)   { Fabricate(:status, account: local_account) }
+-        let!(:remote_status)  { Fabricate(:status, account: remote_account) }
++        let_it_be(:local_account)  { Fabricate(:account, domain: nil) }
++        let_it_be(:remote_account) { Fabricate(:account, domain: 'test.com') }
++        let_it_be(:local_status)   { Fabricate(:status, account: local_account) }
++        let_it_be(:remote_status)  { Fabricate(:status, account: remote_account) }
+ 
+         context 'without a viewer' do
+           let(:viewer) { nil }
+@@ -248,10 +248,10 @@ RSpec.describe PublicFeed do
+       context 'with a local_only option set' do
+         subject { described_class.new(viewer, local: true).get(20).map(&:id) }
+ 
+-        let!(:local_account)  { Fabricate(:account, domain: nil) }
+-        let!(:remote_account) { Fabricate(:account, domain: 'test.com') }
+-        let!(:local_status)   { Fabricate(:status, account: local_account) }
+-        let!(:remote_status)  { Fabricate(:status, account: remote_account) }
++        let_it_be(:local_account)  { Fabricate(:account, domain: nil) }
++        let_it_be(:remote_account) { Fabricate(:account, domain: 'test.com') }
++        let_it_be(:local_status)   { Fabricate(:status, account: local_account) }
++        let_it_be(:remote_status)  { Fabricate(:status, account: remote_account) }
+ 
+         context 'without a viewer' do
+           let(:viewer) { nil }
+@@ -282,10 +282,10 @@ RSpec.describe PublicFeed do
+       context 'with a remote_only option set' do
+         subject { described_class.new(viewer, remote: true).get(20).map(&:id) }
+ 
+-        let!(:local_account)  { Fabricate(:account, domain: nil) }
+-        let!(:remote_account) { Fabricate(:account, domain: 'test.com') }
+-        let!(:local_status)   { Fabricate(:status, account: local_account) }
+-        let!(:remote_status)  { Fabricate(:status, account: remote_account) }
++        let_it_be(:local_account)  { Fabricate(:account, domain: nil) }
++        let_it_be(:remote_account) { Fabricate(:account, domain: 'test.com') }
++        let_it_be(:local_status)   { Fabricate(:status, account: local_account) }
++        let_it_be(:remote_status)  { Fabricate(:status, account: remote_account) }
+ 
+         context 'without a viewer' do
+           let(:viewer) { nil }
+@@ -324,10 +324,10 @@ RSpec.describe PublicFeed do
+ 
+         let(:viewer) { nil }
+ 
+-        let!(:local_account)  { Fabricate(:account, domain: nil) }
+-        let!(:remote_account) { Fabricate(:account, domain: 'test.com') }
+-        let!(:local_status)   { Fabricate(:status, account: local_account) }
+-        let!(:remote_status)  { Fabricate(:status, account: remote_account) }
++        let_it_be(:local_account)  { Fabricate(:account, domain: nil) }
++        let_it_be(:remote_account) { Fabricate(:account, domain: 'test.com') }
++        let_it_be(:local_status)   { Fabricate(:status, account: local_account) }
++        let_it_be(:remote_status)  { Fabricate(:status, account: remote_account) }
+ 
+         context 'without a viewer' do
+           let(:viewer) { nil }
+@@ -351,10 +351,10 @@ RSpec.describe PublicFeed do
+       context 'with a local_only option set' do
+         subject { described_class.new(viewer, local: true).get(20).map(&:id) }
+ 
+-        let!(:local_account)  { Fabricate(:account, domain: nil) }
+-        let!(:remote_account) { Fabricate(:account, domain: 'test.com') }
+-        let!(:local_status)   { Fabricate(:status, account: local_account) }
+-        let!(:remote_status)  { Fabricate(:status, account: remote_account) }
++        let_it_be(:local_account)  { Fabricate(:account, domain: nil) }
++        let_it_be(:remote_account) { Fabricate(:account, domain: 'test.com') }
++        let_it_be(:local_status)   { Fabricate(:status, account: local_account) }
++        let_it_be(:remote_status)  { Fabricate(:status, account: remote_account) }
+ 
+         context 'without a viewer' do
+           let(:viewer) { nil }
+@@ -385,10 +385,10 @@ RSpec.describe PublicFeed do
+       context 'with a remote_only option set' do
+         subject { described_class.new(viewer, remote: true).get(20).map(&:id) }
+ 
+-        let!(:local_account)  { Fabricate(:account, domain: nil) }
+-        let!(:remote_account) { Fabricate(:account, domain: 'test.com') }
+-        let!(:local_status)   { Fabricate(:status, account: local_account) }
+-        let!(:remote_status)  { Fabricate(:status, account: remote_account) }
++        let_it_be(:local_account)  { Fabricate(:account, domain: nil) }
++        let_it_be(:remote_account) { Fabricate(:account, domain: 'test.com') }
++        let_it_be(:local_status)   { Fabricate(:status, account: local_account) }
++        let_it_be(:remote_status)  { Fabricate(:status, account: remote_account) }
+ 
+         context 'without a viewer' do
+           let(:viewer) { nil }
+@@ -420,10 +420,10 @@ RSpec.describe PublicFeed do
+ 
+         let(:viewer) { nil }
+ 
+-        let!(:local_account)  { Fabricate(:account, domain: nil) }
+-        let!(:remote_account) { Fabricate(:account, domain: 'test.com') }
+-        let!(:local_status)   { Fabricate(:status, account: local_account) }
+-        let!(:remote_status)  { Fabricate(:status, account: remote_account) }
++        let_it_be(:local_account)  { Fabricate(:account, domain: nil) }
++        let_it_be(:remote_account) { Fabricate(:account, domain: 'test.com') }
++        let_it_be(:local_status)   { Fabricate(:status, account: local_account) }
++        let_it_be(:remote_status)  { Fabricate(:status, account: remote_account) }
+ 
+         context 'without a viewer' do
+           let(:viewer) { nil }
+@@ -453,10 +453,10 @@ RSpec.describe PublicFeed do
+       context 'with a local_only option set' do
+         subject { described_class.new(viewer, local: true).get(20).map(&:id) }
+ 
+-        let!(:local_account)  { Fabricate(:account, domain: nil) }
+-        let!(:remote_account) { Fabricate(:account, domain: 'test.com') }
+-        let!(:local_status)   { Fabricate(:status, account: local_account) }
+-        let!(:remote_status)  { Fabricate(:status, account: remote_account) }
++        let_it_be(:local_account)  { Fabricate(:account, domain: nil) }
++        let_it_be(:remote_account) { Fabricate(:account, domain: 'test.com') }
++        let_it_be(:local_status)   { Fabricate(:status, account: local_account) }
++        let_it_be(:remote_status)  { Fabricate(:status, account: remote_account) }
+ 
+         context 'without a viewer' do
+           let(:viewer) { nil }
+@@ -486,10 +486,10 @@ RSpec.describe PublicFeed do
+       context 'with a remote_only option set' do
+         subject { described_class.new(viewer, remote: true).get(20).map(&:id) }
+ 
+-        let!(:local_account)  { Fabricate(:account, domain: nil) }
+-        let!(:remote_account) { Fabricate(:account, domain: 'test.com') }
+-        let!(:local_status)   { Fabricate(:status, account: local_account) }
+-        let!(:remote_status)  { Fabricate(:status, account: remote_account) }
++        let_it_be(:local_account)  { Fabricate(:account, domain: nil) }
++        let_it_be(:remote_account) { Fabricate(:account, domain: 'test.com') }
++        let_it_be(:local_status)   { Fabricate(:status, account: local_account) }
++        let_it_be(:remote_status)  { Fabricate(:status, account: remote_account) }
+ 
+         context 'without a viewer' do
+           let(:viewer) { nil }
+diff --git a/spec/models/status/visibility_spec.rb b/spec/models/status/visibility_spec.rb
+index 2aaaf6a..50f2b94 100644
+--- a/spec/models/status/visibility_spec.rb
++++ b/spec/models/status/visibility_spec.rb
+@@ -5,7 +5,9 @@ require 'rails_helper'
+ RSpec.describe Status::Visibility do
+   describe 'Validations' do
+     context 'when status is a reblog' do
+-      subject { Fabricate.build :status, reblog: Fabricate(:status) }
++      subject { Fabricate.build :status, reblog: reblog_target }
++
++      let_it_be(:reblog_target) { Fabricate(:status) }
+ 
+       it { is_expected.to allow_values('public', 'unlisted', 'private').for(:visibility) }
+       it { is_expected.to_not allow_values('direct', 'limited').for(:visibility) }
+diff --git a/spec/models/status_pin_spec.rb b/spec/models/status_pin_spec.rb
+index 1501d43..d4d9172 100644
+--- a/spec/models/status_pin_spec.rb
++++ b/spec/models/status_pin_spec.rb
+@@ -9,7 +9,7 @@ RSpec.describe StatusPin do
+     context 'with an account pinning statuses' do
+       subject { Fabricate.build :status_pin, account: account }
+ 
+-      let(:account) { Fabricate(:account) }
++      let_it_be(:account, refind: true) { Fabricate(:account) }
+ 
+       context 'with a self-owned status' do
+         let(:status) { Fabricate(:status, account: account) }
+diff --git a/spec/models/status_spec.rb b/spec/models/status_spec.rb
+index 06524fc..2575896 100644
+--- a/spec/models/status_spec.rb
++++ b/spec/models/status_spec.rb
+@@ -5,9 +5,9 @@ require 'rails_helper'
+ RSpec.describe Status do
+   subject { Fabricate(:status, account: alice) }
+ 
+-  let(:alice) { Fabricate(:account, username: 'alice') }
+-  let(:bob)   { Fabricate(:account, username: 'bob') }
+-  let(:other) { Fabricate(:status, account: bob, text: 'Skulls for the skull god! The enemy\'s gates are sideways!') }
++  let_it_be(:alice, refind: true) { Fabricate(:account, username: 'alice') }
++  let_it_be(:bob, refind: true)   { Fabricate(:account, username: 'bob') }
++  let_it_be(:other, refind: true) { Fabricate(:status, account: bob, text: 'Skulls for the skull god! The enemy\'s gates are sideways!') }
+ 
+   describe '#local?' do
+     it 'returns true when no remote URI is set' do
+@@ -281,16 +281,14 @@ RSpec.describe Status do
+   end
+ 
+   describe '#ordered_media_attachments' do
+-    let(:status) { Fabricate(:status) }
++    let_it_be(:status, refind: true) { Fabricate(:status) }
+ 
+-    let(:first_attachment) { Fabricate(:media_attachment) }
+-    let(:second_attachment) { Fabricate(:media_attachment) }
+-    let(:last_attachment) { Fabricate(:media_attachment) }
+-    let(:extra_attachment) { Fabricate(:media_attachment) }
+-
+-    before do
+-      stub_const('Status::MEDIA_ATTACHMENTS_LIMIT', 3)
++    let_it_be(:first_attachment)  { Fabricate(:media_attachment) }
++    let_it_be(:second_attachment) { Fabricate(:media_attachment) }
++    let_it_be(:last_attachment)   { Fabricate(:media_attachment) }
++    let_it_be(:extra_attachment)  { Fabricate(:media_attachment) }
+ 
++    before_all do
+       # Add attachments out of order
+       status.media_attachments << second_attachment
+       status.media_attachments << last_attachment
+@@ -298,6 +296,10 @@ RSpec.describe Status do
+       status.media_attachments << first_attachment
+     end
+ 
++    before do
++      stub_const('Status::MEDIA_ATTACHMENTS_LIMIT', 3)
++    end
++
+     context 'when ordered_media_attachment_ids is not set' do
+       it 'returns up to MEDIA_ATTACHMENTS_LIMIT attachments' do
+         expect(status.ordered_media_attachments.size).to eq Status::MEDIA_ATTACHMENTS_LIMIT
+@@ -318,8 +320,8 @@ RSpec.describe Status do
+   describe '.mutes_map' do
+     subject { described_class.mutes_map([status.conversation.id], account) }
+ 
+-    let(:status)  { Fabricate(:status) }
+-    let(:account) { Fabricate(:account) }
++    let_it_be(:status, refind: true)  { Fabricate(:status) }
++    let_it_be(:account, refind: true) { Fabricate(:account) }
+ 
+     it 'returns a hash' do
+       expect(subject).to be_a Hash
+@@ -334,8 +336,8 @@ RSpec.describe Status do
+   describe '.favourites_map' do
+     subject { described_class.favourites_map([status], account) }
+ 
+-    let(:status)  { Fabricate(:status) }
+-    let(:account) { Fabricate(:account) }
++    let_it_be(:status, refind: true)  { Fabricate(:status) }
++    let_it_be(:account, refind: true) { Fabricate(:account) }
+ 
+     it 'returns a hash' do
+       expect(subject).to be_a Hash
+@@ -350,8 +352,8 @@ RSpec.describe Status do
+   describe '.reblogs_map' do
+     subject { described_class.reblogs_map([status], account) }
+ 
+-    let(:status)  { Fabricate(:status) }
+-    let(:account) { Fabricate(:account) }
++    let_it_be(:status, refind: true)  { Fabricate(:status) }
++    let_it_be(:account, refind: true) { Fabricate(:account) }
+ 
+     it 'returns a hash' do
+       expect(subject).to be_a Hash
+@@ -397,14 +399,14 @@ RSpec.describe Status do
+   end
+ 
+   describe '.tagged_with' do
+-    let(:tag_cats) { Fabricate(:tag, name: 'cats') }
+-    let(:tag_dogs) { Fabricate(:tag, name: 'dogs') }
+-    let(:tag_zebras) { Fabricate(:tag, name: 'zebras') }
+-    let!(:status_with_tag_cats) { Fabricate(:status, tags: [tag_cats]) }
+-    let!(:status_with_tag_dogs) { Fabricate(:status, tags: [tag_dogs]) }
+-    let!(:status_tagged_with_zebras) { Fabricate(:status, tags: [tag_zebras]) }
+-    let!(:status_without_tags) { Fabricate(:status, tags: []) }
+-    let!(:status_with_all_tags) { Fabricate(:status, tags: [tag_cats, tag_dogs, tag_zebras]) }
++    let_it_be(:tag_cats) { Fabricate(:tag, name: 'cats') }
++    let_it_be(:tag_dogs) { Fabricate(:tag, name: 'dogs') }
++    let_it_be(:tag_zebras) { Fabricate(:tag, name: 'zebras') }
++    let_it_be(:status_with_tag_cats) { Fabricate(:status, tags: [tag_cats]) }
++    let_it_be(:status_with_tag_dogs) { Fabricate(:status, tags: [tag_dogs]) }
++    let_it_be(:status_tagged_with_zebras) { Fabricate(:status, tags: [tag_zebras]) }
++    let_it_be(:status_without_tags) { Fabricate(:status, tags: []) }
++    let_it_be(:status_with_all_tags) { Fabricate(:status, tags: [tag_cats, tag_dogs, tag_zebras]) }
+ 
+     context 'when given one tag' do
+       it 'returns the expected statuses' do
+@@ -436,14 +438,14 @@ RSpec.describe Status do
+   end
+ 
+   describe '.tagged_with_all' do
+-    let(:tag_cats) { Fabricate(:tag, name: 'cats') }
+-    let(:tag_dogs) { Fabricate(:tag, name: 'dogs') }
+-    let(:tag_zebras) { Fabricate(:tag, name: 'zebras') }
+-    let!(:status_with_tag_cats) { Fabricate(:status, tags: [tag_cats]) }
+-    let!(:status_with_tag_dogs) { Fabricate(:status, tags: [tag_dogs]) }
+-    let!(:status_tagged_with_zebras) { Fabricate(:status, tags: [tag_zebras]) }
+-    let!(:status_without_tags) { Fabricate(:status, tags: []) }
+-    let!(:status_with_all_tags) { Fabricate(:status, tags: [tag_cats, tag_dogs]) }
++    let_it_be(:tag_cats) { Fabricate(:tag, name: 'cats') }
++    let_it_be(:tag_dogs) { Fabricate(:tag, name: 'dogs') }
++    let_it_be(:tag_zebras) { Fabricate(:tag, name: 'zebras') }
++    let_it_be(:status_with_tag_cats) { Fabricate(:status, tags: [tag_cats]) }
++    let_it_be(:status_with_tag_dogs) { Fabricate(:status, tags: [tag_dogs]) }
++    let_it_be(:status_tagged_with_zebras) { Fabricate(:status, tags: [tag_zebras]) }
++    let_it_be(:status_without_tags) { Fabricate(:status, tags: []) }
++    let_it_be(:status_with_all_tags) { Fabricate(:status, tags: [tag_cats, tag_dogs]) }
+ 
+     context 'when given one tag' do
+       it 'returns the expected statuses' do
+@@ -472,14 +474,14 @@ RSpec.describe Status do
+   end
+ 
+   describe '.tagged_with_none' do
+-    let(:tag_cats) { Fabricate(:tag, name: 'cats') }
+-    let(:tag_dogs) { Fabricate(:tag, name: 'dogs') }
+-    let(:tag_zebras) { Fabricate(:tag, name: 'zebras') }
+-    let!(:status_with_tag_cats) { Fabricate(:status, tags: [tag_cats]) }
+-    let!(:status_with_tag_dogs) { Fabricate(:status, tags: [tag_dogs]) }
+-    let!(:status_tagged_with_zebras) { Fabricate(:status, tags: [tag_zebras]) }
+-    let!(:status_without_tags) { Fabricate(:status, tags: []) }
+-    let!(:status_with_all_tags) { Fabricate(:status, tags: [tag_cats, tag_dogs, tag_zebras]) }
++    let_it_be(:tag_cats) { Fabricate(:tag, name: 'cats') }
++    let_it_be(:tag_dogs) { Fabricate(:tag, name: 'dogs') }
++    let_it_be(:tag_zebras) { Fabricate(:tag, name: 'zebras') }
++    let_it_be(:status_with_tag_cats) { Fabricate(:status, tags: [tag_cats]) }
++    let_it_be(:status_with_tag_dogs) { Fabricate(:status, tags: [tag_dogs]) }
++    let_it_be(:status_tagged_with_zebras) { Fabricate(:status, tags: [tag_zebras]) }
++    let_it_be(:status_without_tags) { Fabricate(:status, tags: []) }
++    let_it_be(:status_with_all_tags) { Fabricate(:status, tags: [tag_cats, tag_dogs, tag_zebras]) }
+ 
+     context 'when given one tag' do
+       it 'returns the expected statuses' do
+diff --git a/spec/models/tag_feed_spec.rb b/spec/models/tag_feed_spec.rb
+index 8618b67..e79268d 100644
+--- a/spec/models/tag_feed_spec.rb
++++ b/spec/models/tag_feed_spec.rb
+@@ -4,12 +4,12 @@ require 'rails_helper'
+ 
+ RSpec.describe TagFeed do
+   describe '#get' do
+-    let(:account) { Fabricate(:account) }
+-    let(:tag_cats) { Fabricate(:tag, name: 'cats') }
+-    let(:tag_dogs) { Fabricate(:tag, name: 'dogs') }
+-    let!(:status_tagged_with_cats) { Fabricate(:status, tags: [tag_cats]) }
+-    let!(:status_tagged_with_dogs) { Fabricate(:status, tags: [tag_dogs]) }
+-    let!(:both) { Fabricate(:status, tags: [tag_cats, tag_dogs]) }
++    let_it_be(:account, reload: true) { Fabricate(:account) }
++    let_it_be(:tag_cats) { Fabricate(:tag, name: 'cats') }
++    let_it_be(:tag_dogs) { Fabricate(:tag, name: 'dogs') }
++    let_it_be(:status_tagged_with_cats, reload: true) { Fabricate(:status, tags: [tag_cats]) }
++    let_it_be(:status_tagged_with_dogs) { Fabricate(:status, tags: [tag_dogs]) }
++    let_it_be(:both) { Fabricate(:status, tags: [tag_cats, tag_dogs]) }
+ 
+     it 'can add tags in "any" mode' do
+       results = described_class.new(tag_cats, nil, any: [tag_dogs.name]).get(20)
+@@ -77,10 +77,11 @@ RSpec.describe TagFeed do
+         subject { described_class.new(tag_cats, viewer).get(20).map(&:id) }
+ 
+         let(:viewer) { nil }
++        let(:local_status) { status_tagged_with_cats }
+ 
+-        let!(:remote_account) { Fabricate(:account, domain: 'test.com') }
+-        let!(:local_status)   { status_tagged_with_cats }
+-        let!(:remote_status)  { Fabricate(:status, account: remote_account, tags: [tag_cats]) }
++        let_it_be(:remote_account) { Fabricate(:account, domain: 'test.com') }
++
++        let_it_be(:remote_status) { Fabricate(:status, account: remote_account, tags: [tag_cats]) }
+ 
+         context 'without a viewer' do
+           let(:viewer) { nil }
+@@ -111,9 +112,10 @@ RSpec.describe TagFeed do
+       context 'with a local_only option set' do
+         subject { described_class.new(tag_cats, viewer, local: true).get(20).map(&:id) }
+ 
+-        let!(:remote_account) { Fabricate(:account, domain: 'test.com') }
+-        let!(:local_status)   { status_tagged_with_cats }
+-        let!(:remote_status)  { Fabricate(:status, account: remote_account, tags: [tag_cats]) }
++        let_it_be(:remote_account) { Fabricate(:account, domain: 'test.com') }
++        let(:local_status) { status_tagged_with_cats }
++
++        let_it_be(:remote_status) { Fabricate(:status, account: remote_account, tags: [tag_cats]) }
+ 
+         context 'without a viewer' do
+           let(:viewer) { nil }
+@@ -144,9 +146,10 @@ RSpec.describe TagFeed do
+       context 'with a remote_only option set' do
+         subject { described_class.new(tag_cats, viewer, remote: true).get(20).map(&:id) }
+ 
+-        let!(:remote_account) { Fabricate(:account, domain: 'test.com') }
+-        let!(:local_status)   { status_tagged_with_cats }
+-        let!(:remote_status)  { Fabricate(:status, account: remote_account, tags: [tag_cats]) }
++        let_it_be(:remote_account) { Fabricate(:account, domain: 'test.com') }
++        let(:local_status) { status_tagged_with_cats }
++
++        let_it_be(:remote_status) { Fabricate(:status, account: remote_account, tags: [tag_cats]) }
+ 
+         context 'without a viewer' do
+           let(:viewer) { nil }
+@@ -184,10 +187,11 @@ RSpec.describe TagFeed do
+         subject { described_class.new(tag_cats, viewer).get(20).map(&:id) }
+ 
+         let(:viewer) { nil }
++        let(:local_status) { status_tagged_with_cats }
+ 
+-        let!(:remote_account) { Fabricate(:account, domain: 'test.com') }
+-        let!(:local_status)   { status_tagged_with_cats }
+-        let!(:remote_status)  { Fabricate(:status, account: remote_account, tags: [tag_cats]) }
++        let_it_be(:remote_account) { Fabricate(:account, domain: 'test.com') }
++
++        let_it_be(:remote_status) { Fabricate(:status, account: remote_account, tags: [tag_cats]) }
+ 
+         context 'without a viewer' do
+           let(:viewer) { nil }
+@@ -211,9 +215,10 @@ RSpec.describe TagFeed do
+       context 'with a local_only option set' do
+         subject { described_class.new(tag_cats, viewer, local: true).get(20).map(&:id) }
+ 
+-        let!(:remote_account) { Fabricate(:account, domain: 'test.com') }
+-        let!(:local_status)   { status_tagged_with_cats }
+-        let!(:remote_status)  { Fabricate(:status, account: remote_account, tags: [tag_cats]) }
++        let_it_be(:remote_account) { Fabricate(:account, domain: 'test.com') }
++        let(:local_status) { status_tagged_with_cats }
++
++        let_it_be(:remote_status) { Fabricate(:status, account: remote_account, tags: [tag_cats]) }
+ 
+         context 'without a viewer' do
+           let(:viewer) { nil }
+@@ -244,9 +249,10 @@ RSpec.describe TagFeed do
+       context 'with a remote_only option set' do
+         subject { described_class.new(tag_cats, viewer, remote: true).get(20).map(&:id) }
+ 
+-        let!(:remote_account) { Fabricate(:account, domain: 'test.com') }
+-        let!(:local_status)   { status_tagged_with_cats }
+-        let!(:remote_status)  { Fabricate(:status, account: remote_account, tags: [tag_cats]) }
++        let_it_be(:remote_account) { Fabricate(:account, domain: 'test.com') }
++        let(:local_status) { status_tagged_with_cats }
++
++        let_it_be(:remote_status) { Fabricate(:status, account: remote_account, tags: [tag_cats]) }
+ 
+         context 'without a viewer' do
+           let(:viewer) { nil }
+@@ -277,10 +283,11 @@ RSpec.describe TagFeed do
+         subject { described_class.new(tag_cats, viewer).get(20).map(&:id) }
+ 
+         let(:viewer) { nil }
++        let(:local_status) { status_tagged_with_cats }
++
++        let_it_be(:remote_account) { Fabricate(:account, domain: 'test.com') }
+ 
+-        let!(:remote_account) { Fabricate(:account, domain: 'test.com') }
+-        let!(:local_status)   { status_tagged_with_cats }
+-        let!(:remote_status)  { Fabricate(:status, account: remote_account, tags: [tag_cats]) }
++        let_it_be(:remote_status) { Fabricate(:status, account: remote_account, tags: [tag_cats]) }
+ 
+         context 'without a viewer' do
+           let(:viewer) { nil }
+@@ -310,9 +317,10 @@ RSpec.describe TagFeed do
+       context 'with a local_only option set' do
+         subject { described_class.new(tag_cats, viewer, local: true).get(20).map(&:id) }
+ 
+-        let!(:remote_account) { Fabricate(:account, domain: 'test.com') }
+-        let!(:local_status)   { status_tagged_with_cats }
+-        let!(:remote_status)  { Fabricate(:status, account: remote_account, tags: [tag_cats]) }
++        let_it_be(:remote_account) { Fabricate(:account, domain: 'test.com') }
++        let(:local_status) { status_tagged_with_cats }
++
++        let_it_be(:remote_status) { Fabricate(:status, account: remote_account, tags: [tag_cats]) }
+ 
+         context 'without a viewer' do
+           let(:viewer) { nil }
+@@ -342,9 +350,10 @@ RSpec.describe TagFeed do
+       context 'with a remote_only option set' do
+         subject { described_class.new(tag_cats, viewer, remote: true).get(20).map(&:id) }
+ 
+-        let!(:remote_account) { Fabricate(:account, domain: 'test.com') }
+-        let!(:local_status)   { status_tagged_with_cats }
+-        let!(:remote_status)  { Fabricate(:status, account: remote_account, tags: [tag_cats]) }
++        let_it_be(:remote_account) { Fabricate(:account, domain: 'test.com') }
++        let(:local_status) { status_tagged_with_cats }
++
++        let_it_be(:remote_status) { Fabricate(:status, account: remote_account, tags: [tag_cats]) }
+ 
+         context 'without a viewer' do
+           let(:viewer) { nil }
+diff --git a/spec/models/trends/statuses_spec.rb b/spec/models/trends/statuses_spec.rb
+index 54b227d..b76f99e 100644
+--- a/spec/models/trends/statuses_spec.rb
++++ b/spec/models/trends/statuses_spec.rb
+@@ -5,24 +5,32 @@ require 'rails_helper'
+ RSpec.describe Trends::Statuses do
+   subject! { described_class.new(threshold: 5, review_threshold: 10, score_halflife: 8.hours) }
+ 
+-  let!(:at_time) { DateTime.new(2021, 11, 14, 10, 15, 0) }
++  let_it_be(:at_time) { DateTime.new(2021, 11, 14, 10, 15, 0) }
+ 
+   describe 'Trends::Statuses::Query' do
+     let!(:query) { subject.query }
+-    let!(:today) { at_time }
+ 
+-    let!(:status_foo) { Fabricate(:status, text: 'Foo', language: 'en', trendable: true, created_at: today) }
+-    let!(:status_bar) { Fabricate(:status, text: 'Bar', language: 'en', trendable: true, created_at: today) }
++    let_it_be(:today) { at_time }
+ 
+-    before do
+-      default_threshold_value.times { reblog(status_foo, today) }
+-      default_threshold_value.times { reblog(status_bar, today) }
++    let_it_be(:status_foo) { Fabricate(:status, text: 'Foo', language: 'en', trendable: true, created_at: today) }
++    let_it_be(:status_bar) { Fabricate(:status, text: 'Bar', language: 'en', trendable: true, created_at: today) }
+ 
+-      subject.refresh(today)
++    before_all do
++      trends = described_class.new(threshold: 5, review_threshold: 10, score_halflife: 8.hours)
++      default_threshold_value.times do
++        r = Fabricate(:status, reblog: status_foo, created_at: today)
++        trends.add(status_foo, r.account_id, today)
++      end
++      default_threshold_value.times do
++        r = Fabricate(:status, reblog: status_bar, created_at: today)
++        trends.add(status_bar, r.account_id, today)
++      end
++
++      trends.refresh(today)
+     end
+ 
+     describe '#filtered_for' do
+-      let(:account) { Fabricate(:account) }
++      let_it_be(:account, refind: true) { Fabricate(:account) }
+ 
+       it 'returns a composable query scope' do
+         expect(query.filtered_for(account)).to be_a Trends::Query
+@@ -50,8 +58,8 @@ RSpec.describe Trends::Statuses do
+ 
+     describe '#records' do
+       context 'with scored cards' do
+-        let!(:higher_score) { Fabricate :status_trend, score: 10, language: 'en' }
+-        let!(:lower_score) { Fabricate :status_trend, score: 1, language: 'es' }
++        let_it_be(:higher_score) { Fabricate :status_trend, score: 10, language: 'en' }
++        let_it_be(:lower_score) { Fabricate :status_trend, score: 1, language: 'es' }
+ 
+         it 'returns higher score first' do
+           expect(subject.records)
+@@ -107,21 +115,29 @@ RSpec.describe Trends::Statuses do
+   end
+ 
+   describe '#refresh' do
+-    let!(:today) { at_time }
+-    let!(:yesterday) { today - 1.day }
+-
+-    let!(:status_foo) { Fabricate(:status, text: 'Foo', language: 'en', trendable: true, created_at: yesterday) }
+-    let!(:status_bar) { Fabricate(:status, text: 'Bar', language: 'en', trendable: true, created_at: today, quote: Quote.new(state: :accepted, quoted_status: status_foo)) }
+-    let!(:status_baz) { Fabricate(:status, text: 'Baz', language: 'en', trendable: true, created_at: today) }
+-    let!(:untrendable) { Fabricate(:status, text: 'Untrendable', language: 'en', trendable: true, visibility: :unlisted) }
+-    let!(:untrendable_quote) { Fabricate(:status, text: 'Untrendable quote!', language: 'en', trendable: true, created_at: today, quote: Quote.new(state: :accepted, quoted_status: untrendable)) }
++    let_it_be(:today) { at_time }
++    let_it_be(:yesterday) { today - 1.day }
++
++    let_it_be(:status_foo) { Fabricate(:status, text: 'Foo', language: 'en', trendable: true, created_at: yesterday) }
++    let_it_be(:status_bar) { Fabricate(:status, text: 'Bar', language: 'en', trendable: true, created_at: today, quote: Quote.new(state: :accepted, quoted_status: status_foo)) }
++    let_it_be(:status_baz) { Fabricate(:status, text: 'Baz', language: 'en', trendable: true, created_at: today) }
++    let_it_be(:untrendable) { Fabricate(:status, text: 'Untrendable', language: 'en', trendable: true, visibility: :unlisted) }
++    let_it_be(:untrendable_quote) { Fabricate(:status, text: 'Untrendable quote!', language: 'en', trendable: true, created_at: today, quote: Quote.new(state: :accepted, quoted_status: untrendable)) }
++
++    let_it_be(:reblogs_map) do
++      {
++        status_foo => Fabricate.times(default_threshold_value, :status, reblog: status_foo, created_at: today),
++        status_bar => Fabricate.times(default_threshold_value, :status, reblog: status_bar, created_at: today),
++        untrendable => Fabricate.times(default_threshold_value, :status, reblog: untrendable, created_at: today),
++        untrendable_quote => Fabricate.times(default_threshold_value, :status, reblog: untrendable_quote, created_at: today),
++        status_baz => Fabricate.times(default_threshold_value - 1, :status, reblog: status_baz, created_at: today),
++      }
++    end
+ 
+     before do
+-      default_threshold_value.times { reblog(status_foo, today) }
+-      default_threshold_value.times { reblog(status_bar, today) }
+-      default_threshold_value.times { reblog(untrendable, today) }
+-      default_threshold_value.times { reblog(untrendable_quote, today) }
+-      (default_threshold_value - 1).times { reblog(status_baz, today) }
++      reblogs_map.each do |target_status, reblogs|
++        reblogs.each { |r| subject.add(target_status, r.account_id, today) }
++      end
+     end
+ 
+     context 'when status trends are refreshed' do
+diff --git a/spec/models/web/push_subscription_spec.rb b/spec/models/web/push_subscription_spec.rb
+index b1e9368..854bddf 100644
+--- a/spec/models/web/push_subscription_spec.rb
++++ b/spec/models/web/push_subscription_spec.rb
+@@ -5,7 +5,7 @@ require 'rails_helper'
+ RSpec.describe Web::PushSubscription do
+   subject { described_class.new(data: data) }
+ 
+-  let(:account) { Fabricate(:account) }
++  let_it_be(:account, refind: true) { Fabricate(:account) }
+ 
+   let(:policy) { 'all' }
+ 
+diff --git a/spec/rails_helper.rb b/spec/rails_helper.rb
+index a91461b..4393e65 100644
+--- a/spec/rails_helper.rb
++++ b/spec/rails_helper.rb
+@@ -18,6 +18,8 @@ require 'paperclip/matchers'
+ require 'capybara/rspec'
+ require 'chewy/rspec'
+ require 'pundit/rspec'
++require 'resolv'
++require 'test_prof/recipes/rspec/let_it_be'
+ 
+ Rails.root.glob('spec/support/**/*.rb').each { |f| require f }
+ 
+@@ -30,6 +32,22 @@ Sidekiq.default_configuration.logger = nil
+ 
+ DatabaseCleaner.strategy = [:deletion]
+ 
++Resolv::DNS.singleton_class.class_eval do
++  alias_method :_original_open_without_test_guard, :open
++
++  def open(...)
++    return _original_open_without_test_guard(...) if RSpec.current_example&.metadata&.[](:type) == :system
++
++    raise 'Real DNS queries are disabled, stub Resolv::DNS as needed'
++  end
++end
++
++module SidekiqInlineCaptureEmails
++  def capture_emails(&block)
++    Sidekiq::Testing.inline! { super }
++  end
++end
++
+ Devise::Test::ControllerHelpers.module_eval do
+   alias_method :original_sign_in, :sign_in
+ 
+@@ -80,6 +98,7 @@ RSpec.configure do |config|
+   config.include Devise::Test::IntegrationHelpers, type: :system
+   config.include Devise::Test::IntegrationHelpers, type: :request
+   config.include ActionMailer::TestHelper
++  config.include SidekiqInlineCaptureEmails
+   config.include Paperclip::Shoulda::Matchers
+   config.include ActiveSupport::Testing::NotificationAssertions
+   config.include ActiveSupport::Testing::TimeHelpers
+@@ -95,7 +114,7 @@ RSpec.configure do |config|
+   config.include HtmlHeadInspection, type: :request
+ 
+   # TODO: Remove when Devise fixes https://github.com/heartcombo/devise/issues/5705
+-  config.before do
++  config.before :suite do
+     Rails.application.reload_routes_unless_loaded
+   end
+ 
+@@ -109,12 +128,17 @@ RSpec.configure do |config|
+     Sidekiq.testing!(:inline)
+   end
+ 
+-  config.before :each, type: :cli do
+-    stub_reset_connection_pools
++  config.before :each, type: :model do |example|
++    if example.metadata[:sidekiq_inline]
++      Sidekiq.testing!(:inline)
++    else
++      Sidekiq.testing!(:fake)
++      Sidekiq::Worker.clear_all
++    end
+   end
+ 
+-  config.before do |example|
+-    allow(Resolv::DNS).to receive(:open).and_raise('Real DNS queries are disabled, stub Resolv::DNS as needed') unless example.metadata[:type] == :system
++  config.before :each, type: :cli do
++    stub_reset_connection_pools
+   end
+ 
+   config.before :each, type: :request do
+diff --git a/spec/support/examples/models/concerns/reviewable.rb b/spec/support/examples/models/concerns/reviewable.rb
+index 144019d..2652226 100644
+--- a/spec/support/examples/models/concerns/reviewable.rb
++++ b/spec/support/examples/models/concerns/reviewable.rb
+@@ -7,8 +7,8 @@ RSpec.shared_examples 'Reviewable' do
+   let(:requested_review_at) { nil }
+ 
+   describe 'Scopes' do
+-    let!(:reviewed_record) { Fabricate factory_name, reviewed_at: 10.days.ago }
+-    let!(:un_reviewed_record) { Fabricate factory_name, reviewed_at: nil }
++    let_it_be(:reviewed_record) { Fabricate factory_name, reviewed_at: 10.days.ago }
++    let_it_be(:un_reviewed_record) { Fabricate factory_name, reviewed_at: nil }
+ 
+     describe '.reviewed' do
+       it 'returns reviewed records' do

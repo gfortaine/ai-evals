@@ -1,0 +1,261 @@
+diff --git a/app/controllers/books/searches_controller.rb b/app/controllers/books/searches_controller.rb
+index 5268c55..0f5ac51 100644
+--- a/app/controllers/books/searches_controller.rb
++++ b/app/controllers/books/searches_controller.rb
+@@ -1,9 +1,15 @@
+ class Books::SearchesController < ApplicationController
+   allow_unauthenticated_access
+ 
++  before_action :enforce_rate_limit, only: :create
+   include BookScoped
+ 
+   def create
+     @leaves = @book.leaves.active.search(params[:search]).favoring_title.limit(50)
+   end
++
++  private
++    def enforce_rate_limit
++      head :too_many_requests unless SearchRateLimiter.allow?(request.remote_ip)
++    end
+ end
+diff --git a/app/models/search_rate_limiter.rb b/app/models/search_rate_limiter.rb
+new file mode 100644
+index 0000000..5215829
+--- /dev/null
++++ b/app/models/search_rate_limiter.rb
+@@ -0,0 +1,97 @@
++require "securerandom"
++
++class SearchRateLimiter
++  LIMIT = 30
++  WINDOW = 1.minute
++
++  REDIS_SLIDING_WINDOW_SCRIPT = <<~LUA
++    local key = KEYS[1]
++    local now = tonumber(ARGV[1])
++    local window = tonumber(ARGV[2])
++    local limit = tonumber(ARGV[3])
++    local member = ARGV[4]
++
++    redis.call("ZREMRANGEBYSCORE", key, "-inf", now - window)
++    if redis.call("ZCARD", key) >= limit then
++      return 0
++    end
++
++    redis.call("ZADD", key, now, member)
++    redis.call("EXPIRE", key, math.ceil(window))
++    return 1
++  LUA
++
++  @mutex = Mutex.new
++  @fallback_store = ActiveSupport::Cache::MemoryStore.new
++
++  class << self
++    def allow?(ip, now: Time.current.to_f)
++      key = cache_key_for(ip)
++      store = active_store
++
++      if redis_store?(store)
++        allowed = allow_via_redis?(store, key, now)
++        return allowed unless allowed.nil?
++      end
++
++      allow_via_memory?(store_for_memory(store), key, now)
++    end
++
++    def reset!
++      @mutex.synchronize do
++        @fallback_store.clear
++      end
++    end
++
++    private
++      def active_store
++        Rails.cache
++      end
++
++      def redis_store?(store)
++        defined?(ActiveSupport::Cache::RedisCacheStore) && store.is_a?(ActiveSupport::Cache::RedisCacheStore)
++      end
++
++      def store_for_memory(store)
++        if store.is_a?(ActiveSupport::Cache::NullStore) || redis_store?(store)
++          @fallback_store
++        else
++          store
++        end
++      end
++
++      def cache_key_for(ip)
++        "rate-limit:books/searches:#{ip.presence || "unknown"}"
++      end
++
++      def allow_via_redis?(store, key, now)
++        normalized_key = store.send(:normalize_key, key, {})
++        result = store.redis.then do |client|
++          client = client.node_for(normalized_key) if defined?(::Redis::Distributed) && client.is_a?(::Redis::Distributed)
++          client.eval(
++            REDIS_SLIDING_WINDOW_SCRIPT,
++            keys: [ normalized_key ],
++            argv: [ now, WINDOW.to_f, LIMIT, "#{now}:#{SecureRandom.hex(8)}" ]
++          )
++        end
++        result == 1
++      rescue ::Redis::BaseError, ConnectionPool::Error, ConnectionPool::TimeoutError
++        nil
++      end
++
++      def allow_via_memory?(memory_store, key, now)
++        cutoff = now - WINDOW.to_f
++
++        @mutex.synchronize do
++          timestamps = Array(memory_store.read(key)).select { |timestamp| timestamp > cutoff }
++          if timestamps.size >= LIMIT
++            false
++          else
++            timestamps << now
++            memory_store.write(key, timestamps, expires_in: WINDOW)
++            true
++          end
++        end
++      end
++  end
++end
+diff --git a/test/controllers/books/searches_rate_limiting_test.rb b/test/controllers/books/searches_rate_limiting_test.rb
+new file mode 100644
+index 0000000..698df13
+--- /dev/null
++++ b/test/controllers/books/searches_rate_limiting_test.rb
+@@ -0,0 +1,132 @@
++require "test_helper"
++
++class Books::SearchesRateLimitingTest < ActionDispatch::IntegrationTest
++  setup do
++    SearchRateLimiter.reset!
++    Leaf.reindex_all
++
++    @handbook = books(:handbook)
++    @manual = books(:manual)
++    @handbook.update!(published: true)
++    @manual.update!(published: true)
++  end
++
++  teardown do
++    SearchRateLimiter.reset!
++  end
++
++  test "allows 30 unauthenticated searches in one minute and refuses the rest with 429" do
++    attacker_ip = "198.51.100.10"
++
++    30.times do
++      post book_search_path(@handbook), params: { search: "Thanks" }, headers: { "REMOTE_ADDR" => attacker_ip }
++      assert_response :success
++    end
++
++    5.times do
++      post book_search_path(@handbook), params: { search: "Thanks" }, headers: { "REMOTE_ADDR" => attacker_ip }
++      assert_response :too_many_requests
++      assert_not response.redirect?
++      assert_not response.server_error?
++    end
++  end
++
++  test "counts requests across different published books for the same address" do
++    attacker_ip = "198.51.100.11"
++
++    15.times do
++      post book_search_path(@handbook), params: { search: "Thanks" }, headers: { "REMOTE_ADDR" => attacker_ip }
++      assert_response :success
++    end
++
++    15.times do
++      post book_search_path(@manual), params: { search: "Manual" }, headers: { "REMOTE_ADDR" => attacker_ip }
++      assert_response :success
++    end
++
++    post book_search_path(@manual), params: { search: "Manual" }, headers: { "REMOTE_ADDR" => attacker_ip }
++    assert_response :too_many_requests
++  end
++
++  test "enforces a sliding one-minute window and recovers automatically after the burst stops" do
++    attacker_ip = "198.51.100.12"
++    start_time = Time.current.change(usec: 0)
++
++    travel_to start_time do
++      20.times do
++        post book_search_path(@handbook), params: { search: "Thanks" }, headers: { "REMOTE_ADDR" => attacker_ip }
++        assert_response :success
++      end
++
++      travel 40.seconds
++
++      10.times do
++        post book_search_path(@handbook), params: { search: "Thanks" }, headers: { "REMOTE_ADDR" => attacker_ip }
++        assert_response :success
++      end
++
++      post book_search_path(@handbook), params: { search: "Thanks" }, headers: { "REMOTE_ADDR" => attacker_ip }
++      assert_response :too_many_requests
++
++      # 61 seconds after start_time: the initial 20 expired, 10 from +40s remain in window
++      travel 21.seconds
++
++      20.times do
++        post book_search_path(@handbook), params: { search: "Thanks" }, headers: { "REMOTE_ADDR" => attacker_ip }
++        assert_response :success
++      end
++
++      post book_search_path(@handbook), params: { search: "Thanks" }, headers: { "REMOTE_ADDR" => attacker_ip }
++      assert_response :too_many_requests
++
++      # Within 5 minutes of the burst stopping, the address is served again
++      travel 5.minutes
++
++      post book_search_path(@handbook), params: { search: "Thanks" }, headers: { "REMOTE_ADDR" => attacker_ip }
++      assert_response :success
++    end
++  end
++
++  test "does not block a different address or opening the book pages while one address is refused" do
++    attacker_ip = "198.51.100.13"
++    reader_ip = "198.51.100.14"
++
++    30.times do
++      post book_search_path(@handbook), params: { search: "Thanks" }, headers: { "REMOTE_ADDR" => attacker_ip }
++      assert_response :success
++    end
++
++    post book_search_path(@handbook), params: { search: "Thanks" }, headers: { "REMOTE_ADDR" => attacker_ip }
++    assert_response :too_many_requests
++
++    # Another unauthenticated reader at a different address still gets results on the same book
++    post book_search_path(@handbook), params: { search: "Thanks" }, headers: { "REMOTE_ADDR" => reader_ip }
++    assert_response :success
++    assert_select "a", text: /Thanks for reading/i
++
++    # The refused address can still open the book and its pages
++    get book_slug_path(@handbook), headers: { "REMOTE_ADDR" => attacker_ip }
++    assert_response :success
++
++    get leafable_slug_path(leaves(:welcome_page)), headers: { "REMOTE_ADDR" => attacker_ip }
++    assert_response :success
++  end
++
++  test "works with MemoryStore cache and falls back cleanly when Redis is unavailable" do
++    original_cache = Rails.cache
++    ip = "198.51.100.15"
++
++    Rails.cache = ActiveSupport::Cache::MemoryStore.new
++    30.times { assert SearchRateLimiter.allow?(ip) }
++    assert_not SearchRateLimiter.allow?(ip)
++
++    redis_store = ActiveSupport::Cache::RedisCacheStore.new(url: "redis://127.0.0.1:6399/0", connect_timeout: 0.05)
++    fallback_ip = "198.51.100.16"
++
++    Rails.cache = redis_store
++    30.times { assert SearchRateLimiter.allow?(fallback_ip) }
++    assert_not SearchRateLimiter.allow?(fallback_ip)
++  ensure
++    Rails.cache = original_cache
++  end
++end

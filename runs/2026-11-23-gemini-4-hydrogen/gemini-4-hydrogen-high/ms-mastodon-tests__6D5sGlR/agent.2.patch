@@ -1,0 +1,1377 @@
+diff --git a/docs/test_performance_optimization.md b/docs/test_performance_optimization.md
+index c62a5f9..4f07201 100644
+--- a/docs/test_performance_optimization.md
++++ b/docs/test_performance_optimization.md
+@@ -92,3 +92,91 @@
+      - 2x `LoginActivity` creation (`user_fabricator.rb`)
+      - `User#set_approved` -> `UsernameBlock.matches?`, `EmailDomainBlock.requires_approval?`, `UnreservedUsernameValidator`, `UserRole.everyone`, `Setting.[]` (re-queried per example because `Rails.cache.clear` runs in `after(:each)`).
+    - `media_attachment_spec.rb` accounts for ~5.15s (~14% of remaining `spec/models` time), dominated by `boop.mp3` (7.5MB fixture, 2.64s) and ffmpeg/vips post-processing.
++
++---
++
++## Phase 2: `spec/requests` & Request-Level Shared Infrastructure
++
++### Baseline Metrics (`spec/requests`, post-Phase 1 global fixes)
++- **Spec files**: 263
++- **Examples**: 1,877 (excluding `:js`, `:search`, `:streaming`)
++- **Baseline runtime**: **127.3 seconds (2m 7.3s)** (`real 2m9.75s`)
++- **RSpecDissect (`RD_PROF=1`) baseline**:
++  - Total setup time (`before` + `let`): **93.68s out of 122.03s (~76.8%)**
++  - Top slow suites by setup time:
++    - `spec/requests/cache_spec.rb`: 22.03s of 22.40s / 258 examples (25.20s in JSON profile)
++    - `spec/requests/activitypub/replies_spec.rb`: 9.33s of 10.21s / 45 examples
++    - `spec/requests/api/v2/notifications_spec.rb`: 5.79s of 6.25s / 29 examples
++    - `spec/requests/api/v1/notifications_spec.rb`: 4.65s of 4.96s / 22 examples
++    - `spec/requests/api/v1/timelines/public_spec.rb`: 2.39s of 2.65s / 12 examples
++- **FactoryProf (`FPROF=1`) baseline**:
++  - Total fabrications: **11,030** (**6,561** top-level)
++  - Total time in Fabrication: **72.85s out of 124.53s (~58.5%)**
++  - Top fabricators: `status` (1,450, 29.55s), `bookmark` (1,459, 17.51s), `user` (939, 12.51s), `account` (1,070, 11.84s), `admin_user` (281, 3.56s), `invite` (262, 2.87s), `moderator_user` (258, 2.77s), `login_activity` (2,970, 2.62s), `accessible_access_token` (1,166, 1.43s)
++- **EventProf baseline**:
++  - `sidekiq.inline`: **7,592** inline jobs taking **12.08s (11.0%)** (dominated by `LocalNotificationWorker` ~5.84s including `Premailer::Adapter::Nokogiri#to_inline_css` ~3.11s, and `DistributionWorker` ~5.26s)
++  - `sql.active_record`: **166,850** SQL queries taking **20.23s (18.4%)**
++  - `process_action.action_controller`: **1,944** requests taking **16.82s (15.3%)**
++- **StackProf (`TEST_STACK_PROF=1`) additional findings**:
++  - `ActionDispatch::Routing::RouteSet::NamedRouteCollection#define_url_helper` + `clear!`: **~5.28s** (`Module#define_method` 4.15s + `Module#remove_method` 1.10s) from `after { Rails.application.reload_routes! }` running on every example in `signature_verification_spec.rb`.
++  - `Rack::Attack#call`: **~1.18s** (`blocklisted?` + `throttled?` + duplicate `Doorkeeper::OAuth::Token.authenticate`) running on every request.
++  - `BCrypt::Engine.__bc_crypt`: **4.89s (4.1%)** and `UsernameBlock.matches?`: **4.18s (3.5%)** from per-example `User` fabrication.
++
++---
++
++### Root Causes Identified & Fixes Applied in Phase 2
++
++1. **Per-Example `User` & `AccessToken` Fabrication in `with API authentication` (~15s+ saved)**
++   - **Cause**: `spec/support/api_authentication.rb` fabricated a fresh `:user` (with BCrypt, `Account`, 2 `LoginActivity` rows, `UsernameBlock`/`EmailDomainBlock` checks) and `:accessible_access_token` on every example across 70 request spec files, plus 23 additional files duplicated the exact 4-line `let(:user)` / `let(:scopes)` / `let(:token)` / `let(:headers)` block.
++   - **Fix**:
++     - Updated `spec/support/api_authentication.rb` to define `let_it_be(:_api_auth_user, refind: true)` and `let_it_be(:_api_auth_token, refind: true)`, reusing them whenever `scopes == oauth_scopes && user&.id == _api_auth_user.id` and falling back to per-example `Fabricate(:accessible_access_token, ...)` whenever a spec or shared example (e.g. `forbidden for wrong scope` / `forbidden for wrong role`) overrides `user` or `scopes`.
++     - Converted 23 request spec files that manually duplicated the 4-line pattern to `include_context 'with API authentication'`.
++
++2. **Per-Example `Rails.application.reload_routes!` in `signature_verification_spec.rb` (~5.3s saved)**
++   - **Cause**: `spec/requests/signature_verification_spec.rb` called `Rails.application.routes.draw` in `before(:each)` and `Rails.application.reload_routes!` in `after(:each)` across all 30 examples, tearing down and redefining Mastodon's entire route helper module 30 times.
++   - **Fix**: Moved `draw_test_routes` to `before(:all)` and `Rails.application.reload_routes!` to `after(:all)`, keeping `stub_const('ActivityPub::TestsController', ...)` in `before(:each)` (since RSpec resets `stub_const` after each example). Reduced isolated file time from 3.73s to 1.15s (6.39s -> ~1.1s in suite).
++
++3. **`Rack::Attack` Running Globally on Every Request Spec (~1.2s+ saved)**
++   - **Cause**: `Rack::Attack.enabled` defaulted to `true` in test, running IP blocklist checks, Doorkeeper token lookups, and Redis throttle increments on every request even though only `spec/config/initializers/rack/attack_spec.rb` tests `Rack::Attack`.
++   - **Fix**: Disabled `Rack::Attack` per example in `spec/rails_helper.rb` unless `:rack_attack` metadata is set (`Rack::Attack.enabled = example.metadata[:rack_attack].present?`), and tagged `spec/config/initializers/rack/attack_spec.rb` with `:rack_attack`.
++
++4. **`Sidekiq.testing!(:inline)` Missing Before `before_all` Hooks (Correctness & Infrastructure Fix)**
++   - **Cause**: `Sidekiq::Testing.__test_mode` defaults to `:fake` at boot and `spec/rails_helper.rb` only called `Sidekiq.testing!(:inline)` in `config.before` (`:each`). Any `before_all` hook running at the start of a suite or after an example that called `Sidekiq.testing!(:fake)` executed with Sidekiq in `:fake` mode.
++   - **Fix**: Added `config.prepend_before(:all) { Sidekiq.testing!(:inline) }` in `spec/rails_helper.rb`.
++
++5. **Repeated Per-Example Fixture & Service Setup (`before_all` / `let_it_be` / `stub_const`) (~40s+ saved)**
++   - `spec/requests/cache_spec.rb` (23.25s -> 5.27s): Converted the 7-record `before` block and `remote_actor` contexts (shared across 258 examples) to `before_all` and `let_it_be(..., refind: true)`.
++   - `spec/requests/api/v1/notifications_spec.rb` & `spec/requests/api/v2/notifications_spec.rb` & `spec/requests/api/v2/notifications/accounts_spec.rb` (11.99s -> 3.29s): Converted `user`, `bob`, `tom`, and `PostStatusService`/`ReblogService`/`FavouriteService`/`FollowService` setup (which triggered hundreds of inline `LocalNotificationWorker` + `Premailer` emails + `DistributionWorker` jobs) to `let_it_be(..., refind: true)` and `before_all`.
++   - `spec/requests/activitypub/replies_spec.rb` & `spec/requests/activitypub/contexts_spec.rb` (10.31s -> 2.44s): Converted parent/reply status graphs and `remote_account`/`remote_querier`/`conversation` to `let_it_be(..., refind: true)`, reduced `many replies` count from 10 to 5 (matching `DESCENDANTS_LIMIT = 5`), and added the missing `stub_const 'ActivityPub::ContextsController::DESCENDANTS_LIMIT', 2` in `contexts_spec.rb`'s `GET #show` `with many statuses` context (avoiding 60 status fabrications).
++   - Also applied `let_it_be` / `before_all` to:
++     - `spec/requests/api/v1/timelines/public_spec.rb`, `tag_spec.rb`, `link_spec.rb`
++     - `spec/requests/activitypub/outboxes_spec.rb`, `collections_spec.rb`
++     - `spec/requests/api/v1/admin/accounts_spec.rb`, `account_actions_spec.rb`, `reports_spec.rb`
++     - `spec/requests/api/v2/admin/accounts_spec.rb`, `api/v2/search_spec.rb`
++     - `spec/requests/accounts_spec.rb`, `statuses_spec.rb`, `api/v1/statuses_spec.rb`, `api/v1/follow_requests_spec.rb`, `api/v1/conversations_spec.rb`, `api/v1/profiles_spec.rb`, `admin/reports_spec.rb`
++
++---
++
++### Phase 2 Results (`spec/requests`)
++- **Before (post-Phase 1)**: **127.3 seconds** (1,877 examples, 0 failures)
++- **After Phase 2**: **49.81 seconds** (`--format progress`; 59.58s with `--profile 20`) (1,877 examples, 0 failures)
++- **Phase 2 Speedup**: **~60.9% reduction (2.56x faster)**
++- **FactoryProf after Phase 2**: Fabrications reduced from **11,030 -> 4,590** (-58.4%), fabrication time from **72.85s -> 32.75s** (-55.0%)
++- **Combined Phase 1 + Phase 2 (`spec/models` + `spec/requests`)**:
++  - `spec/models`: 137.7s -> ~35.8-37.0s
++  - `spec/requests`: 127.3s (post-Phase 1) -> 59.58s (and baseline pre-Phase 1 would have been significantly slower due to `TriggerWebhookWorker` + debug SQL logging)
++
++---
++
++### Additional Gotchas & Insights Discovered in Phase 2
++
++1. **`let_it_be(:user, refind: true)` clears virtual attributes like `user.password`**:
++   - `refind: true` reloads the record via `User.find(id)` before each example, so `user.password` (only populated in-memory by `Fabricate(:user)`) becomes `nil`.
++   - Avoid `refind: true` (or `let_it_be`) for users passed to form-based login helpers like `sign_in_with_session(user)` in `spec/requests/statuses_spec.rb` that POST `user.password`. (Devise's `sign_in(user)` helper does not need `user.password` and works fine with `refind: true`.)
++2. **Paperclip file deletion on disk is NOT rolled back by database transactions**:
++   - Actions like `DELETE /api/v1/profile/avatar` or `PATCH /api/v1/profile` overwrite/remove Paperclip files in `spec/test_files` on disk even though Postgres rolls back the column changes.
++   - Do not share a Paperclip-attached `let_it_be` record across examples that delete or overwrite its attachments.
++3. **Snowflake ID ordering with `let_it_be` vs lazy `let`**:
++   - Converting lazy `let` declarations to `let_it_be` changes creation order from "first referenced in `before`/example" to "declaration order", which can alter pagination `min_id`/`max_id` cursor expectations (e.g. `timelines/link_spec.rb`, `api/v2/admin/accounts_spec.rb`). Preserve creation order when pagination cursor IDs are asserted.
++4. **`Sidekiq.testing!(:inline)` in `before_all`**:
++   - Any `before_all` calling service objects (`PostStatusService`, etc.) that expect Sidekiq workers to run inline requires `Sidekiq.testing!(:inline)` in `before(:all)` (now enforced globally via `config.prepend_before(:all)` in `spec/rails_helper.rb`).
+diff --git a/spec/config/initializers/rack/attack_spec.rb b/spec/config/initializers/rack/attack_spec.rb
+index c7af11b..0b4e52c 100644
+--- a/spec/config/initializers/rack/attack_spec.rb
++++ b/spec/config/initializers/rack/attack_spec.rb
+@@ -2,7 +2,7 @@
+ 
+ require 'rails_helper'
+ 
+-RSpec.describe Rack::Attack, type: :request do
++RSpec.describe Rack::Attack, :rack_attack, type: :request do
+   def app
+     Rails.application
+   end
+diff --git a/spec/rails_helper.rb b/spec/rails_helper.rb
+index ae01424..7512b78 100644
+--- a/spec/rails_helper.rb
++++ b/spec/rails_helper.rb
+@@ -117,6 +117,10 @@ RSpec.configure do |config|
+     self.use_transactional_tests = true
+   end
+ 
++  config.prepend_before(:all) do
++    Sidekiq.testing!(:inline)
++  end
++
+   config.before do
+     Sidekiq.testing!(:inline)
+   end
+@@ -126,6 +130,7 @@ RSpec.configure do |config|
+   end
+ 
+   config.before do |example|
++    Rack::Attack.enabled = example.metadata[:rack_attack].present?
+     allow(Resolv::DNS).to receive(:open).and_raise('Real DNS queries are disabled, stub Resolv::DNS as needed') unless example.metadata[:type] == :system
+   end
+ 
+diff --git a/spec/requests/accounts_spec.rb b/spec/requests/accounts_spec.rb
+index 26f8f57..bd5c9fe 100644
+--- a/spec/requests/accounts_spec.rb
++++ b/spec/requests/accounts_spec.rb
+@@ -3,7 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'Accounts show response' do
+-  let(:account) { Fabricate(:account) }
++  let_it_be(:account, refind: true) { Fabricate(:account) }
+ 
+   context 'with numeric-based identifiers' do
+     context 'with JSON format' do
+@@ -238,16 +238,16 @@ RSpec.describe 'Accounts show response' do
+       context 'with RSS' do
+         let(:format) { 'rss' }
+ 
+-        let!(:status) { Fabricate(:status, account: account) }
+-        let!(:status_reply) { Fabricate(:status, account: account, thread: Fabricate(:status)) }
+-        let!(:status_self_reply) { Fabricate(:status, account: account, thread: status) }
+-        let!(:status_media) { Fabricate(:status, account: account) }
+-        let!(:status_pinned) { Fabricate(:status, account: account) }
+-        let!(:status_private) { Fabricate(:status, account: account, visibility: :private) }
+-        let!(:status_direct) { Fabricate(:status, account: account, visibility: :direct) }
+-        let!(:status_reblog) { Fabricate(:status, account: account, reblog: Fabricate(:status)) }
++        let_it_be(:status, refind: true) { Fabricate(:status, account: account) }
++        let_it_be(:status_reply, refind: true) { Fabricate(:status, account: account, thread: Fabricate(:status)) }
++        let_it_be(:status_self_reply, refind: true) { Fabricate(:status, account: account, thread: status) }
++        let_it_be(:status_media, refind: true) { Fabricate(:status, account: account) }
++        let_it_be(:status_pinned, refind: true) { Fabricate(:status, account: account) }
++        let_it_be(:status_private, refind: true) { Fabricate(:status, account: account, visibility: :private) }
++        let_it_be(:status_direct, refind: true) { Fabricate(:status, account: account, visibility: :direct) }
++        let_it_be(:status_reblog, refind: true) { Fabricate(:status, account: account, reblog: Fabricate(:status)) }
+ 
+-        before do
++        before_all do
+           status_media.media_attachments << Fabricate(:media_attachment, account: account, type: :image)
+           account.pinned_statuses << status_pinned
+           account.pinned_statuses << status_private
+diff --git a/spec/requests/activitypub/collections_spec.rb b/spec/requests/activitypub/collections_spec.rb
+index b10f7c8..711c7d5 100644
+--- a/spec/requests/activitypub/collections_spec.rb
++++ b/spec/requests/activitypub/collections_spec.rb
+@@ -3,11 +3,11 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'ActivityPub Collections' do
+-  let!(:account) { Fabricate(:account) }
+-  let!(:private_pinned) { Fabricate(:status, account: account, text: 'secret private stuff', visibility: :private) }
++  let_it_be(:account, refind: true) { Fabricate(:account) }
++  let_it_be(:private_pinned, refind: true) { Fabricate(:status, account: account, text: 'secret private stuff', visibility: :private) }
+   let(:remote_account) { nil }
+ 
+-  before do
++  before_all do
+     Fabricate.times(2, :status_pin, account: account)
+     Fabricate(:status_pin, account: account, status: private_pinned)
+     Fabricate(:status, account: account, visibility: :private)
+diff --git a/spec/requests/activitypub/contexts_spec.rb b/spec/requests/activitypub/contexts_spec.rb
+index 65b306a..69f65a6 100644
+--- a/spec/requests/activitypub/contexts_spec.rb
++++ b/spec/requests/activitypub/contexts_spec.rb
+@@ -3,13 +3,13 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'ActivityPub Contexts' do
+-  let(:conversation) { Fabricate(:status).owned_conversation }
++  let_it_be(:conversation, refind: true) { Fabricate(:status).owned_conversation }
+ 
+   describe 'GET #show' do
+     subject { get context_path(conversation), headers: nil }
+ 
+-    let!(:status) { Fabricate(:status, conversation: conversation) }
+-    let!(:unrelated_status) { Fabricate(:status) }
++    let_it_be(:status, refind: true) { Fabricate(:status, conversation: conversation) }
++    let_it_be(:unrelated_status, refind: true) { Fabricate(:status) }
+ 
+     it 'returns http success and correct media type and correct items' do
+       subject
+@@ -75,6 +75,7 @@ RSpec.describe 'ActivityPub Contexts' do
+ 
+       context 'with many statuses' do
+         before do
++          stub_const 'ActivityPub::ContextsController::DESCENDANTS_LIMIT', 2
+           ActivityPub::ContextsController::DESCENDANTS_LIMIT.times do
+             Fabricate(:status, conversation: conversation)
+           end
+diff --git a/spec/requests/activitypub/outboxes_spec.rb b/spec/requests/activitypub/outboxes_spec.rb
+index b2af762..a8392e4 100644
+--- a/spec/requests/activitypub/outboxes_spec.rb
++++ b/spec/requests/activitypub/outboxes_spec.rb
+@@ -3,9 +3,9 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'ActivityPub Outboxes' do
+-  let!(:account) { Fabricate(:account) }
++  let_it_be(:account, refind: true) { Fabricate(:account) }
+ 
+-  before do
++  before_all do
+     Fabricate(:status, account: account, visibility: :public)
+     Fabricate(:status, account: account, visibility: :unlisted)
+     Fabricate(:status, account: account, visibility: :private)
+@@ -170,7 +170,7 @@ RSpec.describe 'ActivityPub Outboxes' do
+     context 'with signature' do
+       subject { get account_outbox_path(account_username: account.username, page: page), headers: nil, sign_with: remote_account }
+ 
+-      let(:remote_account) { Fabricate(:account, domain: 'example.com') }
++      let_it_be(:remote_account, refind: true) { Fabricate(:account, domain: 'example.com') }
+       let(:page) { 'true' }
+ 
+       context 'when signed request account does not follow account' do
+diff --git a/spec/requests/activitypub/replies_spec.rb b/spec/requests/activitypub/replies_spec.rb
+index a002f70..d7dabe9 100644
+--- a/spec/requests/activitypub/replies_spec.rb
++++ b/spec/requests/activitypub/replies_spec.rb
+@@ -3,9 +3,27 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'ActivityPub Replies' do
+-  let(:status) { Fabricate(:status, visibility: parent_visibility) }
+-  let(:remote_account) { Fabricate(:account, domain: 'foobar.com') }
+-  let(:remote_reply_id) { 'https://foobar.com/statuses/1234' }
++  let_it_be(:remote_account, refind: true) { Fabricate(:account, domain: 'foobar.com') }
++  let_it_be(:remote_reply_id) { 'https://foobar.com/statuses/1234' }
++  let_it_be(:public_status, refind: true) do
++    Fabricate(:status, visibility: :public).tap do |s|
++      Fabricate.times(2, :status, thread: s, visibility: :public)
++      Fabricate(:status, thread: s, visibility: :private)
++      Fabricate(:status, account: s.account, thread: s, visibility: :public)
++      Fabricate(:status, account: s.account, thread: s, visibility: :private)
++      Fabricate(:status, account: remote_account, thread: s, visibility: :public, uri: remote_reply_id)
++    end
++  end
++  let_it_be(:private_status, refind: true) { Fabricate(:status, visibility: :private) }
++  let_it_be(:direct_status, refind: true) { Fabricate(:status, visibility: :direct) }
++
++  let(:status) do
++    case parent_visibility
++    when :public then public_status
++    when :private then private_status
++    when :direct then direct_status
++    end
++  end
+   let(:remote_querier) { nil }
+ 
+   shared_examples 'common behavior' do
+@@ -155,7 +173,7 @@ RSpec.describe 'ActivityPub Replies' do
+ 
+         context 'when there are many self-replies' do
+           before do
+-            10.times { Fabricate(:status, account: status.account, thread: status, visibility: :public) }
++            5.times { Fabricate(:status, account: status.account, thread: status, visibility: :public) }
+           end
+ 
+           it 'points next to other self-replies' do
+@@ -209,7 +227,7 @@ RSpec.describe 'ActivityPub Replies' do
+ 
+         context 'when there are many replies' do
+           before do
+-            10.times { Fabricate(:status, thread: status, visibility: :public) }
++            5.times { Fabricate(:status, thread: status, visibility: :public) }
+           end
+ 
+           it 'points next to other replies' do
+@@ -233,13 +251,6 @@ RSpec.describe 'ActivityPub Replies' do
+ 
+   before do
+     stub_const 'ActivityPub::RepliesController::DESCENDANTS_LIMIT', 5
+-
+-    Fabricate.times(2, :status, thread: status, visibility: :public)
+-    Fabricate(:status, thread: status, visibility: :private)
+-    Fabricate(:status, account: status.account, thread: status, visibility: :public)
+-    Fabricate(:status, account: status.account, thread: status, visibility: :private)
+-
+-    Fabricate(:status, account: remote_account, thread: status, visibility: :public, uri: remote_reply_id)
+   end
+ 
+   describe 'GET #index' do
+@@ -260,7 +271,7 @@ RSpec.describe 'ActivityPub Replies' do
+     context 'with signature' do
+       subject { get account_status_replies_path(account_username: status.account.username, status_id: status.id, only_other_accounts: only_other_accounts), headers: nil, sign_with: remote_querier }
+ 
+-      let(:remote_querier) { Fabricate(:account, domain: 'example.com') }
++      let_it_be(:remote_querier, refind: true) { Fabricate(:account, domain: 'example.com') }
+ 
+       it_behaves_like 'allowed access'
+ 
+diff --git a/spec/requests/admin/reports_spec.rb b/spec/requests/admin/reports_spec.rb
+index 2e361e4..ce5e1cf 100644
+--- a/spec/requests/admin/reports_spec.rb
++++ b/spec/requests/admin/reports_spec.rb
+@@ -19,10 +19,11 @@ RSpec.describe 'Admin Reports' do
+   end
+ 
+   describe 'GET /admin/reports/:id' do
+-    let(:report) { Fabricate(:report) }
++    let_it_be(:admin_user, refind: true) { Fabricate(:admin_user) }
++    let_it_be(:report, refind: true) { Fabricate(:report) }
+ 
+     before do
+-      sign_in Fabricate(:admin_user)
++      sign_in admin_user
+     end
+ 
+     shared_examples 'successful return' do
+diff --git a/spec/requests/api/v1/admin/account_actions_spec.rb b/spec/requests/api/v1/admin/account_actions_spec.rb
+index b67db3d..dd36ce4 100644
+--- a/spec/requests/api/v1/admin/account_actions_spec.rb
++++ b/spec/requests/api/v1/admin/account_actions_spec.rb
+@@ -44,7 +44,7 @@ RSpec.describe 'Account actions' do
+       post "/api/v1/admin/accounts/#{target_account.id}/action", headers: headers, params: params
+     end
+ 
+-    let(:target_account) { Fabricate(:account) }
++    let_it_be(:target_account, refind: true) { Fabricate(:account) }
+ 
+     context 'with type of disable' do
+       let(:params) { { type: 'disable' } }
+diff --git a/spec/requests/api/v1/admin/accounts_spec.rb b/spec/requests/api/v1/admin/accounts_spec.rb
+index d94fcd3..8d56efc 100644
+--- a/spec/requests/api/v1/admin/accounts_spec.rb
++++ b/spec/requests/api/v1/admin/accounts_spec.rb
+@@ -21,10 +21,10 @@ RSpec.describe 'Accounts' do
+       end
+     end
+ 
+-    let!(:remote_account)    { Fabricate(:account, domain: 'example.org') }
+-    let!(:suspended_account) { Fabricate(:account, suspended: true) }
+-    let!(:disabled_account)  { Fabricate(:user, disabled: true).account }
+-    let!(:pending_account)   { Fabricate(:user, approved: false).account }
++    let_it_be(:remote_account, refind: true)    { Fabricate(:account, domain: 'example.org') }
++    let_it_be(:suspended_account, refind: true) { Fabricate(:account, suspended: true) }
++    let_it_be(:disabled_account, refind: true)  { Fabricate(:user, disabled: true).account }
++    let_it_be(:pending_account, refind: true)   { Fabricate(:user, approved: false).account }
+     let!(:admin_account)     { user.account }
+     let(:params)             { {} }
+ 
+diff --git a/spec/requests/api/v1/admin/reports_spec.rb b/spec/requests/api/v1/admin/reports_spec.rb
+index 432e7f4..5fc78f1 100644
+--- a/spec/requests/api/v1/admin/reports_spec.rb
++++ b/spec/requests/api/v1/admin/reports_spec.rb
+@@ -29,8 +29,8 @@ RSpec.describe 'Reports' do
+     end
+ 
+     context 'when there are reports' do
+-      let!(:reporter) { Fabricate(:account) }
+-      let!(:spammer)  { Fabricate(:account) }
++      let_it_be(:reporter, refind: true) { Fabricate(:account) }
++      let_it_be(:spammer, refind: true)  { Fabricate(:account) }
+       let(:expected_response) do
+         scope.map do |report|
+           hash_including({
+@@ -48,7 +48,7 @@ RSpec.describe 'Reports' do
+       end
+       let(:scope) { Report.unresolved }
+ 
+-      before do
++      before_all do
+         Fabricate(:report)
+         Fabricate(:report, target_account: spammer)
+         Fabricate(:report, account: reporter, target_account: spammer)
+diff --git a/spec/requests/api/v1/announcements/reactions_spec.rb b/spec/requests/api/v1/announcements/reactions_spec.rb
+index 82154b4..4058f6b 100644
+--- a/spec/requests/api/v1/announcements/reactions_spec.rb
++++ b/spec/requests/api/v1/announcements/reactions_spec.rb
+@@ -3,10 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'API V1 Announcements Reactions' do
+-  let(:user)   { Fabricate(:user) }
+-  let(:scopes) { 'write:favourites' }
+-  let(:token)  { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+-  let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
++  include_context 'with API authentication', oauth_scopes: 'write:favourites'
+ 
+   let!(:announcement) { Fabricate(:announcement) }
+ 
+diff --git a/spec/requests/api/v1/conversations_spec.rb b/spec/requests/api/v1/conversations_spec.rb
+index aed3645..f66132a 100644
+--- a/spec/requests/api/v1/conversations_spec.rb
++++ b/spec/requests/api/v1/conversations_spec.rb
+@@ -5,12 +5,12 @@ require 'rails_helper'
+ RSpec.describe 'API V1 Conversations' do
+   include_context 'with API authentication', oauth_scopes: 'read:statuses'
+ 
+-  let!(:user) { Fabricate(:user, account_attributes: { username: 'alice' }) }
++  let_it_be(:user, refind: true) { Fabricate(:user, account_attributes: { username: 'alice' }) }
+ 
+-  let(:other) { Fabricate(:user) }
++  let_it_be(:other, refind: true) { Fabricate(:user) }
+ 
+   describe 'GET /api/v1/conversations' do
+-    before do
++    before_all do
+       user.account.follow!(other.account)
+       PostStatusService.new.call(other.account, text: 'Hey @alice', visibility: 'direct')
+       PostStatusService.new.call(user.account, text: 'Hey, nobody here', visibility: 'direct')
+diff --git a/spec/requests/api/v1/domain_blocks/previews_spec.rb b/spec/requests/api/v1/domain_blocks/previews_spec.rb
+index eb191f4..11cdfbc 100644
+--- a/spec/requests/api/v1/domain_blocks/previews_spec.rb
++++ b/spec/requests/api/v1/domain_blocks/previews_spec.rb
+@@ -3,10 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'Domain Blocks Previews API' do
+-  let(:user)    { Fabricate(:user) }
+-  let(:token)   { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+-  let(:scopes)  { 'write:blocks' }
+-  let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
++  include_context 'with API authentication', oauth_scopes: 'write:blocks'
+   let(:account) { Fabricate(:account, user: user) }
+ 
+   describe 'GET /api/v1/domain_blocks/preview' do
+diff --git a/spec/requests/api/v1/featured_tags/suggestions_spec.rb b/spec/requests/api/v1/featured_tags/suggestions_spec.rb
+index 8f2b64c..fd0a54e 100644
+--- a/spec/requests/api/v1/featured_tags/suggestions_spec.rb
++++ b/spec/requests/api/v1/featured_tags/suggestions_spec.rb
+@@ -3,10 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'Featured Tags Suggestions API' do
+-  let(:user)    { Fabricate(:user) }
+-  let(:token)   { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+-  let(:scopes)  { 'read:accounts' }
+-  let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
++  include_context 'with API authentication', oauth_scopes: 'read:accounts'
+   let(:account) { Fabricate(:account, user: user) }
+ 
+   describe 'GET /api/v1/featured_tags/suggestions' do
+diff --git a/spec/requests/api/v1/follow_requests_spec.rb b/spec/requests/api/v1/follow_requests_spec.rb
+index 7ebfce3..9cc1f08 100644
+--- a/spec/requests/api/v1/follow_requests_spec.rb
++++ b/spec/requests/api/v1/follow_requests_spec.rb
+@@ -5,15 +5,15 @@ require 'rails_helper'
+ RSpec.describe 'Follow requests' do
+   include_context 'with API authentication', oauth_scopes: 'read:follows write:follows'
+ 
+-  let(:user) { Fabricate(:user, account_attributes: { locked: true }) }
++  let_it_be(:user, refind: true) { Fabricate(:user, account_attributes: { locked: true }) }
+ 
+   describe 'GET /api/v1/follow_requests' do
+     subject do
+       get '/api/v1/follow_requests', headers: headers, params: params
+     end
+ 
+-    let(:accounts) { Fabricate.times(2, :account) }
+-    let(:params)   { {} }
++    let_it_be(:accounts, refind: true) { Fabricate.times(2, :account) }
++    let(:params) { {} }
+ 
+     let(:expected_response) do
+       accounts.map do |account|
+@@ -25,7 +25,7 @@ RSpec.describe 'Follow requests' do
+       end
+     end
+ 
+-    before do
++    before_all do
+       accounts.each { |account| FollowService.new.call(account, user.account) }
+     end
+ 
+@@ -56,9 +56,9 @@ RSpec.describe 'Follow requests' do
+       post "/api/v1/follow_requests/#{follower.id}/authorize", headers: headers
+     end
+ 
+-    let(:follower) { Fabricate(:account) }
++    let_it_be(:follower, refind: true) { Fabricate(:account) }
+ 
+-    before do
++    before_all do
+       FollowService.new.call(follower, user.account)
+     end
+ 
+@@ -78,9 +78,9 @@ RSpec.describe 'Follow requests' do
+       post "/api/v1/follow_requests/#{follower.id}/reject", headers: headers
+     end
+ 
+-    let(:follower) { Fabricate(:account) }
++    let_it_be(:follower, refind: true) { Fabricate(:account) }
+ 
+-    before do
++    before_all do
+       FollowService.new.call(follower, user.account)
+     end
+ 
+diff --git a/spec/requests/api/v1/lists/accounts_spec.rb b/spec/requests/api/v1/lists/accounts_spec.rb
+index da815f0..d4ff9ca 100644
+--- a/spec/requests/api/v1/lists/accounts_spec.rb
++++ b/spec/requests/api/v1/lists/accounts_spec.rb
+@@ -3,10 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'Accounts' do
+-  let(:user)    { Fabricate(:user) }
+-  let(:token)   { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+-  let(:scopes)  { 'read:lists write:lists' }
+-  let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
++  include_context 'with API authentication', oauth_scopes: 'read:lists write:lists'
+ 
+   describe 'GET /api/v1/lists/:id/accounts' do
+     subject do
+diff --git a/spec/requests/api/v1/notifications_spec.rb b/spec/requests/api/v1/notifications_spec.rb
+index 15183d2..886ab83 100644
+--- a/spec/requests/api/v1/notifications_spec.rb
++++ b/spec/requests/api/v1/notifications_spec.rb
+@@ -5,7 +5,7 @@ require 'rails_helper'
+ RSpec.describe 'Notifications' do
+   include_context 'with API authentication', oauth_scopes: 'read:notifications write:notifications'
+ 
+-  let(:user)    { Fabricate(:user, account_attributes: { username: 'alice' }) }
++  let_it_be(:user, refind: true) { Fabricate(:user, account_attributes: { username: 'alice' }) }
+ 
+   describe 'GET /api/v1/notifications/unread_count' do
+     subject do
+@@ -14,7 +14,7 @@ RSpec.describe 'Notifications' do
+ 
+     let(:params) { {} }
+ 
+-    before do
++    before_all do
+       first_status = PostStatusService.new.call(user.account, text: 'Test')
+       ReblogService.new.call(Fabricate(:account), first_status)
+       PostStatusService.new.call(Fabricate(:account), text: 'Hello @alice')
+@@ -99,11 +99,11 @@ RSpec.describe 'Notifications' do
+       get '/api/v1/notifications', headers: headers, params: params
+     end
+ 
+-    let(:bob)    { Fabricate(:user) }
+-    let(:tom)    { Fabricate(:user) }
++    let_it_be(:bob, refind: true) { Fabricate(:user) }
++    let_it_be(:tom, refind: true) { Fabricate(:user) }
+     let(:params) { {} }
+ 
+-    before do
++    before_all do
+       first_status = PostStatusService.new.call(user.account, text: 'Test')
+       ReblogService.new.call(bob.account, first_status)
+       PostStatusService.new.call(bob.account, text: 'Hello @alice')
+diff --git a/spec/requests/api/v1/polls/votes_spec.rb b/spec/requests/api/v1/polls/votes_spec.rb
+index d3f7eb4..2064ff3 100644
+--- a/spec/requests/api/v1/polls/votes_spec.rb
++++ b/spec/requests/api/v1/polls/votes_spec.rb
+@@ -3,10 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'API V1 Polls Votes' do
+-  let(:user)   { Fabricate(:user) }
+-  let(:scopes) { 'write:statuses' }
+-  let(:token)  { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+-  let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
++  include_context 'with API authentication', oauth_scopes: 'write:statuses'
+ 
+   describe 'POST /api/v1/polls/:poll_id/votes' do
+     let(:poll) { Fabricate(:poll) }
+diff --git a/spec/requests/api/v1/profiles_spec.rb b/spec/requests/api/v1/profiles_spec.rb
+index dc490ca..aba0894 100644
+--- a/spec/requests/api/v1/profiles_spec.rb
++++ b/spec/requests/api/v1/profiles_spec.rb
+@@ -7,17 +7,18 @@ RSpec.describe 'Profile API' do
+ 
+   let(:scopes) { 'write:accounts' }
+ 
+-  let(:account) do
+-    Fabricate(
+-      :account,
+-      avatar: fixture_file_upload('avatar.gif', 'image/gif'),
+-      header: fixture_file_upload('attachment.jpg', 'image/jpeg')
+-    )
+-  end
+-  let(:user) { account.user }
++  let(:account) { user.account }
+ 
+   describe 'GET /api/v1/profile' do
+     let(:scopes) { 'read:accounts' }
++    let(:account) do
++      Fabricate(
++        :account,
++        avatar: fixture_file_upload('avatar.gif', 'image/gif'),
++        header: fixture_file_upload('attachment.jpg', 'image/jpeg')
++      )
++    end
++    let(:user) { account.user }
+ 
+     it 'returns HTTP success with the appropriate profile' do
+       get '/api/v1/profile', headers: headers
+@@ -135,6 +136,15 @@ RSpec.describe 'Profile API' do
+   end
+ 
+   describe 'DELETE /api/v1/profile/avatar' do
++    let(:account) do
++      Fabricate(
++        :account,
++        avatar: fixture_file_upload('avatar.gif', 'image/gif'),
++        header: fixture_file_upload('attachment.jpg', 'image/jpeg')
++      )
++    end
++    let(:user) { account.user }
++
+     context 'with wrong scope' do
+       before do
+         delete '/api/v1/profile/avatar', headers: headers
+@@ -161,6 +171,15 @@ RSpec.describe 'Profile API' do
+   end
+ 
+   describe 'DELETE /api/v1/profile/header' do
++    let(:account) do
++      Fabricate(
++        :account,
++        avatar: fixture_file_upload('avatar.gif', 'image/gif'),
++        header: fixture_file_upload('attachment.jpg', 'image/jpeg')
++      )
++    end
++    let(:user) { account.user }
++
+     context 'with wrong scope' do
+       before do
+         delete '/api/v1/profile/header', headers: headers
+diff --git a/spec/requests/api/v1/push/subscriptions_spec.rb b/spec/requests/api/v1/push/subscriptions_spec.rb
+index bccbda6..295fc3b 100644
+--- a/spec/requests/api/v1/push/subscriptions_spec.rb
++++ b/spec/requests/api/v1/push/subscriptions_spec.rb
+@@ -3,7 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'API V1 Push Subscriptions' do
+-  let(:user) { Fabricate(:user) }
++  include_context 'with API authentication', oauth_scopes: 'push'
+   let(:endpoint) { 'https://fcm.googleapis.com/fcm/send/fiuH06a27qE:APA91bHnSiGcLwdaxdyqVXNDR9w1NlztsHb6lyt5WDKOC_Z_Q8BlFxQoR8tWFSXUIDdkyw0EdvxTu63iqamSaqVSevW5LfoFwojws8XYDXv_NRRLH6vo2CdgiN4jgHv5VLt2A8ah6lUX' }
+   let(:keys) do
+     {
+@@ -38,9 +38,6 @@ RSpec.describe 'API V1 Push Subscriptions' do
+     }.with_indifferent_access
+   end
+   let(:standard) { '1' }
+-  let(:scopes) { 'push' }
+-  let(:token) { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+-  let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
+ 
+   shared_examples 'validation error' do
+     it 'returns a validation error' do
+diff --git a/spec/requests/api/v1/statuses/bookmarks_spec.rb b/spec/requests/api/v1/statuses/bookmarks_spec.rb
+index 583f5b6..dc751d4 100644
+--- a/spec/requests/api/v1/statuses/bookmarks_spec.rb
++++ b/spec/requests/api/v1/statuses/bookmarks_spec.rb
+@@ -3,10 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'Bookmarks' do
+-  let(:user)    { Fabricate(:user) }
+-  let(:scopes)  { 'write:bookmarks' }
+-  let(:token)   { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+-  let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
++  include_context 'with API authentication', oauth_scopes: 'write:bookmarks'
+ 
+   describe 'POST /api/v1/statuses/:status_id/bookmark' do
+     subject do
+diff --git a/spec/requests/api/v1/statuses/favourited_by_accounts_spec.rb b/spec/requests/api/v1/statuses/favourited_by_accounts_spec.rb
+index 441664d..2fd6ce3 100644
+--- a/spec/requests/api/v1/statuses/favourited_by_accounts_spec.rb
++++ b/spec/requests/api/v1/statuses/favourited_by_accounts_spec.rb
+@@ -3,11 +3,8 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'API V1 Statuses Favourited by Accounts' do
+-  let(:user) { Fabricate(:user) }
+-  let(:scopes)  { 'read:accounts' }
++  include_context 'with API authentication', oauth_scopes: 'read:accounts'
+   # let(:app)   { Fabricate(:application, name: 'Test app', website: 'http://testapp.com') }
+-  let(:token) { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+-  let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
+   let(:alice) { Fabricate(:account) }
+   let(:bob)   { Fabricate(:account) }
+ 
+diff --git a/spec/requests/api/v1/statuses/favourites_spec.rb b/spec/requests/api/v1/statuses/favourites_spec.rb
+index 0e58f3e..a8eda80 100644
+--- a/spec/requests/api/v1/statuses/favourites_spec.rb
++++ b/spec/requests/api/v1/statuses/favourites_spec.rb
+@@ -3,10 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'Favourites' do
+-  let(:user)    { Fabricate(:user) }
+-  let(:scopes)  { 'write:favourites' }
+-  let(:token)   { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+-  let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
++  include_context 'with API authentication', oauth_scopes: 'write:favourites'
+ 
+   describe 'POST /api/v1/statuses/:status_id/favourite' do
+     subject do
+diff --git a/spec/requests/api/v1/statuses/histories_spec.rb b/spec/requests/api/v1/statuses/histories_spec.rb
+index 9c7f93d..6c0a5ef 100644
+--- a/spec/requests/api/v1/statuses/histories_spec.rb
++++ b/spec/requests/api/v1/statuses/histories_spec.rb
+@@ -3,10 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'API V1 Statuses Histories' do
+-  let(:user)  { Fabricate(:user) }
+-  let(:token) { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+-  let(:scopes)  { 'read:statuses' }
+-  let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
++  include_context 'with API authentication', oauth_scopes: 'read:statuses'
+ 
+   context 'with an oauth token' do
+     describe 'GET /api/v1/statuses/:status_id/history' do
+diff --git a/spec/requests/api/v1/statuses/interaction_policies_spec.rb b/spec/requests/api/v1/statuses/interaction_policies_spec.rb
+index 5b91f41..a61968f 100644
+--- a/spec/requests/api/v1/statuses/interaction_policies_spec.rb
++++ b/spec/requests/api/v1/statuses/interaction_policies_spec.rb
+@@ -3,10 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'Interaction policies' do
+-  let(:user)    { Fabricate(:user) }
+-  let(:scopes)  { 'write:statuses' }
+-  let(:token)   { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+-  let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
++  include_context 'with API authentication', oauth_scopes: 'write:statuses'
+   let(:status) { Fabricate(:status, account: user.account) }
+   let(:params) { { quote_approval_policy: 'followers' } }
+ 
+diff --git a/spec/requests/api/v1/statuses/mutes_spec.rb b/spec/requests/api/v1/statuses/mutes_spec.rb
+index 5531348..7d5fba8 100644
+--- a/spec/requests/api/v1/statuses/mutes_spec.rb
++++ b/spec/requests/api/v1/statuses/mutes_spec.rb
+@@ -3,10 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'API V1 Statuses Mutes' do
+-  let(:user)  { Fabricate(:user) }
+-  let(:token) { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+-  let(:scopes)  { 'write:mutes' }
+-  let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
++  include_context 'with API authentication', oauth_scopes: 'write:mutes'
+ 
+   context 'with an oauth token' do
+     describe 'POST /api/v1/statuses/:status_id/mute' do
+diff --git a/spec/requests/api/v1/statuses/pins_spec.rb b/spec/requests/api/v1/statuses/pins_spec.rb
+index 409fbb3..e45f050 100644
+--- a/spec/requests/api/v1/statuses/pins_spec.rb
++++ b/spec/requests/api/v1/statuses/pins_spec.rb
+@@ -3,10 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'Pins' do
+-  let(:user)    { Fabricate(:user) }
+-  let(:scopes)  { 'write:accounts' }
+-  let(:token)   { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+-  let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
++  include_context 'with API authentication', oauth_scopes: 'write:accounts'
+ 
+   describe 'POST /api/v1/statuses/:status_id/pin' do
+     subject do
+diff --git a/spec/requests/api/v1/statuses/quotes_spec.rb b/spec/requests/api/v1/statuses/quotes_spec.rb
+index 01e9e17..32b8c80 100644
+--- a/spec/requests/api/v1/statuses/quotes_spec.rb
++++ b/spec/requests/api/v1/statuses/quotes_spec.rb
+@@ -3,8 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'API V1 Statuses Quotes' do
+-  let(:user) { Fabricate(:user) }
+-  let(:token) { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
++  include_context 'with API authentication'
+ 
+   describe 'GET /api/v1/statuses/:status_id/quotes' do
+     subject do
+diff --git a/spec/requests/api/v1/statuses/reblogged_by_accounts_spec.rb b/spec/requests/api/v1/statuses/reblogged_by_accounts_spec.rb
+index 824b5aa..6620689 100644
+--- a/spec/requests/api/v1/statuses/reblogged_by_accounts_spec.rb
++++ b/spec/requests/api/v1/statuses/reblogged_by_accounts_spec.rb
+@@ -3,10 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'API V1 Statuses Reblogged by Accounts' do
+-  let(:user) { Fabricate(:user) }
+-  let(:scopes)  { 'read:accounts' }
+-  let(:token) { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+-  let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
++  include_context 'with API authentication', oauth_scopes: 'read:accounts'
+   let(:alice) { Fabricate(:account) }
+   let(:bob)   { Fabricate(:account) }
+ 
+diff --git a/spec/requests/api/v1/statuses/reblogs_spec.rb b/spec/requests/api/v1/statuses/reblogs_spec.rb
+index cee24ac..50f6244 100644
+--- a/spec/requests/api/v1/statuses/reblogs_spec.rb
++++ b/spec/requests/api/v1/statuses/reblogs_spec.rb
+@@ -3,10 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'API V1 Statuses Reblogs' do
+-  let(:user)  { Fabricate(:user) }
+-  let(:token) { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+-  let(:scopes)  { 'write:statuses' }
+-  let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
++  include_context 'with API authentication', oauth_scopes: 'write:statuses'
+ 
+   context 'with an oauth token' do
+     describe 'POST /api/v1/statuses/:status_id/reblog' do
+diff --git a/spec/requests/api/v1/statuses/sources_spec.rb b/spec/requests/api/v1/statuses/sources_spec.rb
+index 6b769f3..6d23364 100644
+--- a/spec/requests/api/v1/statuses/sources_spec.rb
++++ b/spec/requests/api/v1/statuses/sources_spec.rb
+@@ -3,10 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'Sources' do
+-  let(:user)    { Fabricate(:user) }
+-  let(:scopes)  { 'read:statuses' }
+-  let(:token)   { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+-  let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
++  include_context 'with API authentication', oauth_scopes: 'read:statuses'
+ 
+   describe 'GET /api/v1/statuses/:status_id/source' do
+     subject do
+diff --git a/spec/requests/api/v1/statuses/translations_spec.rb b/spec/requests/api/v1/statuses/translations_spec.rb
+index eb17d9f..5335524 100644
+--- a/spec/requests/api/v1/statuses/translations_spec.rb
++++ b/spec/requests/api/v1/statuses/translations_spec.rb
+@@ -3,10 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'API V1 Statuses Translations' do
+-  let(:user)  { Fabricate(:user) }
+-  let(:token) { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+-  let(:scopes)  { 'read:statuses' }
+-  let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
++  include_context 'with API authentication', oauth_scopes: 'read:statuses'
+ 
+   context 'with an application token' do
+     let(:token) { Fabricate(:accessible_access_token, resource_owner_id: nil, scopes: scopes) }
+diff --git a/spec/requests/api/v1/statuses_spec.rb b/spec/requests/api/v1/statuses_spec.rb
+index ec5087a..9e71b67 100644
+--- a/spec/requests/api/v1/statuses_spec.rb
++++ b/spec/requests/api/v1/statuses_spec.rb
+@@ -6,7 +6,7 @@ RSpec.describe '/api/v1/statuses' do
+   context 'with an oauth token' do
+     include_context 'with API authentication'
+ 
+-    let(:client_app) { Fabricate(:application, name: 'Test app', website: 'http://testapp.com') }
++    let_it_be(:client_app, refind: true) { Fabricate(:application, name: 'Test app', website: 'http://testapp.com') }
+     let(:token) { Fabricate(:accessible_access_token, resource_owner_id: user.id, application: client_app, scopes: scopes) }
+ 
+     describe 'GET /api/v1/statuses?id[]=:id' do
+diff --git a/spec/requests/api/v1/timelines/home_spec.rb b/spec/requests/api/v1/timelines/home_spec.rb
+index 6ff0a51..a20eb52 100644
+--- a/spec/requests/api/v1/timelines/home_spec.rb
++++ b/spec/requests/api/v1/timelines/home_spec.rb
+@@ -3,10 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'Home' do
+-  let(:user)    { Fabricate(:user) }
+-  let(:scopes)  { 'read:statuses' }
+-  let(:token)   { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+-  let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
++  include_context 'with API authentication', oauth_scopes: 'read:statuses'
+ 
+   describe 'GET /api/v1/timelines/home' do
+     subject do
+diff --git a/spec/requests/api/v1/timelines/link_spec.rb b/spec/requests/api/v1/timelines/link_spec.rb
+index fa91134..233a792 100644
+--- a/spec/requests/api/v1/timelines/link_spec.rb
++++ b/spec/requests/api/v1/timelines/link_spec.rb
+@@ -3,10 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'Link' do
+-  let(:user)    { Fabricate(:user) }
+-  let(:scopes)  { 'read:statuses' }
+-  let(:token)   { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+-  let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
++  include_context 'with API authentication', oauth_scopes: 'read:statuses'
+ 
+   shared_examples 'a successful request to the link timeline' do
+     it 'returns the expected statuses successfully', :aggregate_failures do
+@@ -25,14 +22,15 @@ RSpec.describe 'Link' do
+     end
+ 
+     let(:url) { 'https://example.com/' }
+-    let(:private_status) { Fabricate(:status, visibility: :private) }
+-    let(:undiscoverable_status) { Fabricate(:status, account: Fabricate.build(:account, domain: nil, discoverable: false)) }
+-    let(:local_status) { Fabricate(:status, account: Fabricate.build(:account, domain: nil, discoverable: true)) }
+-    let(:remote_status) { Fabricate(:status, account: Fabricate.build(:account, domain: 'example.com', discoverable: true)) }
+     let(:params) { { url: url } }
+     let(:expected_statuses) { [local_status, remote_status] }
+     let(:preview_card) { Fabricate(:preview_card, url: url) }
+ 
++    let_it_be(:private_status, refind: true) { Fabricate(:status, visibility: :private) }
++    let_it_be(:undiscoverable_status, refind: true) { Fabricate(:status, account: Fabricate.build(:account, domain: nil, discoverable: false)) }
++    let_it_be(:remote_status, refind: true) { Fabricate(:status, account: Fabricate.build(:account, domain: 'example.com', discoverable: true)) }
++    let_it_be(:local_status, refind: true) { Fabricate(:status, account: Fabricate.build(:account, domain: nil, discoverable: true)) }
++
+     before do
+       if preview_card.present?
+         preview_card.create_trend!(allowed: true)
+@@ -86,7 +84,7 @@ RSpec.describe 'Link' do
+     end
+ 
+     context 'when the instance does not allow public preview' do
+-      before do
++      before_all do
+         Form::AdminSettings.new(local_topic_feed_access: 'authenticated', remote_topic_feed_access: 'authenticated').save
+       end
+ 
+diff --git a/spec/requests/api/v1/timelines/list_spec.rb b/spec/requests/api/v1/timelines/list_spec.rb
+index 1be754f..058470e 100644
+--- a/spec/requests/api/v1/timelines/list_spec.rb
++++ b/spec/requests/api/v1/timelines/list_spec.rb
+@@ -3,10 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'API V1 Timelines List' do
+-  let(:user) { Fabricate(:user) }
+-  let(:scopes)  { 'read:statuses' }
+-  let(:token)   { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+-  let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
++  include_context 'with API authentication', oauth_scopes: 'read:statuses'
+   let(:list) { Fabricate(:list, account: user.account) }
+ 
+   context 'with a user context' do
+diff --git a/spec/requests/api/v1/timelines/public_spec.rb b/spec/requests/api/v1/timelines/public_spec.rb
+index 5ae9f76..43841ca 100644
+--- a/spec/requests/api/v1/timelines/public_spec.rb
++++ b/spec/requests/api/v1/timelines/public_spec.rb
+@@ -3,10 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'Public' do
+-  let(:user)    { Fabricate(:user) }
+-  let(:scopes)  { 'read:statuses' }
+-  let(:token)   { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+-  let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
++  include_context 'with API authentication', oauth_scopes: 'read:statuses'
+ 
+   shared_examples 'a successful request to the public timeline' do
+     it 'returns the expected statuses successfully', :aggregate_failures do
+@@ -24,12 +21,12 @@ RSpec.describe 'Public' do
+       get '/api/v1/timelines/public', headers: headers, params: params
+     end
+ 
+-    let!(:local_status)   { Fabricate(:status, account: Fabricate.build(:account, domain: nil)) }
+-    let!(:remote_status)  { Fabricate(:status, account: Fabricate.build(:account, domain: 'example.com')) }
+-    let!(:media_status)   { Fabricate(:status, media_attachments: [Fabricate.build(:media_attachment)]) }
++    let_it_be(:local_status, refind: true)   { Fabricate(:status, account: Fabricate.build(:account, domain: nil)) }
++    let_it_be(:remote_status, refind: true)  { Fabricate(:status, account: Fabricate.build(:account, domain: 'example.com')) }
++    let_it_be(:media_status, refind: true)   { Fabricate(:status, media_attachments: [Fabricate.build(:media_attachment)]) }
+     let(:params) { {} }
+ 
+-    before do
++    before_all do
+       Fabricate(:status, visibility: :private)
+     end
+ 
+@@ -97,7 +94,7 @@ RSpec.describe 'Public' do
+     end
+ 
+     context 'when the instance does not allow public preview' do
+-      before do
++      before_all do
+         Form::AdminSettings.new(local_live_feed_access: 'authenticated', remote_live_feed_access: 'authenticated').save
+       end
+ 
+diff --git a/spec/requests/api/v1/timelines/tag_spec.rb b/spec/requests/api/v1/timelines/tag_spec.rb
+index 5a723b1..1233c7b 100644
+--- a/spec/requests/api/v1/timelines/tag_spec.rb
++++ b/spec/requests/api/v1/timelines/tag_spec.rb
+@@ -3,10 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'Tag' do
+-  let(:user) { Fabricate(:user) }
+-  let(:scopes)  { 'read:statuses' }
+-  let(:token)   { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+-  let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
++  include_context 'with API authentication', oauth_scopes: 'read:statuses'
+ 
+   describe 'GET /api/v1/timelines/tag/:hashtag' do
+     subject do
+@@ -27,11 +24,11 @@ RSpec.describe 'Tag' do
+       end
+     end
+ 
+-    let(:account)         { Fabricate(:account) }
+-    let!(:private_status) { PostStatusService.new.call(account, visibility: :private, text: '#life could be a dream') }
+-    let!(:life_status)    { PostStatusService.new.call(account, text: 'tell me what is my #life without your #love') }
+-    let!(:war_status)     { PostStatusService.new.call(user.account, text: '#war, war never changes') }
+-    let!(:love_status)    { PostStatusService.new.call(account, text: 'what is #love?') }
++    let_it_be(:account, refind: true)        { Fabricate(:account) }
++    let_it_be(:private_status, refind: true) { PostStatusService.new.call(account, visibility: :private, text: '#life could be a dream') }
++    let_it_be(:life_status, refind: true)    { PostStatusService.new.call(account, text: 'tell me what is my #life without your #love') }
++    let_it_be(:war_status, refind: true)     { PostStatusService.new.call(_api_auth_user.account, text: '#war, war never changes') }
++    let_it_be(:love_status, refind: true)    { PostStatusService.new.call(account, text: 'what is #love?') }
+     let(:params)          { {} }
+     let(:hashtag)         { 'life' }
+ 
+@@ -98,7 +95,7 @@ RSpec.describe 'Tag' do
+     end
+ 
+     context 'when the instance does not allow public preview' do
+-      before do
++      before_all do
+         Form::AdminSettings.new(local_topic_feed_access: 'authenticated', remote_topic_feed_access: 'authenticated').save
+       end
+ 
+diff --git a/spec/requests/api/v2/admin/accounts_spec.rb b/spec/requests/api/v2/admin/accounts_spec.rb
+index 1d1fda3..334cd48 100644
+--- a/spec/requests/api/v2/admin/accounts_spec.rb
++++ b/spec/requests/api/v2/admin/accounts_spec.rb
+@@ -3,20 +3,19 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'API V2 Admin Accounts' do
+-  let(:role)   { UserRole.find_by(name: 'Moderator') }
+-  let(:user)   { Fabricate(:user, role: role) }
+   let(:scopes) { 'admin:read admin:write' }
+   let(:token)  { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+   let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
+ 
+   describe 'GET #index' do
+-    let!(:remote_account)       { Fabricate(:account, domain: 'example.org') }
+-    let!(:other_remote_account) { Fabricate(:account, domain: 'foo.bar') }
+-    let!(:suspended_account)    { Fabricate(:account, suspended: true) }
+-    let!(:suspended_remote)     { Fabricate(:account, domain: 'foo.bar', suspended: true) }
+-    let!(:disabled_account)     { Fabricate(:user, disabled: true).account }
+-    let!(:pending_account)      { Fabricate(:user, approved: false).account }
+-    let!(:admin_account)        { user.account }
++    let_it_be(:remote_account, refind: true)       { Fabricate(:account, domain: 'example.org') }
++    let_it_be(:other_remote_account, refind: true) { Fabricate(:account, domain: 'foo.bar') }
++    let_it_be(:suspended_account, refind: true)    { Fabricate(:account, suspended: true) }
++    let_it_be(:suspended_remote, refind: true)     { Fabricate(:account, domain: 'foo.bar', suspended: true) }
++    let_it_be(:disabled_account, refind: true)     { Fabricate(:user, disabled: true).account }
++    let_it_be(:pending_account, refind: true)      { Fabricate(:user, approved: false).account }
++    let_it_be(:user, refind: true) { Fabricate(:moderator_user) }
++    let!(:admin_account) { user.account }
+ 
+     let(:params) { {} }
+ 
+diff --git a/spec/requests/api/v2/filters/keywords_spec.rb b/spec/requests/api/v2/filters/keywords_spec.rb
+index f0d62e9..735f9cc 100644
+--- a/spec/requests/api/v2/filters/keywords_spec.rb
++++ b/spec/requests/api/v2/filters/keywords_spec.rb
+@@ -3,12 +3,10 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'API V2 Filters Keywords' do
+-  let(:user)         { Fabricate(:user) }
+-  let(:token)        { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
++  include_context 'with API authentication'
+   let(:filter)       { Fabricate(:custom_filter, account: user.account) }
+   let(:other_user)   { Fabricate(:user) }
+   let(:other_filter) { Fabricate(:custom_filter, account: other_user.account) }
+-  let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
+ 
+   describe 'GET /api/v2/filters/:filter_id/keywords' do
+     let(:scopes) { 'read:filters' }
+diff --git a/spec/requests/api/v2/filters/statuses_spec.rb b/spec/requests/api/v2/filters/statuses_spec.rb
+index f20a6ae..6166b73 100644
+--- a/spec/requests/api/v2/filters/statuses_spec.rb
++++ b/spec/requests/api/v2/filters/statuses_spec.rb
+@@ -3,12 +3,10 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'API V2 Filters Statuses' do
+-  let(:user)         { Fabricate(:user) }
+-  let(:token)        { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
++  include_context 'with API authentication'
+   let(:filter)       { Fabricate(:custom_filter, account: user.account) }
+   let(:other_user)   { Fabricate(:user) }
+   let(:other_filter) { Fabricate(:custom_filter, account: other_user.account) }
+-  let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
+ 
+   describe 'GET /api/v2/filters/:filter_id/statuses' do
+     let(:scopes) { 'read:filters' }
+diff --git a/spec/requests/api/v2/notifications/accounts_spec.rb b/spec/requests/api/v2/notifications/accounts_spec.rb
+index ddc9c5d..f4266ef 100644
+--- a/spec/requests/api/v2/notifications/accounts_spec.rb
++++ b/spec/requests/api/v2/notifications/accounts_spec.rb
+@@ -3,7 +3,7 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'Accounts in grouped notifications' do
+-  let(:user)    { Fabricate(:user, account_attributes: { username: 'alice' }) }
++  let_it_be(:user, refind: true) { Fabricate(:user, account_attributes: { username: 'alice' }) }
+   let(:token)   { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+   let(:scopes)  { 'read:notifications write:notifications' }
+   let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
+@@ -15,7 +15,7 @@ RSpec.describe 'Accounts in grouped notifications' do
+ 
+     let(:params) { {} }
+ 
+-    before do
++    before_all do
+       first_status = PostStatusService.new.call(user.account, text: 'Test')
+       FavouriteService.new.call(Fabricate(:account), first_status)
+       FavouriteService.new.call(Fabricate(:account), first_status)
+diff --git a/spec/requests/api/v2/notifications_spec.rb b/spec/requests/api/v2/notifications_spec.rb
+index 23e617f..d24dfb6 100644
+--- a/spec/requests/api/v2/notifications_spec.rb
++++ b/spec/requests/api/v2/notifications_spec.rb
+@@ -5,7 +5,7 @@ require 'rails_helper'
+ RSpec.describe 'Notifications' do
+   include_context 'with API authentication', oauth_scopes: 'read:notifications write:notifications'
+ 
+-  let(:user)    { Fabricate(:user, account_attributes: { username: 'alice' }) }
++  let_it_be(:user, refind: true) { Fabricate(:user, account_attributes: { username: 'alice' }) }
+ 
+   describe 'GET /api/v2/notifications/unread_count' do
+     subject do
+@@ -14,7 +14,7 @@ RSpec.describe 'Notifications' do
+ 
+     let(:params) { {} }
+ 
+-    before do
++    before_all do
+       first_status = PostStatusService.new.call(user.account, text: 'Test')
+       ReblogService.new.call(Fabricate(:account), first_status)
+       PostStatusService.new.call(Fabricate(:account), text: 'Hello @alice')
+@@ -112,11 +112,11 @@ RSpec.describe 'Notifications' do
+       get '/api/v2/notifications', headers: headers, params: params
+     end
+ 
+-    let(:bob)    { Fabricate(:user) }
+-    let(:tom)    { Fabricate(:user) }
++    let_it_be(:bob, refind: true) { Fabricate(:user) }
++    let_it_be(:tom, refind: true) { Fabricate(:user) }
+     let(:params) { {} }
+ 
+-    before do
++    before_all do
+       first_status = PostStatusService.new.call(user.account, text: 'Test')
+       ReblogService.new.call(bob.account, first_status)
+       PostStatusService.new.call(bob.account, text: 'Hello @alice')
+@@ -143,7 +143,7 @@ RSpec.describe 'Notifications' do
+     end
+ 
+     context 'when there are numerous notifications for the same final group' do
+-      before do
++      before_all do
+         user.account.notifications.destroy_all
+         5.times.each { FavouriteService.new.call(Fabricate(:account), user.account.statuses.first) }
+       end
+diff --git a/spec/requests/api/v2/search_spec.rb b/spec/requests/api/v2/search_spec.rb
+index 572e413..611a702 100644
+--- a/spec/requests/api/v2/search_spec.rb
++++ b/spec/requests/api/v2/search_spec.rb
+@@ -7,9 +7,9 @@ RSpec.describe 'Search API' do
+     include_context 'with API authentication', oauth_scopes: 'read:search'
+ 
+     describe 'GET /api/v2/search' do
+-      let!(:bob)   { Fabricate(:account, username: 'bob_test') }
+-      let!(:ana)   { Fabricate(:account, username: 'ana_test') }
+-      let!(:tom)   { Fabricate(:account, username: 'tom_test') }
++      let_it_be(:bob, refind: true) { Fabricate(:account, username: 'bob_test') }
++      let_it_be(:ana, refind: true) { Fabricate(:account, username: 'ana_test') }
++      let_it_be(:tom, refind: true) { Fabricate(:account, username: 'tom_test') }
+       let(:params) { { q: 'test' } }
+ 
+       it 'returns http success' do
+diff --git a/spec/requests/cache_spec.rb b/spec/requests/cache_spec.rb
+index 8fa5a03..60fff23 100644
+--- a/spec/requests/cache_spec.rb
++++ b/spec/requests/cache_spec.rb
+@@ -167,18 +167,15 @@ RSpec.describe 'Caching behavior' do
+     ActionController::Base.allow_forgery_protection = old
+   end
+ 
+-  let(:alice) { Account.find_by(username: 'alice') }
+-  let(:user) { User.find_by(email: 'user@host.example') }
+-  let(:token) { Doorkeeper::AccessToken.find_by(resource_owner_id: user.id) }
++  let_it_be(:alice, refind: true) { Fabricate(:account, username: 'alice') }
++  let_it_be(:user, refind: true) { Fabricate(:moderator_user, email: 'user@host.example') }
++  let_it_be(:token, refind: true) { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: 'read') }
+ 
+-  before do
+-    alice = Fabricate(:account, username: 'alice')
+-    user = Fabricate(:moderator_user, email: 'user@host.example')
++  before_all do
+     status = Fabricate(:status, account: alice, id: 110_224_538_612_341_312)
+     Fabricate(:status, account: alice, id: 110_224_538_643_211_312, visibility: :private)
+     Fabricate(:invite, code: 'abcdef')
+     Fabricate(:poll, status: status, account: alice, id: 123_456_789)
+-    Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: 'read')
+ 
+     user.account.follow!(alice)
+   end
+@@ -388,10 +385,10 @@ RSpec.describe 'Caching behavior' do
+   end
+ 
+   context 'with a Signature header' do
+-    let(:remote_actor)    { Fabricate(:account, domain: 'example.org', uri: 'https://example.org/remote', protocol: :activitypub) }
++    let_it_be(:remote_actor, refind: true) { Fabricate(:account, domain: 'example.org', uri: 'https://example.org/remote', protocol: :activitypub) }
+     let(:dummy_signature) { 'dummy-signature' }
+ 
+-    before do
++    before_all do
+       remote_actor.follow!(alice)
+     end
+ 
+@@ -442,10 +439,10 @@ RSpec.describe 'Caching behavior' do
+     end
+ 
+     context 'when providing a Signature' do
+-      let(:remote_actor)    { Fabricate(:account, domain: 'example.org', uri: 'https://example.org/remote', protocol: :activitypub) }
++      let_it_be(:remote_actor, refind: true) { Fabricate(:account, domain: 'example.org', uri: 'https://example.org/remote', protocol: :activitypub) }
+       let(:dummy_signature) { 'dummy-signature' }
+ 
+-      before do
++      before_all do
+         remote_actor.follow!(alice)
+       end
+ 
+@@ -502,10 +499,10 @@ RSpec.describe 'Caching behavior' do
+     end
+ 
+     context 'when providing a Signature from an allowed domain' do
+-      let(:remote_actor)    { Fabricate(:account, domain: 'example.org', uri: 'https://example.org/remote', protocol: :activitypub) }
++      let_it_be(:remote_actor, refind: true) { Fabricate(:account, domain: 'example.org', uri: 'https://example.org/remote', protocol: :activitypub) }
+       let(:dummy_signature) { 'dummy-signature' }
+ 
+-      before do
++      before_all do
+         DomainAllow.create!(domain: remote_actor.domain)
+         remote_actor.follow!(alice)
+       end
+@@ -530,7 +527,7 @@ RSpec.describe 'Caching behavior' do
+     end
+ 
+     context 'when providing a Signature from a non-allowed domain' do
+-      let(:remote_actor)    { Fabricate(:account, domain: 'example.org', uri: 'https://example.org/remote', protocol: :activitypub) }
++      let_it_be(:remote_actor, refind: true) { Fabricate(:account, domain: 'example.org', uri: 'https://example.org/remote', protocol: :activitypub) }
+       let(:dummy_signature) { 'dummy-signature' }
+ 
+       describe '/actor' do
+diff --git a/spec/requests/oauth/userinfo_spec.rb b/spec/requests/oauth/userinfo_spec.rb
+index 280a3a3..4991b34 100644
+--- a/spec/requests/oauth/userinfo_spec.rb
++++ b/spec/requests/oauth/userinfo_spec.rb
+@@ -5,11 +5,8 @@ require 'rails_helper'
+ RSpec.describe 'OAuth Userinfo Endpoint' do
+   include RoutingHelper
+ 
+-  let(:user)     { Fabricate(:user) }
+-  let(:account)  { user.account }
+-  let(:token)    { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+-  let(:scopes)   { 'profile' }
+-  let(:headers)  { { 'Authorization' => "Bearer #{token.token}" } }
++  include_context 'with API authentication', oauth_scopes: 'profile'
++  let(:account) { user.account }
+ 
+   shared_examples 'returns successfully' do
+     it 'returns http success' do
+diff --git a/spec/requests/signature_verification_spec.rb b/spec/requests/signature_verification_spec.rb
+index 9556911..86c9111 100644
+--- a/spec/requests/signature_verification_spec.rb
++++ b/spec/requests/signature_verification_spec.rb
+@@ -3,15 +3,21 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'signature verification concern' do
++  before(:all) do # rubocop:disable RSpec/BeforeAfterAll
++    draw_test_routes
++  end
++
++  after(:all) do # rubocop:disable RSpec/BeforeAfterAll
++    Rails.application.reload_routes!
++  end
++
+   before do
+-    stub_tests_controller
++    stub_const('ActivityPub::TestsController', activitypub_tests_controller)
+ 
+     # Signature checking is time-dependent, so travel to a fixed date
+     travel_to '2023-12-20T10:00:00Z'
+   end
+ 
+-  after { Rails.application.reload_routes! }
+-
+   # Include the private key so the tests can be easily adjusted and reviewed
+   let(:actor_keypair) do
+     OpenSSL::PKey.read(<<~PEM_TEXT)
+@@ -765,9 +771,7 @@ RSpec.describe 'signature verification concern' do
+ 
+   private
+ 
+-  def stub_tests_controller
+-    stub_const('ActivityPub::TestsController', activitypub_tests_controller)
+-
++  def draw_test_routes
+     Rails.application.routes.draw do
+       # NOTE: RouteSet#draw removes all routes, so we need to re-insert one
+       resource :instance_actor, path: 'actor', only: [:show]
+diff --git a/spec/requests/statuses_spec.rb b/spec/requests/statuses_spec.rb
+index ec32973..0b60b9e 100644
+--- a/spec/requests/statuses_spec.rb
++++ b/spec/requests/statuses_spec.rb
+@@ -4,8 +4,8 @@ require 'rails_helper'
+ 
+ RSpec.describe 'Statuses' do
+   describe 'GET /@:account_username/:id' do
+-    let(:account) { Fabricate(:account) }
+-    let(:status)  { Fabricate(:status, account: account) }
++    let_it_be(:account, refind: true) { Fabricate(:account) }
++    let_it_be(:status, refind: true)  { Fabricate(:status, account: account) }
+ 
+     context 'when signed out' do
+       context 'when account is permanently suspended' do
+@@ -327,7 +327,8 @@ RSpec.describe 'Statuses' do
+       end
+ 
+       let(:format) { 'html' }
+-      let(:remote_account) { Fabricate(:account, domain: 'host.example') }
++
++      let_it_be(:remote_account, refind: true) { Fabricate(:account, domain: 'host.example') }
+ 
+       context 'when account blocks the remote account' do
+         before { account.block!(remote_account) }
+diff --git a/spec/support/api_authentication.rb b/spec/support/api_authentication.rb
+index 83f76ab..3fe23e5 100644
+--- a/spec/support/api_authentication.rb
++++ b/spec/support/api_authentication.rb
+@@ -1,8 +1,19 @@
+ # frozen_string_literal: true
+ 
+ RSpec.shared_context 'with API authentication' do |oauth_scopes: '', user_fabricator: :user|
+-  let(:user)    { Fabricate(user_fabricator) }
+-  let(:scopes)  { oauth_scopes }
+-  let(:token)   { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
++  let_it_be(:_api_auth_user, refind: true) { Fabricate(user_fabricator) }
++  let_it_be(:_api_auth_token, refind: true) do
++    Fabricate(:accessible_access_token, resource_owner_id: _api_auth_user.id, scopes: oauth_scopes)
++  end
++
++  let(:user)   { _api_auth_user }
++  let(:scopes) { oauth_scopes }
++  let(:token) do
++    if scopes == oauth_scopes && user&.id == _api_auth_user.id
++      _api_auth_token
++    else
++      Fabricate(:accessible_access_token, resource_owner_id: user&.id, scopes: scopes)
++    end
++  end
+   let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
+ end
