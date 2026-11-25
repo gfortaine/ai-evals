@@ -1,0 +1,1080 @@
+diff --git a/app/controllers/users/push_subscriptions_controller.rb b/app/controllers/users/push_subscriptions_controller.rb
+new file mode 100644
+index 0000000..f316593
+--- /dev/null
++++ b/app/controllers/users/push_subscriptions_controller.rb
+@@ -0,0 +1,27 @@
++class Users::PushSubscriptionsController < ApplicationController
++  before_action :set_user, :ensure_current_user
++
++  def create
++    Push::Subscription.register(user: @user, user_agent: request.user_agent, **subscription_params)
++
++    respond_to do |format|
++      format.html { redirect_to notifications_settings_path, notice: "Notifications turned on for this device" }
++      format.json { head :no_content }
++    end
++  rescue ActiveRecord::RecordInvalid
++    head :unprocessable_entity
++  end
++
++  private
++    def set_user
++      @user = Current.account.users.active.find(params[:user_id])
++    end
++
++    def ensure_current_user
++      head :forbidden unless @user == Current.user
++    end
++
++    def subscription_params
++      params.expect(push_subscription: %i[ endpoint p256dh_key auth_key ]).to_h.symbolize_keys
++    end
++end
+diff --git a/app/javascript/controllers/notifications_controller.js b/app/javascript/controllers/notifications_controller.js
+new file mode 100644
+index 0000000..c09e9ae
+--- /dev/null
++++ b/app/javascript/controllers/notifications_controller.js
+@@ -0,0 +1,71 @@
++import { Controller } from "@hotwired/stimulus"
++import { post } from "@rails/request.js"
++
++// Turns on push notifications for the device in use. The browser grants
++// permission and issues a push subscription; we hand that subscription to Fizzy
++// so notifications can be delivered to this device.
++export default class extends Controller {
++  static targets = [ "details", "enable" ]
++  static values = { vapidPublicKey: String, subscriptionsUrl: String }
++
++  async connect() {
++    const subscription = await this.#subscription()
++    if (subscription) await this.#register(subscription)
++
++    this.#render(subscription)
++  }
++
++  async enable() {
++    if (await Notification.requestPermission() === "granted") {
++      const subscription = await this.#subscribe()
++      const response = await this.#register(subscription)
++
++      // Don't claim notifications are on if Fizzy couldn't take the subscription
++      if (!response.ok) await subscription.unsubscribe()
++    }
++
++    this.#render(await this.#subscription())
++  }
++
++  async #subscription() {
++    if (!pushSupported() || Notification.permission !== "granted") return null
++
++    const registration = await navigator.serviceWorker.ready
++    return registration.pushManager.getSubscription()
++  }
++
++  async #subscribe() {
++    const registration = await navigator.serviceWorker.ready
++
++    return registration.pushManager.subscribe({
++      userVisibleOnly: true,
++      applicationServerKey: base64UrlToUint8Array(this.vapidPublicKeyValue)
++    })
++  }
++
++  #register(subscription) {
++    const { endpoint, keys } = subscription.toJSON()
++
++    return post(this.subscriptionsUrlValue, {
++      body: { push_subscription: { endpoint, p256dh_key: keys.p256dh, auth_key: keys.auth } },
++      responseKind: "json"
++    })
++  }
++
++  #render(subscription) {
++    const blocked = pushSupported() && Notification.permission === "denied"
++
++    this.element.classList.toggle("notifications--on", !!subscription)
++    this.enableTarget.hidden = !pushSupported() || blocked || !!subscription
++    this.detailsTargets.forEach(details => details.hidden = !blocked)
++  }
++}
++
++function pushSupported() {
++  return "Notification" in window && "serviceWorker" in navigator && "PushManager" in window
++}
++
++function base64UrlToUint8Array(base64Url) {
++  const base64 = base64Url.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(base64Url.length / 4) * 4, "=")
++  return Uint8Array.from(atob(base64), char => char.charCodeAt(0))
++}
+diff --git a/app/jobs/notification/push_job.rb b/app/jobs/notification/push_job.rb
+new file mode 100644
+index 0000000..acd1843
+--- /dev/null
++++ b/app/jobs/notification/push_job.rb
+@@ -0,0 +1,7 @@
++class Notification::PushJob < ApplicationJob
++  discard_on ActiveJob::DeserializationError
++
++  def perform(notification)
++    notification.deliver_push
++  end
++end
+diff --git a/app/models/notification.rb b/app/models/notification.rb
+index 1c70ca3..6e017ba 100644
+--- a/app/models/notification.rb
++++ b/app/models/notification.rb
+@@ -20,6 +20,9 @@ class Notification < ApplicationRecord
+   after_create :bundle
+   after_update :bundle, if: :source_id_previously_changed?
+ 
++  after_create_commit -> { deliver_push_later }
++  after_update_commit -> { deliver_push_later if saved_change_to_source_id? }
++
+   after_create_commit  -> { broadcast_prepend_later_to user, :notifications, target: "notifications" }
+   after_update_commit  -> { broadcast_update }
+   after_destroy_commit -> { broadcast_remove_to user, :notifications }
+@@ -45,6 +48,17 @@ class Notification < ApplicationRecord
+     update!(read_at: nil, unread_count: 1)
+   end
+ 
++  def deliver_push_later
++    if Push::Subscription.enabled? && user.push_subscriptions.any?
++      Notification::PushJob.perform_later(self)
++    end
++  end
++
++  def deliver_push
++    payload = push_payload.to_json
++    user.push_subscriptions.each { it.push(payload) }
++  end
++
+   def read?
+     read_at.present?
+   end
+@@ -54,6 +68,36 @@ class Notification < ApplicationRecord
+       self.card = source.card
+     end
+ 
++    def push_payload
++      { title: push_title, body: push_body, url: push_url, tag: "card-#{card_id}" }
++    end
++
++    # Same text the tray shows for this notification.
++    def push_title
++      if source.is_a?(Mention)
++        "#{source.mentioner.first_name} @mentioned you"
++      else
++        ApplicationController.helpers.event_notification_title(source)
++      end
++    end
++
++    def push_body
++      if source.is_a?(Mention)
++        source.source.mentionable_content.truncate(200)
++      else
++        ApplicationController.helpers.event_notification_body(source)
++      end
++    end
++
++    def push_url
++      Rails.application.routes.url_helpers.polymorphic_url(notifiable_target, base_url_options.merge(script_name: account.slug))
++    end
++
++    def base_url_options
++      Rails.application.routes.default_url_options.presence ||
++        Rails.application.config.action_mailer.default_url_options
++    end
++
+     def bundle
+       user.bundle(self) if user.settings.bundling_emails?
+     end
+diff --git a/app/models/push.rb b/app/models/push.rb
+new file mode 100644
+index 0000000..765323c
+--- /dev/null
++++ b/app/models/push.rb
+@@ -0,0 +1,5 @@
++module Push
++  def self.table_name_prefix
++    "push_"
++  end
++end
+diff --git a/app/models/push/subscription.rb b/app/models/push/subscription.rb
+new file mode 100644
+index 0000000..ea46af9
+--- /dev/null
++++ b/app/models/push/subscription.rb
+@@ -0,0 +1,75 @@
++class Push::Subscription < ApplicationRecord
++  TIME_TO_LIVE = 1.day
++
++  belongs_to :account, default: -> { user.account }
++  belongs_to :user
++
++  validates :endpoint, :p256dh_key, :auth_key, presence: true
++  validate :validate_endpoint, if: :will_save_change_to_endpoint?
++
++  class << self
++    def enabled?
++      vapid_public_key.present? && vapid_private_key.present?
++    end
++
++    def vapid_public_key
++      ENV["VAPID_PUBLIC_KEY"]
++    end
++
++    def vapid_private_key
++      ENV["VAPID_PRIVATE_KEY"]
++    end
++
++    def register(user:, endpoint:, p256dh_key:, auth_key:, user_agent:)
++      transaction do
++        # A browser subscription belongs to whoever is signed in on that browser,
++        # so take it away from any other identity that had it before.
++        where(endpoint: endpoint).where.not(user: user.identity.users).delete_all
++
++        find_or_initialize_by(user: user, endpoint: endpoint).tap do |subscription|
++          subscription.assign_attributes(p256dh_key: p256dh_key, auth_key: auth_key, user_agent: user_agent)
++          subscription.save!(context: :register)
++        end
++      end
++    end
++  end
++
++  def push(payload)
++    WebPush.payload_send(
++      message: payload,
++      endpoint: endpoint,
++      p256dh: p256dh_key,
++      auth: auth_key,
++      ttl: TIME_TO_LIVE.to_i,
++      vapid: vapid_options
++    )
++  rescue WebPush::ExpiredSubscription, WebPush::InvalidSubscription
++    destroy!
++  # A device that can't be reached right now shouldn't stop the others from getting the push.
++  rescue WebPush::ResponseError, Timeout::Error, SocketError, SystemCallError, OpenSSL::SSL::SSLError => error
++    Rails.error.report(error, handled: true, severity: :warning, context: { push_subscription_id: id })
++  end
++
++  private
++    def vapid_options
++      {
++        subject: "mailto:#{Mail::Address.new(ApplicationMailer.default_params[:from]).address}",
++        public_key: self.class.vapid_public_key,
++        private_key: self.class.vapid_private_key
++      }
++    end
++
++    # Only browser registration checks the host, so importing old subscriptions
++    # doesn't look up DNS for every endpoint.
++    def validate_endpoint
++      uri = URI.parse(endpoint)
++
++      if uri.scheme != "https" || uri.host.blank?
++        errors.add :endpoint, "must be an https URL"
++      elsif validation_context == :register && SsrfProtection.resolve_public_ip(uri.host).nil?
++        errors.add :endpoint, "must point to a public host"
++      end
++    rescue URI::InvalidURIError
++      errors.add :endpoint, "is not a URL"
++    end
++end
+diff --git a/app/models/user.rb b/app/models/user.rb
+index 842f7f6..7b163b9 100644
+--- a/app/models/user.rb
++++ b/app/models/user.rb
+@@ -19,6 +19,7 @@ class User < ApplicationRecord
+   def deactivate
+     transaction do
+       accesses.destroy_all
++      push_subscriptions.destroy_all
+       update! active: false, identity: nil
+       close_remote_connections
+     end
+diff --git a/app/models/user/notifiable.rb b/app/models/user/notifiable.rb
+index 7598f0e..886f6a1 100644
+--- a/app/models/user/notifiable.rb
++++ b/app/models/user/notifiable.rb
+@@ -4,6 +4,7 @@ module User::Notifiable
+   included do
+     has_many :notifications, dependent: :destroy
+     has_many :notification_bundles, class_name: "Notification::Bundle", dependent: :destroy
++    has_many :push_subscriptions, class_name: "Push::Subscription", dependent: :destroy
+ 
+     generates_token_for :unsubscribe, expires_in: 1.month
+   end
+diff --git a/app/views/notifications/settings/_device.html.erb b/app/views/notifications/settings/_device.html.erb
+new file mode 100644
+index 0000000..f150e51
+--- /dev/null
++++ b/app/views/notifications/settings/_device.html.erb
+@@ -0,0 +1,21 @@
++<section class="settings__section hide-on-native" data-controller="notifications"
++  data-notifications-vapid-public-key-value="<%= Push::Subscription.vapid_public_key %>"
++  data-notifications-subscriptions-url-value="<%= user_push_subscriptions_path(Current.user) %>">
++  <heading>
++    <h2 class="divider">This Device</h2>
++    <div>Get a notification on this device whenever something lands in your tray.</div>
++  </heading>
++
++  <div class="panel notifications__status margin-block-start-half">
++    <p class="notifications__on-message"><strong>Notifications are on for this device.</strong></p>
++
++    <div class="notifications__off-message">
++      <p><strong>Notifications are off for this device.</strong></p>
++      <button type="button" class="btn" hidden data-notifications-target="enable" data-action="notifications#enable">Turn on notifications</button>
++    </div>
++  </div>
++
++  <%= render "notifications/settings/browser" %>
++  <%= render "notifications/settings/system" %>
++  <%= render "notifications/settings/install" %>
++</section>
+diff --git a/app/views/notifications/settings/show.html.erb b/app/views/notifications/settings/show.html.erb
+index bc09e75..7229576 100644
+--- a/app/views/notifications/settings/show.html.erb
++++ b/app/views/notifications/settings/show.html.erb
+@@ -16,6 +16,7 @@
+ 
+   <div class="settings__panel panel shadow">
+     <%= render "notifications/settings/native_devices" if Fizzy.saas? %>
++    <%= render "notifications/settings/device" if Push::Subscription.enabled? %>
+     <%= render "notifications/settings/email", settings: @settings %>
+   </div>
+ </section>
+diff --git a/app/views/pwa/service_worker.js.erb b/app/views/pwa/service_worker.js.erb
+index 483cba6..f37798a 100644
+--- a/app/views/pwa/service_worker.js.erb
++++ b/app/views/pwa/service_worker.js.erb
+@@ -64,4 +64,34 @@ self.addEventListener("activate", (event) => {
+   event.waitUntil(self.clients.claim())
+ })
+ 
++// Web push: show the same text the tray shows, and open the card when tapped
++self.addEventListener("push", (event) => {
++  const { title, body, url, tag } = event.data.json()
++
++  event.waitUntil(self.registration.showNotification(title, {
++    body,
++    tag,
++    renotify: true,
++    icon: "/app-icon-192.png",
++    data: { url }
++  }))
++})
++
++self.addEventListener("notificationclick", (event) => {
++  event.notification.close()
++  event.waitUntil(openNotificationUrl(event.notification.data.url))
++})
++
++async function openNotificationUrl(url) {
++  const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true })
++  const client = clients.find((candidate) => new URL(candidate.url).origin === self.location.origin)
++
++  if (client) {
++    await client.navigate(url)
++    return client.focus()
++  } else {
++    return self.clients.openWindow(url)
++  }
++}
++
+ TurboOffline.start()
+diff --git a/config/routes.rb b/config/routes.rb
+index 2c71eec..dd6e8fd 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -21,6 +21,7 @@ Rails.application.routes.draw do
+       end
+ 
+       resources :data_exports, only: [ :create, :show ]
++      resources :push_subscriptions, only: :create
+     end
+   end
+ 
+diff --git a/db/migrate/20261119120000_create_push_subscriptions.rb b/db/migrate/20261119120000_create_push_subscriptions.rb
+new file mode 100644
+index 0000000..67c61a5
+--- /dev/null
++++ b/db/migrate/20261119120000_create_push_subscriptions.rb
+@@ -0,0 +1,18 @@
++class CreatePushSubscriptions < ActiveRecord::Migration[8.2]
++  def change
++    create_table :push_subscriptions, id: :uuid do |t|
++      t.uuid :account_id, null: false
++      t.uuid :user_id, null: false
++      t.string :endpoint, limit: 512, null: false
++      t.string :p256dh_key, null: false
++      t.string :auth_key, null: false
++      t.string :user_agent, limit: 4096
++
++      t.timestamps
++
++      t.index :account_id
++      t.index :endpoint
++      t.index [ :user_id, :endpoint ], unique: true
++    end
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 338f53b..c50dedb 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
++ActiveRecord::Schema[8.2].define(version: 2026_11_19_120000) do
+   create_table "accesses", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+     t.datetime "accessed_at"
+     t.uuid "account_id", null: false
+@@ -432,6 +432,20 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.index ["user_id"], name: "index_pins_on_user_id"
+   end
+ 
++  create_table "push_subscriptions", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
++    t.uuid "account_id", null: false
++    t.string "auth_key", null: false
++    t.datetime "created_at", null: false
++    t.string "endpoint", limit: 512, null: false
++    t.string "p256dh_key", null: false
++    t.uuid "user_id", null: false
++    t.string "user_agent", limit: 4096
++    t.datetime "updated_at", null: false
++    t.index ["account_id"], name: "index_push_subscriptions_on_account_id"
++    t.index ["endpoint"], name: "index_push_subscriptions_on_endpoint"
++    t.index ["user_id", "endpoint"], name: "index_push_subscriptions_on_user_id_and_endpoint", unique: true
++  end
++
+   create_table "reactions", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+     t.uuid "account_id", null: false
+     t.string "content", limit: 16, null: false
+diff --git a/db/schema_sqlite.rb b/db/schema_sqlite.rb
+index d268f47..a09cbbd 100644
+--- a/db/schema_sqlite.rb
++++ b/db/schema_sqlite.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
++ActiveRecord::Schema[8.2].define(version: 2026_11_19_120000) do
+   create_table "accesses", id: :uuid, force: :cascade do |t|
+     t.datetime "accessed_at"
+     t.uuid "account_id", null: false
+@@ -432,6 +432,20 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.index ["user_id"], name: "index_pins_on_user_id"
+   end
+ 
++  create_table "push_subscriptions", id: :uuid, force: :cascade do |t|
++    t.uuid "account_id", null: false
++    t.uuid "user_id", null: false
++    t.string "endpoint", limit: 512, null: false
++    t.string "p256dh_key", limit: 255, null: false
++    t.string "auth_key", limit: 255, null: false
++    t.string "user_agent", limit: 4096
++    t.datetime "created_at", null: false
++    t.datetime "updated_at", null: false
++    t.index ["account_id"], name: "index_push_subscriptions_on_account_id"
++    t.index ["endpoint"], name: "index_push_subscriptions_on_endpoint"
++    t.index ["user_id", "endpoint"], name: "index_push_subscriptions_on_user_id_and_endpoint", unique: true
++  end
++
+   create_table "reactions", id: :uuid, force: :cascade do |t|
+     t.uuid "account_id", null: false
+     t.string "content", limit: 16, null: false
+diff --git a/docs/docker-deployment.md b/docs/docker-deployment.md
+index f6eca78..e0439e3 100644
+--- a/docs/docker-deployment.md
++++ b/docs/docker-deployment.md
+@@ -101,6 +101,25 @@ Set `BASE_URL` to the full URL where your Fizzy instance is accessible:
+ docker run --env BASE_URL=https://fizzy.example.com ...
+ ```
+ 
++#### Web push notifications (optional)
++
++Fizzy can send notifications to people's phones and desktops, so they hear about things as they land in their tray.
++People turn it on for each device from their notification settings.
++
++To enable it, generate a VAPID key pair and set both halves of it:
++
++```sh
++bin/rails runner 'key = WebPush.generate_key; puts "VAPID_PUBLIC_KEY=#{key.public_key}", "VAPID_PRIVATE_KEY=#{key.private_key}"'
++```
++
++```sh
++docker run --env VAPID_PUBLIC_KEY=... --env VAPID_PRIVATE_KEY=... ...
++```
++
++Keep the private key secret.
++If you change the key pair later, people will need to turn notifications on again on each of their devices.
++Notification links are built from `BASE_URL`, so set that too.
++
+ #### S3 storage (optional)
+ 
+ If you'd prefer that uploaded files were stored in an S3 bucket rather than in your mounted volume, you can set that up.
+diff --git a/docs/kamal-deployment.md b/docs/kamal-deployment.md
+index 5dcd257..8d1edd4 100644
+--- a/docs/kamal-deployment.md
++++ b/docs/kamal-deployment.md
+@@ -57,6 +57,7 @@ The values you enter here will be specific to you, and you can get or create the
+ 
+ - `SECRET_KEY_BASE` should be a long, random secret. You can run `bin/rails secret` to create a suitable value for this.
+ - `SMTP_USERNAME` & `SMTP_PASSWORD` should be valid credentials for your SMTP server. If you're using a 3rd-party service here, consult their documentation for what to use.
++- `VAPID_PUBLIC_KEY` & `VAPID_PRIVATE_KEY` (optional) enable web push notifications. Generate the pair with `bin/rails runner 'key = WebPush.generate_key; puts "VAPID_PUBLIC_KEY=#{key.public_key}", "VAPID_PRIVATE_KEY=#{key.private_key}"'`, then list both under `env/secret` in `config/deploy.yml`. Without both keys, the "This Device" section of notification settings is hidden.
+ Once you've made all those changes, commit them to your fork so they're saved.
+ 
+ ### Deploy Fizzy!
+diff --git a/test/controllers/notifications/settings_controller_test.rb b/test/controllers/notifications/settings_controller_test.rb
+index b5b554c..d13d5b4 100644
+--- a/test/controllers/notifications/settings_controller_test.rb
++++ b/test/controllers/notifications/settings_controller_test.rb
+@@ -13,6 +13,26 @@ class Notifications::SettingsControllerTest < ActionDispatch::IntegrationTest
+     assert_response :success
+   end
+ 
++  test "show offers to turn on notifications for this device when push is configured" do
++    Push::Subscription.stubs(:vapid_public_key).returns("public-key")
++    Push::Subscription.stubs(:vapid_private_key).returns("private-key")
++
++    get notifications_settings_path
++
++    assert_select ".hide-on-native[data-controller=notifications][data-notifications-vapid-public-key-value=?][data-notifications-subscriptions-url-value=?]",
++      "public-key", user_push_subscriptions_path(@user)
++  end
++
++  test "show leaves out this device when push is not configured" do
++    Push::Subscription.stubs(:vapid_public_key).returns(nil)
++    Push::Subscription.stubs(:vapid_private_key).returns(nil)
++
++    get notifications_settings_path
++
++    assert_response :success
++    assert_select "[data-controller=notifications]", count: 0
++  end
++
+   test "show as JSON" do
+     get notifications_settings_path, as: :json
+     assert_response :success
+diff --git a/test/controllers/pwa_controller_test.rb b/test/controllers/pwa_controller_test.rb
+index 0b391b8..b60d8cb 100644
+--- a/test/controllers/pwa_controller_test.rb
++++ b/test/controllers/pwa_controller_test.rb
+@@ -12,6 +12,14 @@ class PwaControllerTest < ActionDispatch::IntegrationTest
+     assert_match 'fetchOptions: { mode: "cors" }', response.body
+   end
+ 
++  test "service worker shows web push notifications and opens their card when tapped" do
++    untenanted { get "/service-worker.js" }
++
++    assert_response :success
++    assert_match 'addEventListener("push"', response.body
++    assert_match 'addEventListener("notificationclick"', response.body
++  end
++
+   test "service worker omits CORS fetch mode when disabled" do
+     switch_env "SERVICE_WORKER_CORS_ENABLED", "false" do
+       untenanted { get "/service-worker.js" }
+diff --git a/test/controllers/users/push_subscriptions_controller_test.rb b/test/controllers/users/push_subscriptions_controller_test.rb
+new file mode 100644
+index 0000000..80e9d72
+--- /dev/null
++++ b/test/controllers/users/push_subscriptions_controller_test.rb
+@@ -0,0 +1,68 @@
++require "test_helper"
++
++class Users::PushSubscriptionsControllerTest < ActionDispatch::IntegrationTest
++  setup do
++    @user = users(:david)
++    sign_in_as @user
++
++    SsrfProtection.stubs(:resolve_public_ip).returns("93.184.216.34")
++  end
++
++  test "create stores this device's subscription for the signed in user" do
++    assert_difference -> { @user.push_subscriptions.count }, 1 do
++      post user_push_subscriptions_path(@user), params: { push_subscription: subscription_params }, as: :json
++    end
++
++    assert_response :no_content
++
++    subscription = @user.push_subscriptions.last
++    assert_equal "https://push.example.com/send/abc123", subscription.endpoint
++    assert_equal "p256-key", subscription.p256dh_key
++    assert_equal "auth-key", subscription.auth_key
++    assert_equal accounts("37s"), subscription.account
++  end
++
++  test "create from a form redirects back to the notification settings" do
++    post user_push_subscriptions_path(@user), params: { push_subscription: subscription_params }
++
++    assert_redirected_to notifications_settings_path
++    assert_equal "Notifications turned on for this device", flash[:notice]
++  end
++
++  test "creating again for the same device does not duplicate it" do
++    post user_push_subscriptions_path(@user), params: { push_subscription: subscription_params }, as: :json
++
++    assert_no_difference -> { @user.push_subscriptions.count } do
++      post user_push_subscriptions_path(@user), params: { push_subscription: subscription_params.merge(auth_key: "rotated") }, as: :json
++    end
++
++    assert_equal "rotated", @user.push_subscriptions.last.auth_key
++  end
++
++  test "users cannot subscribe devices for someone else" do
++    assert_no_difference -> { Push::Subscription.count } do
++      post user_push_subscriptions_path(users(:kevin)), params: { push_subscription: subscription_params }, as: :json
++    end
++
++    assert_response :forbidden
++  end
++
++  test "an endpoint that is not https is rejected" do
++    assert_no_difference -> { Push::Subscription.count } do
++      post user_push_subscriptions_path(@user), params: { push_subscription: subscription_params.merge(endpoint: "http://push.example.com/send/abc123") }, as: :json
++    end
++
++    assert_response :unprocessable_entity
++  end
++
++  test "a request without a subscription is a bad request" do
++    post user_push_subscriptions_path(@user), params: {}, as: :json
++
++    assert_response :bad_request
++  end
++
++  private
++    def subscription_params
++      { endpoint: "https://push.example.com/send/abc123", p256dh_key: "p256-key", auth_key: "auth-key" }
++    end
++end
+diff --git a/test/models/notification/push_test.rb b/test/models/notification/push_test.rb
+new file mode 100644
+index 0000000..85ead7e
+--- /dev/null
++++ b/test/models/notification/push_test.rb
+@@ -0,0 +1,97 @@
++require "test_helper"
++
++class Notification::PushTest < ActiveSupport::TestCase
++  setup do
++    SsrfProtection.stubs(:resolve_public_ip).returns("93.184.216.34")
++    Push::Subscription.stubs(:vapid_public_key).returns("public-key")
++    Push::Subscription.stubs(:vapid_private_key).returns("private-key")
++
++    users(:kevin).push_subscriptions.create!(endpoint: "https://push.example.com/kevin", p256dh_key: "p256", auth_key: "auth")
++  end
++
++  test "a notification that lands in the tray queues a push for the user" do
++    notifications(:layout_commented_kevin).destroy
++
++    assert_enqueued_with(job: Notification::PushJob) do
++      Notifier.for(events(:layout_commented)).notify
++    end
++  end
++
++  test "nothing is queued for users without a subscription" do
++    users(:kevin).push_subscriptions.delete_all
++
++    assert_no_enqueued_jobs only: Notification::PushJob do
++      Notifier.for(events(:layout_commented)).notify
++    end
++  end
++
++  test "nothing is queued when push is not configured" do
++    Push::Subscription.stubs(:enabled?).returns(false)
++
++    assert_no_enqueued_jobs only: Notification::PushJob do
++      Notifier.for(events(:layout_commented)).notify
++    end
++  end
++
++  test "new activity on an existing notification pushes again" do
++    notification = notifications(:layout_commented_kevin)
++
++    assert_enqueued_with(job: Notification::PushJob, args: [ notification ]) do
++      notification.update!(source: events(:layout_published))
++    end
++  end
++
++  test "marking a notification read or unread does not push" do
++    notification = notifications(:layout_commented_kevin)
++
++    assert_no_enqueued_jobs only: Notification::PushJob do
++      notification.read
++      notification.unread
++    end
++  end
++
++  test "the push says what the tray says and opens the comment it's about" do
++    comment = comments(:layout_overflowing_david)
++
++    payload = pushed_payload_for(notifications(:layout_commented_kevin))
++
++    assert_equal "RE: Layout is broken", payload["title"]
++    assert_equal comment.body.to_plain_text.truncate(200), payload["body"]
++    assert_equal card_url(cards(:layout), anchor: ActionView::RecordIdentifier.dom_id(comment)), payload["url"]
++    assert_equal "card-#{cards(:layout).id}", payload["tag"]
++  end
++
++  test "a mention says who mentioned the user and opens where they were mentioned" do
++    users(:david).push_subscriptions.create!(endpoint: "https://push.example.com/david", p256dh_key: "p256", auth_key: "auth")
++    notification = notifications(:logo_mentioned_david)
++    mention = notification.source
++
++    payload = pushed_payload_for(notification)
++
++    assert_equal "#{mention.mentioner.first_name} @mentioned you", payload["title"]
++    assert_equal mention.source.mentionable_content.truncate(200), payload["body"]
++    assert_equal card_url(cards(:logo), anchor: ActionView::RecordIdentifier.dom_id(mention.source)), payload["url"]
++  end
++
++  test "the push job delivers the notification" do
++    notification = notifications(:layout_commented_kevin)
++
++    Notification.any_instance.expects(:deliver_push)
++
++    Notification::PushJob.perform_now(notification)
++  end
++
++  private
++    def pushed_payload_for(notification)
++      payload = nil
++      Push::Subscription.any_instance.expects(:push).with { |json| payload = JSON.parse(json) }
++
++      notification.deliver_push
++
++      payload
++    end
++
++    def card_url(card, **options)
++      Rails.application.routes.url_helpers.card_url(card, host: "example.com", script_name: accounts("37s").slug, **options)
++    end
++end
+diff --git a/test/models/push/subscription_test.rb b/test/models/push/subscription_test.rb
+new file mode 100644
+index 0000000..55eb6d2
+--- /dev/null
++++ b/test/models/push/subscription_test.rb
+@@ -0,0 +1,176 @@
++require "test_helper"
++
++class Push::SubscriptionTest < ActiveSupport::TestCase
++  ENDPOINT = "https://push.example.com/send/abc123".freeze
++
++  setup do
++    @user = users(:david)
++    SsrfProtection.stubs(:resolve_public_ip).returns("93.184.216.34")
++    Push::Subscription.stubs(:vapid_public_key).returns("public-key")
++    Push::Subscription.stubs(:vapid_private_key).returns("private-key")
++  end
++
++  test "enabled only when both VAPID keys are configured" do
++    assert Push::Subscription.enabled?
++
++    Push::Subscription.stubs(:vapid_private_key).returns(nil)
++    assert_not Push::Subscription.enabled?
++  end
++
++  test "register stores the browser's subscription for the user and their account" do
++    subscription = register
++
++    assert_equal @user, subscription.user
++    assert_equal accounts("37s"), subscription.account
++    assert_equal "p256-key", subscription.p256dh_key
++    assert_equal "auth-key", subscription.auth_key
++    assert_equal "Chrome", subscription.user_agent
++  end
++
++  test "registering the same endpoint again updates the keys instead of duplicating" do
++    register
++    register(p256dh_key: "new-p256", auth_key: "new-auth")
++
++    assert_equal 1, @user.push_subscriptions.where(endpoint: ENDPOINT).count
++    assert_equal "new-p256", @user.push_subscriptions.find_by(endpoint: ENDPOINT).p256dh_key
++  end
++
++  test "registering takes the endpoint away from other identities that had it" do
++    Push::Subscription.register(user: users(:kevin), **subscription_attributes)
++    register
++
++    assert_not users(:kevin).push_subscriptions.exists?(endpoint: ENDPOINT)
++    assert @user.push_subscriptions.exists?(endpoint: ENDPOINT)
++  end
++
++  test "registering keeps the endpoint for other accounts of the same identity" do
++    other_account_user = User.create!(account: accounts("initech"), identity: @user.identity, name: "David")
++
++    register
++    Push::Subscription.register(user: other_account_user, **subscription_attributes)
++
++    assert @user.push_subscriptions.exists?(endpoint: ENDPOINT)
++    assert other_account_user.push_subscriptions.exists?(endpoint: ENDPOINT)
++  end
++
++  test "a rejected registration leaves other identities' subscriptions alone" do
++    Push::Subscription.register(user: users(:kevin), **subscription_attributes)
++
++    assert_raises ActiveRecord::RecordInvalid do
++      register(endpoint: "http://push.example.com/send/abc123")
++    end
++
++    assert users(:kevin).push_subscriptions.exists?(endpoint: ENDPOINT)
++  end
++
++  test "endpoints must be https" do
++    assert_raises(ActiveRecord::RecordInvalid) { register(endpoint: "http://push.example.com/send/abc123") }
++  end
++
++  test "endpoints must not point at non-public hosts" do
++    SsrfProtection.stubs(:resolve_public_ip).returns(nil)
++
++    assert_raises(ActiveRecord::RecordInvalid) { register(endpoint: "https://intranet.example.com/send/abc123") }
++  end
++
++  test "creating a subscription directly, as importing old ones does, doesn't look up its host" do
++    SsrfProtection.expects(:resolve_public_ip).never
++
++    subscription = @user.push_subscriptions.create!(endpoint: ENDPOINT, p256dh_key: "p256-key", auth_key: "auth-key")
++
++    assert subscription.persisted?
++  end
++
++  test "endpoints must be URLs" do
++    assert_raises(ActiveRecord::RecordInvalid) { register(endpoint: "not a url") }
++  end
++
++  test "push sends the payload to the endpoint, signed with the VAPID keys" do
++    subscription = register
++
++    WebPush.expects(:payload_send).with(has_entries(
++      message: '{"title":"Hi"}',
++      endpoint: ENDPOINT,
++      p256dh: "p256-key",
++      auth: "auth-key",
++      vapid: has_entries(public_key: "public-key", private_key: "private-key", subject: "mailto:support@fizzy.do")
++    ))
++
++    subscription.push('{"title":"Hi"}')
++  end
++
++  test "push posts an encrypted message that the push service can verify came from us" do
++    vapid_key = WebPush.generate_key
++    Push::Subscription.stubs(:vapid_public_key).returns(vapid_key.public_key)
++    Push::Subscription.stubs(:vapid_private_key).returns(vapid_key.private_key)
++
++    browser_key = OpenSSL::PKey::EC.generate("prime256v1")
++    subscription = register(
++      p256dh_key: WebPush.encode64(browser_key.public_key.to_bn.to_s(2)),
++      auth_key: WebPush.encode64(SecureRandom.random_bytes(16))
++    )
++    stub_request(:post, ENDPOINT).to_return(status: 201)
++
++    subscription.push('{"title":"Hi"}')
++
++    assert_requested :post, ENDPOINT do |request|
++      request.headers["Content-Encoding"] == "aes128gcm" &&
++        request.headers["Ttl"] == 1.day.to_i.to_s &&
++        request.headers["Authorization"].match?(/\Avapid t=[^,]+,k=#{vapid_key.public_key.delete("=")}\z/)
++    end
++  end
++
++  test "push removes the subscription when the push service says it has expired" do
++    subscription = register
++    WebPush.stubs(:payload_send).raises(WebPush::ExpiredSubscription.new(push_service_response, "push.example.com"))
++
++    assert_difference -> { Push::Subscription.count }, -1 do
++      subscription.push("{}")
++    end
++  end
++
++  test "push removes the subscription when the push service says it is invalid" do
++    subscription = register
++    WebPush.stubs(:payload_send).raises(WebPush::InvalidSubscription.new(push_service_response, "push.example.com"))
++
++    assert_difference -> { Push::Subscription.count }, -1 do
++      subscription.push("{}")
++    end
++  end
++
++  test "push reports a device it cannot reach without stopping the others" do
++    subscription = register
++    WebPush.stubs(:payload_send).raises(Net::OpenTimeout)
++
++    Rails.error.expects(:report).with(instance_of(Net::OpenTimeout), handled: true, severity: :warning, context: { push_subscription_id: subscription.id })
++
++    assert_no_difference -> { Push::Subscription.count } do
++      subscription.push("{}")
++    end
++  end
++
++  test "push keeps the subscription and reports other push service failures" do
++    subscription = register
++    error = WebPush::PushServiceError.new(push_service_response, "push.example.com")
++    WebPush.stubs(:payload_send).raises(error)
++
++    Rails.error.expects(:report).with(error, handled: true, severity: :warning, context: { push_subscription_id: subscription.id })
++
++    assert_no_difference -> { Push::Subscription.count } do
++      subscription.push("{}")
++    end
++  end
++
++  private
++    def push_service_response
++      stub("push service response", body: "")
++    end
++
++    def register(**overrides)
++      Push::Subscription.register(user: @user, **subscription_attributes, **overrides)
++    end
++
++    def subscription_attributes
++      { endpoint: ENDPOINT, p256dh_key: "p256-key", auth_key: "auth-key", user_agent: "Chrome" }
++    end
++end
+diff --git a/test/models/user_test.rb b/test/models/user_test.rb
+index 9e5d2bd..4051176 100644
+--- a/test/models/user_test.rb
++++ b/test/models/user_test.rb
+@@ -33,6 +33,18 @@ class UserTest < ActiveSupport::TestCase
+     end
+   end
+ 
++  test "deactivate stops push notifications to the user's devices" do
++    SsrfProtection.stubs(:resolve_public_ip).returns("93.184.216.34")
++    users(:jz).push_subscriptions.create!(endpoint: "https://push.example.com/jz", p256dh_key: "p256", auth_key: "auth")
++
++    users(:jz).tap do |user|
++      user.stubs(:close_remote_connections)
++      user.deactivate
++    end
++
++    assert_empty users(:jz).push_subscriptions.reload
++  end
++
+   test "initials" do
+     assert_equal "JF", User.new(name: "jason fried").initials
+     assert_equal "DHH", User.new(name: "David Heinemeier Hansson").initials
+diff --git a/test/system/notifications_settings_test.rb b/test/system/notifications_settings_test.rb
+new file mode 100644
+index 0000000..3092ba6
+--- /dev/null
++++ b/test/system/notifications_settings_test.rb
+@@ -0,0 +1,110 @@
++require "application_system_test_case"
++
++class NotificationsSettingsTest < ApplicationSystemTestCase
++  # Headless Chromium can't reach a push service, so PushManager is stubbed in the page.
++  # Everything else (permission, the Stimulus controller, the request to Fizzy) is real.
++  setup do
++    key = WebPush.generate_key
++    Push::Subscription.stubs(:vapid_public_key).returns(key.public_key)
++    Push::Subscription.stubs(:vapid_private_key).returns(key.private_key)
++    SsrfProtection.stubs(:resolve_public_ip).returns("93.184.216.34")
++
++    sign_in_as users(:david)
++  end
++
++  teardown do
++    page.driver.browser.execute_cdp("Browser.resetPermissions") rescue nil
++    remove_fake_push_api
++  end
++
++  test "a browser that has not decided yet is offered the button, without the help for blocked browsers" do
++    add_fake_push_api(subscribed: false)
++    visit notifications_settings_url
++
++    assert_button "Turn on notifications"
++    assert_no_selector "[data-notifications-target=details]", visible: :visible
++  end
++
++  test "turning on notifications for this device hands the subscription to Fizzy" do
++    add_fake_push_api(subscribed: false)
++    visit notifications_settings_url
++    grant_notification_permission
++
++    click_on "Turn on notifications"
++
++    assert_text "Notifications are on for this device."
++    assert_equal 1, users(:david).push_subscriptions.count
++    assert_equal "auth-key", users(:david).push_subscriptions.last.auth_key
++  end
++
++  test "a device that is already subscribed is kept in sync each time settings are visited" do
++    add_fake_push_api(subscribed: true)
++    visit notifications_settings_url
++    grant_notification_permission
++    visit notifications_settings_url
++
++    assert_text "Notifications are on for this device."
++    assert_equal 1, users(:david).push_subscriptions.count
++  end
++
++  test "a subscription Fizzy refuses is not shown as turned on" do
++    SsrfProtection.stubs(:resolve_public_ip).returns(nil)
++    add_fake_push_api(subscribed: false)
++    visit notifications_settings_url
++    grant_notification_permission
++
++    click_on "Turn on notifications"
++
++    assert_button "Turn on notifications"
++    assert_no_text "Notifications are on for this device."
++    assert_equal 0, users(:david).push_subscriptions.count
++  end
++
++  test "browsers that block notifications are shown how to turn them back on" do
++    add_fake_push_api(subscribed: false)
++    visit notifications_settings_url
++    deny_notification_permission
++    visit notifications_settings_url
++
++    assert_text "Turn on notifications for this website."
++    assert_no_button "Turn on notifications"
++    assert_equal 0, users(:david).push_subscriptions.count
++  end
++
++  private
++    def add_fake_push_api(subscribed:)
++      @fake_push_script_id = page.driver.browser.execute_cdp(
++        "Page.addScriptToEvaluateOnNewDocument", source: fake_push_api(subscribed: subscribed)
++      )["identifier"]
++    end
++
++    def fake_push_api(subscribed:)
++      <<~JS
++        window.__pushSubscribed = #{subscribed}
++        const subscription = {
++          endpoint: "https://push.example.com/send/browser",
++          toJSON() { return { endpoint: this.endpoint, keys: { p256dh: "p256-key", auth: "auth-key" } } },
++          async unsubscribe() { window.__pushSubscribed = false; return true }
++        }
++        PushManager.prototype.subscribe = async () => { window.__pushSubscribed = true; return subscription }
++        PushManager.prototype.getSubscription = async () => window.__pushSubscribed ? subscription : null
++      JS
++    end
++
++    def remove_fake_push_api
++      return unless @fake_push_script_id
++      page.driver.browser.execute_cdp("Page.removeScriptToEvaluateOnNewDocument", identifier: @fake_push_script_id)
++      @fake_push_script_id = nil
++    end
++
++    def grant_notification_permission
++      page.driver.browser.execute_cdp("Browser.grantPermissions", origin: page.evaluate_script("location.origin"), permissions: [ "notifications" ])
++      visit notifications_settings_url
++    end
++
++    def deny_notification_permission
++      page.driver.browser.execute_cdp("Browser.setPermission",
++        origin: page.evaluate_script("location.origin"),
++        permission: { name: "notifications" }, setting: "denied")
++    end
++end

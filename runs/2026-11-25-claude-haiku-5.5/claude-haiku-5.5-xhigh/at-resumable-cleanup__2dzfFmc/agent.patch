@@ -1,0 +1,228 @@
+diff --git a/app/jobs/title_cleanup_job.rb b/app/jobs/title_cleanup_job.rb
+index 13721ed..aee5039 100644
+--- a/app/jobs/title_cleanup_job.rb
++++ b/app/jobs/title_cleanup_job.rb
+@@ -1,8 +1,23 @@
+ class TitleCleanupJob < ApplicationJob
++  # The legacy exporter wrapped every leaf title in quotes. Deploys interrupt
++  # this job partway through, so it checkpoints its progress per leaf: the title
++  # update and the cursor advance commit in one transaction. A restart therefore
++  # redoes at most the leaf that was in flight, and no title is cleaned twice.
+   def perform
+-    Leaf.find_each(order: :asc) do |leaf|
+-      leaf.update!(title: cleaned(leaf.title))
++    progress = JobProgress.for(self.class)
++    return if progress.completed?
++
++    Leaf.where("id > ?", progress.cursor).find_each do |leaf|
++      progress.with_lock do
++        # Another run may have committed this leaf while we were reading it.
++        next unless leaf.id > progress.cursor
++
++        leaf.update!(title: cleaned(leaf.title))
++        progress.update!(cursor: leaf.id)
++      end
+     end
++
++    progress.update!(completed_at: Time.current)
+   end
+ 
+   private
+diff --git a/app/models/job_progress.rb b/app/models/job_progress.rb
+new file mode 100644
+index 0000000..4040146
+--- /dev/null
++++ b/app/models/job_progress.rb
+@@ -0,0 +1,15 @@
++# Durable checkpoint for a job that walks a collection and can be interrupted.
++#
++# +cursor+ is the id of the last record whose work has been committed, and
++# +completed_at+ is set once the whole run has finished. Jobs must write the
++# cursor in the same transaction as the work it describes, so a restart
++# resumes from exactly the first record that was not committed.
++class JobProgress < ApplicationRecord
++  def self.for(job_class)
++    create_or_find_by!(name: job_class.name)
++  end
++
++  def completed?
++    completed_at.present?
++  end
++end
+diff --git a/db/migrate/20261119160958_create_job_progresses.rb b/db/migrate/20261119160958_create_job_progresses.rb
+new file mode 100644
+index 0000000..e304069
+--- /dev/null
++++ b/db/migrate/20261119160958_create_job_progresses.rb
+@@ -0,0 +1,11 @@
++class CreateJobProgresses < ActiveRecord::Migration[8.2]
++  def change
++    create_table :job_progresses do |t|
++      t.string :name, null: false
++      t.integer :cursor, null: false, default: 0
++      t.datetime :completed_at
++      t.timestamps
++      t.index :name, unique: true
++    end
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index e033199..f1d3371 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.0].define(version: 2024_09_28_005927) do
++ActiveRecord::Schema[8.0].define(version: 2026_11_19_160958) do
+   create_table "accesses", force: :cascade do |t|
+     t.integer "user_id", null: false
+     t.integer "book_id", null: false
+@@ -94,6 +94,15 @@ ActiveRecord::Schema[8.0].define(version: 2024_09_28_005927) do
+     t.index ["leafable_type", "leafable_id"], name: "index_edits_on_leafable"
+   end
+ 
++  create_table "job_progresses", force: :cascade do |t|
++    t.string "name", null: false
++    t.integer "cursor", default: 0, null: false
++    t.datetime "completed_at"
++    t.datetime "created_at", null: false
++    t.datetime "updated_at", null: false
++    t.index ["name"], name: "index_job_progresses_on_name", unique: true
++  end
++
+   create_table "leaves", force: :cascade do |t|
+     t.integer "book_id", null: false
+     t.string "leafable_type", null: false
+diff --git a/test/jobs/title_cleanup_job_test.rb b/test/jobs/title_cleanup_job_test.rb
+new file mode 100644
+index 0000000..53bd062
+--- /dev/null
++++ b/test/jobs/title_cleanup_job_test.rb
+@@ -0,0 +1,125 @@
++require "test_helper"
++
++class TitleCleanupJobTest < ActiveSupport::TestCase
++  Interrupted = Class.new(StandardError)
++
++  # Stands in for a deploy killing the worker at a chosen point of one leaf's cleanup:
++  #   :before_title      - before the leaf's title is written
++  #   :before_checkpoint - after the title is written, before the progress cursor is
++  class << self
++    attr_accessor :kill_stage, :kill_leaf_id
++
++    def kill_if(stage, leaf_id)
++      raise Interrupted, "killed #{stage} of leaf #{leaf_id}" if kill_stage == stage && kill_leaf_id == leaf_id
++    end
++  end
++
++  module KillableLeaf
++    def update!(...)
++      TitleCleanupJobTest.kill_if(:before_title, id)
++      super
++    end
++  end
++  Leaf.prepend KillableLeaf
++
++  module KillableCheckpoint
++    def update!(attributes)
++      TitleCleanupJobTest.kill_if(:before_checkpoint, attributes[:cursor])
++      super
++    end
++  end
++  JobProgress.prepend KillableCheckpoint
++
++  setup do
++    # The legacy exporter wrapped every title in quotes. The second title also
++    # legitimately opens with a quoted phrase, so its inner quotes must survive.
++    @leaves = Leaf.order(:id).to_a
++    @leaves.each_with_index { |leaf, i| leaf.update_column(:title, %("Chapter #{i + 1}")) }
++    @leaves[1].update_column(:title, %("\"Quoted\" phrase in the title"))
++    @exported = titles
++
++    @cleaned = [ "Chapter 1", %("Quoted" phrase in the title), "Chapter 3", "Chapter 4" ]
++  end
++
++  teardown do
++    TitleCleanupJobTest.kill_stage = nil
++    TitleCleanupJobTest.kill_leaf_id = nil
++  end
++
++  test "cleans the exporter's wrapping quotes from every title and keeps inner quotes" do
++    TitleCleanupJob.perform_now
++
++    assert_equal @cleaned, titles
++  end
++
++  test "after an interruption, resuming cleans each title exactly once" do
++    interrupt_job_at @leaves[2], :before_title
++    assert_equal [ @cleaned[0], @cleaned[1], @exported[2], @exported[3] ], titles,
++      "leaves before the interrupted one are cleaned; the interrupted one is left untouched"
++
++    TitleCleanupJob.perform_now
++
++    assert_equal @cleaned, titles
++  end
++
++  test "survives repeated interruptions" do
++    interrupt_job_at @leaves[1], :before_title
++    interrupt_job_at @leaves[3], :before_title
++
++    TitleCleanupJob.perform_now
++
++    assert_equal @cleaned, titles
++  end
++
++  test "a title is only cleaned together with its progress checkpoint" do
++    interrupt_job_at @leaves[1], :before_checkpoint
++    assert_equal [ "Chapter 1", @exported[1], %("Chapter 3"), %("Chapter 4") ], titles,
++      "the title written just before the checkpoint must roll back with it"
++
++    TitleCleanupJob.perform_now
++
++    assert_equal @cleaned, titles
++  end
++
++  test "a batch that still holds an already-committed leaf does not clean it again" do
++    interrupt_job_at @leaves[2], :before_title
++    batch = Leaf.order(:id).to_a # titles as they stand now: the first two are already cleaned
++
++    with_loaded_batch(batch) { TitleCleanupJob.perform_now }
++
++    assert_equal @cleaned, titles
++  end
++
++  test "a leaf added after a completed run is not touched by a later run" do
++    TitleCleanupJob.perform_now
++    added = books(:handbook).press(Page.new(body: "Added later"), title: %("\"Quoted\" added later"))
++
++    TitleCleanupJob.perform_now
++
++    assert_equal %("\"Quoted\" added later"), added.reload.title
++  end
++
++  private
++    def titles
++      @leaves.map { |leaf| leaf.reload.title }
++    end
++
++    # Makes the job walk `records` as its batch, as a run that loaded its batch
++    # before another run committed some of those leaves would.
++    def with_loaded_batch(records)
++      batch = Struct.new(:records) { def find_each(&block) = records.each(&block) }.new(records)
++      Leaf.define_singleton_method(:where) { |*| batch }
++      yield
++    ensure
++      Leaf.singleton_class.remove_method(:where)
++    end
++
++    def interrupt_job_at(leaf, stage)
++      TitleCleanupJobTest.kill_leaf_id = leaf.id
++      TitleCleanupJobTest.kill_stage = stage
++      assert_raises(Interrupted) { TitleCleanupJob.perform_now }
++    ensure
++      TitleCleanupJobTest.kill_stage = nil
++      TitleCleanupJobTest.kill_leaf_id = nil
++    end
++end

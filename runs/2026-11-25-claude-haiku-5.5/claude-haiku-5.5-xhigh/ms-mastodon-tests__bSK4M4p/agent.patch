@@ -1,0 +1,949 @@
+diff --git a/config/environments/test.rb b/config/environments/test.rb
+index 12709d5..17f308d 100644
+--- a/config/environments/test.rb
++++ b/config/environments/test.rb
+@@ -22,6 +22,10 @@ Rails.application.configure do
+   # Show full error reports and disable caching.
+   config.consider_all_requests_local = true
+   config.action_controller.perform_caching = false
++  # At debug level every SQL query (and its binds) is formatted and written to the
++  # test log, which costs a noticeable share of the suite run time. Keep the default
++  # quieter; set RAILS_LOG_LEVEL=debug to get the SQL logs back when debugging.
++  config.log_level = ENV.fetch('RAILS_LOG_LEVEL', 'info')
+   config.cache_store = :memory_store
+ 
+   # Render exception templates for rescuable exceptions and raise for other exceptions.
+diff --git a/docs/rspec-performance.md b/docs/rspec-performance.md
+new file mode 100644
+index 0000000..581d6cd
+--- /dev/null
++++ b/docs/rspec-performance.md
+@@ -0,0 +1,735 @@
++# RSpec suite performance: notes, baselines and plan
++
++Living document for the "make the suite fast again" effort. Update the
++numbers and the phase log whenever a change is measured.
++
++- Goal: the full RSpec run (serial, no parallelisation) on CI had grown past
++  10 minutes.
++- Phase 1: `spec/models`. Target: at least 30-35% faster. **Done: about 61%
++  faster** (see results).
++- Phase 2: `spec/requests`. **Done: about 47% faster (paired), about 50% in
++  single runs.** Combined with models the suite is about 2.2x faster than the
++  baseline, which meets the 2x target (see "Phase 2").
++- Phase 3: factories (`spec/fabricators`, `spec/support`). **Done: models about
++  26% faster, requests about 20% faster (paired), combined about 22%.** With phases
++  1 and 2 the suite is now about 3x faster than the original baseline (about 306 s
++  paired, now about 103 s). See "Phase 3".
++- Constraints that applied in every phase: no app code changes that alter
++  runtime behaviour, no changes to what examples assert, system and streaming
++  specs ignored. Factories changed only in phase 3, and only the default records
++  and the password digest (see "Phase 3").
++
++## How to measure
++
++```bash
++cd /app
++bundle exec rspec spec/models --seed 4242 --format progress --format json --out tmp/perf/models.json
++```
++
++- Always pass a fixed `--seed`. `config.order = 'random'` makes the order
++  (and therefore the cost of shared state) differ otherwise.
++- Read the timing from the JSON: `summary.duration` is the sum of example time
++  and matches wall-clock minus about 2-3 s of boot. Do not use the console
++  "Finished in" line for comparisons.
++- Run one `rspec` process at a time. Runs share the `mastodon_test` database
++  and the Redis keyspace (`config.after` flushes Redis keys), so concurrent runs
++  corrupt each other.
++- This container is noisy: the same code and seed varied by about 10-20%
++  between runs (models: 48.0 s and 58.4 s; requests: 135 s and 173 s). For any
++  claim, interleave a pristine run and a changed run (see "Paired runs").
++- `log/test.log` grows by about 100 MB per models run at debug level. After the
++  phase 1 log-level change it stays small by default. Truncate it when needed.
++- Tools that are not on this box: `python3`, `bc`. Use Ruby for JSON analysis.
++
++Environment during the measurements (container, shared VM host):
++Ruby 4.0.6, Rails 8.1.3.1, rspec-core 3.13.6, rspec-rails 8.0.4,
++rspec-mocks 3.13.8, sidekiq 8.1.6, fabrication 3.0.0, kt-paperclip 8.0.0,
++bcrypt 3.1.22, devise 5.0.4, PostgreSQL 17 (unix socket, `mastodon_test`),
++local redis-server, 12 vCPU aarch64. `CI` was unset, so `eager_load` was off
++(as in a normal local run).
++
++### Paired runs (how to compare pristine vs changed)
++
++Stash only `config` and `spec`. A plain `git stash push -u` also stashes the
++untracked `docs/` folder, which holds this file.
++
++```bash
++git stash push -u -m perf-current -- config spec   # -u includes new support files
++bundle exec rspec spec/models --seed 4242 --format json --out tmp/perf/pristine.json
++git stash pop
++bundle exec rspec spec/models --seed 4242 --format json --out tmp/perf/current.json
++```
++
++Leave `RAILS_LOG_LEVEL` unset. Setting it to an empty string breaks the Sidekiq
++initializer (`Logger.const_get('')`), and the run fails after about 3 s.
++Make sure `git stash list` is empty afterwards. Repeat the pair at least twice.
++
++### Analysis snippets (not part of the repo)
++
++Per-file and per-example breakdown from the JSON report:
++
++```ruby
++require 'json'
++d = JSON.parse(File.read(ARGV[0]))
++s = d['summary']
++puts "examples=#{s['example_count']} failures=#{s['failure_count']} duration=#{s['duration'].round(2)}s"
++per_file = Hash.new(0.0)
++d['examples'].each { |e| per_file[e['file_path'].sub(%r{^\./}, '')] += e['run_time'] }
++per_file.sort_by { |_, v| -v }.first(25).each { |f, t| printf("%8.2fs  %s\n", t, f) }
++```
++
++Sampling profile with StackProf, loaded via `rspec -r`. Use CPU mode with
++aggregated output (`raw: false`, `interval: 1000`): the dump is about 2 MB. Wall
++mode with raw samples at 500 us produced a 966 MB dump, which ran out of memory
++when loaded. Wall mode also inflated some files by up to 14x, so take timings
++from the unprofiled JSON and use the profile only for shares.
++
++```ruby
++# tmp/profile_hook.rb, load with: bundle exec rspec spec/requests -r ./tmp/profile_hook.rb
++require 'stackprof'
++RSpec.configure do |config|
++  config.before(:suite) { StackProf.start(mode: :cpu, raw: false, interval: 1000) }
++  config.after(:suite)  { StackProf.stop; StackProf.results('tmp/stackprof.dump') }
++end
++```
++
++Then aggregate the dump by source (gem, app, spec support, factories) with a
++short script over `Marshal.load(File.binread(dump))[:frames]` (self samples
++by `:file`), and look at inclusive totals for suspicious method names
++(`serialize_event`, `LogSubscriber#sql`, `BacktraceCleaner`, `BCrypt`,
++`Paperclip::Processor.make`, `Fabrication::Generator::Base#create`, ...).
++
++SQL shape per run: subscribe to `sql.active_record`, normalise literals out of
++the SQL (`gsub(/'(?:[^']|'')*'/, '?').gsub(/\b\d+\b/, '?')`), count templates and
++queries per example. Do this in a temporary hook, never in the repo.
++
++Factory profile (phase 3). Exclusive time (children subtracted), creates and builds,
++and SQL statements per fabricator. Save the block as `tmp/perf/doc_factory_hook.rb`
++  (git-ignored) and load it with `-r`. It is a measurement tool only.
++Expect the example time to be the same with or without it (within noise).
++
++```ruby
++# Load with: bundle exec rspec spec/models -r ./tmp/perf/doc_factory_hook.rb
++# Measurement only. Prints exclusive time, creates/builds and SQL per fabricator.
++module FactoryHook
++  Stat = Struct.new(:create, :build, :excl, :incl, :queries, keyword_init: true)
++  @stack = []
++  @stats = Hash.new { |h, k| h[k] = Stat.new(create: 0, build: 0, excl: 0.0, incl: 0.0, queries: 0) }
++  class << self
++    attr_reader :stack, :stats
++  end
++
++  def self.measure(kind, name)
++    st = stats[name.to_s]
++    st.public_send(:"#{kind}=", st.public_send(kind) + 1)
++    t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
++    stack.push([name.to_s, 0.0])
++    begin
++      yield
++    ensure
++      _, child = stack.pop
++      dt = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0
++      st.incl += dt
++      st.excl += dt - child
++      stack.last[1] += dt if stack.last
++    end
++  end
++
++  module Wrap
++    def create(name, *, **, &) = FactoryHook.measure(:create, name) { super }
++    def build(name, *, **, &) = FactoryHook.measure(:build, name) { super }
++  end
++end
++
++RSpec.configure do |config|
++  config.before(:suite) do
++    Fabricate.singleton_class.prepend(FactoryHook::Wrap)
++    ActiveSupport::Notifications.subscribe('sql.active_record') do |*args|
++      ev = ActiveSupport::Notifications::Event.new(*args)
++      next if ev.payload[:name] == 'SCHEMA' || ev.payload[:cached]
++      owner = FactoryHook.stack.last
++      FactoryHook.stats[owner[0]].queries += 1 if owner
++    end
++  end
++
++  config.after(:suite) do
++    FactoryHook.stats.sort_by { |_, s| -s.excl }.first(20).each do |name, s|
++      puts format('%-28s create %5d build %5d excl %6.2fs queries %6d', name, s.create, s.build, s.excl, s.queries)
++    end
++  end
++end
++```
++
++## Baseline (before any change)
++
++| Group | Examples | Example time (JSON `duration`) | Notes |
++|---|---:|---:|---|
++| `spec/models` | 1795 | 133.98 s single run, 129.40 s and 127.30 s paired | seed 4242, 0 failures |
++| `spec/requests` | 1877 | 165.12 s single run, 177.69 s paired | seed 4242, 0 failures |
++
++Combined baseline: about 300 s (models 134 + requests 165, single runs) or
++about 306 s from the paired pristine runs. The 2x target for the final state
++is therefore about 150 s combined.
++
++Heaviest files at baseline (single run):
++
++- models: `account_statuses_cleanup_policy_spec` 12.1 s (36 ex),
++  `tag_feed_spec` 11.2 s (33), `trends/statuses_spec` 11.2 s (12),
++  `status_spec` 10.5 s (62), `public_feed_spec` 7.3 s (43),
++  `threading_concern_spec` 5.9 s (16), `notification_spec` 5.7 s (25),
++  `media_attachment_spec` 5.4 s (27).
++- requests: `cache_spec.rb` 35.6 s (258 ex), `activitypub/replies_spec.rb`
++  14.8 s (45), `support/examples/api.rb` shared examples 13.7 s (239),
++  `api/v2/notifications_spec.rb` 7.2 s (24), `signature_verification_spec.rb`
++  6.3 s (30), `api/v1/notifications_spec.rb` 5.1 s (17).
++
++## Phase 1 (spec/models): what was wrong and what changed
++
++Three shared problems explained nearly all of the models overhead. Shares below
++are from StackProf sample counts on the same seed.
++
++### 1. A spec leaked `ActiveRecord.verbose_query_logs = true` into the whole run
++
++`spec/models/concerns/status/fetch_replies_concern_spec.rb` assigned the global
++at load time (in the `describe` body), so it was in effect for every example in
++the process. With verbose query logs on, ActiveRecord computes the caller
++source location of every SQL query by walking the backtrace
++(`ActiveSupport::BacktraceCleaner#first_clean_frame` and
++`Thread.each_caller_location`). That was about 30% of all samples.
++
++Fix: scope the setting to that group with an `around` hook that restores the
++previous value. The spec's assertions are unchanged.
++
++Rule for future specs: never assign global configuration in a `describe` body
++or at file load time. Use an `around` hook that restores the old value.
++
++### 2. Every local status, account, report and user event serialized its webhook payload for nothing
++
++`WebhookService#call` builds the full ActiveModelSerializers payload
++(`serialize_event`) before it asks which enabled webhooks subscribe to the
++event. Specs create lots of local records with no webhook configured, so the
++payload was computed and thrown away. Serialization alone was about 24.5% of
++samples and about 35k of the roughly 114k SQL queries per run (serializers load
++`account_stats`, `user_roles`, `user_ips`, `user_invite_requests`, ...).
++
++Fix (test-only, `spec/support/skip_unsubscribed_webhook_serialization.rb`): a
++prepended module skips `serialize_event` when no enabled webhook subscribes to
++the event. The subscriber lookup still runs, so the enqueued delivery jobs and
++the return value are unchanged. The shortcut is switched on by an `around`
++hook for `type: :model` only, so other spec types are not affected in this
++phase. Its own check (not committed) covered: no subscriber means no
++serialization and no enqueue; an enabled subscriber still serializes and
++enqueues; a disabled subscriber counts as no subscriber.
++
++The production code has the same waste: `WebhookService` serializes for every
++local event on every instance, whether or not a webhook exists. Reordering the
++check in app code would fix it at the source. That is an app change, so it was
++deliberately not made in this phase. It needs a decision from the owners.
++
++### 3. Debug-level test logging formatted every SQL query
++
++Rails' default test log level is `debug`. Each SQL query then builds a debug
++message (name, binds, colorised SQL) and writes it to `log/test.log`. That was
++about 8.4% of samples plus about 1.6% for the logger writes, and about 90-100 MB
++of log per models run.
++
++Fix: `config/environments/test.rb` sets `config.log_level =
++ENV.fetch('RAILS_LOG_LEVEL', 'info')`. Set `RAILS_LOG_LEVEL=debug` to get SQL
++logs back when debugging a spec. Nothing in the suite asserts on debug output:
++the only logger assertion stubs `Rails.logger.debug`, and `httplog` is still
++loaded in the test env.
++
++## Results
++
++Models, seed 4242, example time:
++
++| Step | Duration | Change vs previous | Cumulative vs baseline |
++|---|---:|---:|---:|
++| Baseline (pristine), single run | 134.0 s | | |
++| 1. Scope verbose query logs to the spec group | 79.4 s | -41% | -41% |
++| 2. Skip unsubscribed webhook serialization (models) | 57.0 s | -28% | -57% |
++| 3. Test log level `info` | 48.0 s | -16% | -64% |
++| Final, paired with pristine (seed 4242), run 1 | 50.5 s | | vs 129.4 s pristine: -61% |
++| Final, paired with pristine (seed 4242), run 2 | 49.9 s | | vs 127.3 s pristine: -61% |
++| Final, seed 98765 (different order) | 51.5 s | | 0 failures |
++
++The per-step numbers are single runs and carry the noise described above. Treat
++them as a rough ladder and use the paired numbers as the result. The step
++attribution is backed by the profiler shares above. All runs: 1795 examples,
++0 failures.
++
++Query count per models run: 113,739 before, 78,987 after (-31%).
++
++Per-file change (paired pristine vs final, seconds):
++
++| spec file | before | after | change |
++|---|---:|---:|---:|
++| `account_statuses_cleanup_policy_spec.rb` | 13.3 | 3.9 | -71% |
++| `trends/statuses_spec.rb` | 10.9 | 3.4 | -69% |
++| `tag_feed_spec.rb` | 10.0 | 3.3 | -67% |
++| `status_spec.rb` | 9.5 | 3.2 | -66% |
++| `public_feed_spec.rb` | 6.7 | 2.4 | -64% |
++| `notification_spec.rb` | 6.0 | 1.9 | -68% |
++| `media_attachment_spec.rb` | 5.4 | 5.1 | -5% |
++| `concerns/status/threading_concern_spec.rb` | 5.2 | 1.7 | -67% |
++| `concerns/account/interactions_spec.rb` | 4.5 | 1.7 | -61% |
++| `account_spec.rb` | 4.4 | 2.0 | -54% |
++| `concerns/status/fetch_replies_concern_spec.rb` | 3.7 | 1.2 | -68% |
++| `form/import_spec.rb` | 3.0 | 1.0 | -66% |
++| `user_spec.rb` | 2.7 | 1.3 | -53% |
++| `report_spec.rb` | 2.1 | 0.6 | -74% |
++| **total (sum of example run_time)** | **129.0** | **50.2** | **-61%** |
++
++`media_attachment_spec.rb` barely moved because its cost is image and audio
++processing (factory-driven). That belongs to the factories phase.
++
++Requests (not a phase 1 target): paired runs gave 177.7 s pristine and 173.3 s
++with the phase 1 changes. That is within noise, so there is no measured
++requests gain from phase 1. The earlier single run of 135 s did not reproduce.
++Webhook skipping is scoped to models by design. The log level is global, and
++the paired runs show no measurable requests effect from it (within noise).
++
++## Profile after phase 1 (spec/models, sample shares)
++
++- Factory creation (`Fabrication::Generator`, `Fabricate`): about 80% inclusive
++  (most of it is ActiveRecord save callbacks).
++- ActiveRecord internals: about 24% self. ActiveModel validations: about 7%
++  self. ActiveSupport callbacks: about 7% self.
++- PostgreSQL round trips (`exec*`, `IO.select`): about 24%. About 79k queries
++  per run, about 44 per example on average (median 21).
++- Paperclip post-processing (thumbnails, image and audio processing): about 9%
++  inclusive.
++- BCrypt password hashing: about 7% inclusive. Devise sets `stretches = 1` in
++  test, but bcrypt clamps the cost to its minimum of 4, so each fabricated user
++  costs about 1.1 ms.
++- GC: about 5%.
++- Remaining webhook overhead (subscriber lookup, `TriggerWebhookWorker#find`):
++  about 4%.
++
++Top remaining SQL templates per run:
++
++- `SELECT user_roles WHERE id = ?` (about 5.8k): `belongs_to :role` loads the
++  role again for each user instance.
++- `username_blocks` existence check (about 5.7k): one per account validation.
++- `SAVEPOINT` / `RELEASE` (about 5.6k): from nested transactions in callbacks.
++- `SELECT 1 AS one` uniqueness validations (about 26k): standard Rails
++  validators.
++- `SELECT webhooks ... ? = ANY(events)` (about 3.8k): the subscriber lookup
++  that remains.
++- `settings WHERE var = ?` (about 3k): settings are re-read because
++  `Rails.cache.clear` runs after each example.
++
++Heaviest examples by query count (candidates for per-example review in a
++later phase): `trends/statuses_spec.rb:140` (1444 queries),
++`trends/statuses_spec.rb:132` (1423), `trends/statuses_spec.rb:31` (617).
++
++## Tried and rejected (measured or checked)
++
++- YJIT (`RUBY_YJIT_ENABLE=1`): 51.2 s vs 48.0 s. Slower for a run this short
++  (warm-up cost). Not recommended for this suite.
++- RSA key generation: local accounts generate a 2048-bit key in
++  `Account#generate_keys` (about 52 ms each). The account fabricator already
++  supplies a keypair, so the cost does not occur in specs. Not a problem.
++- `sleep` in specs: none in `spec/models`.
++- `use_transactional_tests: false` and DatabaseCleaner: none in
++  `spec/models`, so no cleanup cost.
++- Redis cleanup in `config.after` (`redis.del(redis.keys)`) and
++  `Rails.cache.clear`: negligible (the keyspace is empty between examples).
++- Routes reload and DNS stubs in `config.before`: negligible in the profile.
++
++## Phase 2 (spec/requests): plan, what changed, results
++
++### Plan items and status
++
++1. Profile `spec/requests` the same way. **Done.** Hot spots differed from
++   models: webhook serialization, route reloads and per-example setup in one
++   file, not SQL or HTTP.
++2. `cache_spec.rb` (258 examples, the largest file). **Done**, see change 3.
++3. Shared examples in `spec/support/examples/api.rb` (239 examples). **Checked,
++   not changed.** About 35 ms each. The JSON attributes the time of the group
++   that includes them to `api.rb`: each example builds a user (about 10 ms) and
++   a token, then makes one request. What remains is factory cost and the `before`
++   blocks of the including groups (see "Next candidates").
++4. Extend the webhook skip to `type: :request`. **Done**, see change 1. Checked
++   first: `spec/requests/admin/webhooks_spec.rb` only posts an invalid webhook,
++   and no request spec asserts on webhook delivery or payloads. The skip only
++   applies when no enabled webhook subscribes to the event, so it cannot change
++   what is enqueued.
++5. Global state assigned at load time. **Checked: none** in `spec/requests`
++   (`grep -rnE "^\s{0,2}[A-Za-z:]+\.[a-z_]+\s*=[^=~]"` is empty). No `sleep`, no
++   `use_transactional_tests: false`, and no `before(:all)` before this phase.
++
++### Findings (CPU sample shares before this phase, requests)
++
++- Webhook serialization: `WebhookService#call` was about 22% of CPU
++  (`TriggerWebhookWorker#perform` 23%, `serialize_event` 20%,
++  `SerializableResource#to_json` 22%). About 6.7k subscriber lookups and tens of
++  thousands of serializer queries per run (for example `user_ips` and
++  `user_invite_requests` at about 5k each, `account_stats` at about 7.6k). After:
++  about 1.5%.
++- `reload_routes!`: about 4% of CPU. `signature_verification_spec.rb` and
++  `api/v1/csp_spec.rb` ran a full route reload after every example: 31 reloads of
++  about 0.17 s each. After: about 0.3%.
++- `cache_spec.rb`: each of its 258 examples rebuilt the same 8 records (alice, a
++  moderator, two statuses, an invite, a poll, a token, a follow). That was about
++  50 ms per example, about 70% of the file.
++- Time split before this phase (unprofiled hook run, 136 s of example time):
++  about 24 s in SQL (about 18%), about 22 s in request dispatch (1956 requests,
++  about 11 ms each), and the rest in Ruby (fixtures, callbacks, specs).
++
++### What changed
++
++1. `spec/support/skip_unsubscribed_webhook_serialization.rb`: the skip is enabled
++   for `type: :request` as well as `type: :model` (`TYPES` constant). The around
++   hook now runs for every example and restores the previous value.
++2. `spec/requests/signature_verification_spec.rb` and
++   `spec/requests/api/v1/csp_spec.rb`: `after { reload_routes! }` became
++   `after(:all) { reload_routes! }`. Each example still draws its own test routes
++   in `before`, so the examples see the same routes. The app routes are restored
++   once per group. Both `after(:all)` lines carry an inline
++   `rubocop:disable RSpec/BeforeAfterAll`, as in the rest of the spec suite.
++3. `spec/requests/cache_spec.rb`: the shared records are created in
++   `before(:context)` instead of `before`. They live in a connection pinned for the
++   group (`ActiveRecord::Base.connection_pool.pin_connection!(true)`, which begins
++   a non-joinable transaction). `after(:context)` unpins it and rolls back.
++   Each example still runs in its own transactional fixture, nested inside the
++   pinned one, so database changes made by examples are rolled back as before.
++   `Sidekiq.testing!(:inline)` is set in the group hook, because rails_helper
++   sets it per example and that has not run yet at `before(:context)`.
++   Known side effects, checked:
++   - Redis data written by the setup (timelines and similar feeds) is removed by
++     the global `after` hook after the first example. No assertion in
++     `cache_spec.rb` reads timelines or response bodies.
++   - Verified: 258 examples, 0 failures with seeds 1, 4242 and 98765. The test
++     database has no leftover rows after the run, and no open transaction or
++     pinned connection remains.
++
++Pattern for later use: shared records that examples only read can be created
++once per group this way. Before doing it in a file, check that the examples do
++not depend on Redis-held data, and that the records are not defined in a `let`
++that differs per context.
++
++### Results (requests, seed 4242, example time from the JSON `duration`)
++
++| Step | Duration | Change vs previous | Cumulative vs pristine |
++|---|---:|---:|---:|
++| Pristine (HEAD), single run | 163.8 s | | |
++| Phase 1 state (log level only), single run | 140.5 s | -14% | -14% |
++| 1+2. Webhook skip for requests, routes reloaded once per group, single run | 95.3 s | -32% | -42% |
++| 3. Shared records in `cache_spec.rb`, single run | 79.7 s | -16% | -51% |
++| Final, paired with pristine (seed 4242), pristine | 154.3 s | | |
++| Final, paired with pristine (seed 4242), current | 81.2 s | | -47% |
++
++The single-run ladder carries the noise described above. The paired final
++number is the reference.
++
++Per file, paired (pristine to current, seconds):
++
++| spec file | before | after | change |
++|---|---:|---:|---:|
++| `requests/cache_spec.rb` | 32.6 | 3.3 | -90% |
++| `requests/signature_verification_spec.rb` | 6.2 | 0.5 | -92% |
++| `requests/activitypub/replies_spec.rb` | 14.1 | 8.1 | -43% |
++| `support/examples/api.rb` (shared examples) | 13.1 | 8.7 | -33% |
++| `requests/api/v2/notifications_spec.rb` | 7.1 | 4.9 | -32% |
++| `requests/api/v1/notifications_spec.rb` | 4.7 | 3.9 | -16% |
++| `requests/activitypub/contexts_spec.rb` | 3.5 | 1.8 | -48% |
++| `requests/activitypub/outboxes_spec.rb` | 2.5 | 1.2 | -53% |
++| `requests/accounts_spec.rb` | 2.1 | 1.3 | -40% |
++| **total (sum of example time)** | **154.3** | **81.2** | **-47%** |
++
++Combined: `spec/models` 49.7 s (1795 examples, 0 failures, same as after phase 1)
++plus `spec/requests` 81.2 s is about 131 s. The baseline is about 283 s (paired
++pristine, using the phase 1 paired models mean of about 128 s) or 299 s (single
++runs). That is about 2.15x to 2.3x, so the 2x target is met.
++
++SQL per requests run: 141,960 queries, down from 234,378 at the phase 1 state
++(-39%). Most of the drop comes from the webhook serializers and the per-example
++fixtures in `cache_spec.rb`. The remaining largest templates are savepoint and release
++(about 22.9k together), `user_roles` by id (about 9.0k), `settings` reads (about
++7.4k) and `username_blocks` checks (about 7.2k).
++
++### Profile after phase 2 (requests, CPU sample shares, inclusive unless noted)
++
++- `Fabricate` (fixtures): about 57%. This is the biggest remaining cost and
++  belongs to the factories phase.
++- BCrypt: about 5.8% (self). Each fabricated user hashes its password at bcrypt's
++  minimum cost (about 1.1 ms). Factories phase.
++- GC: about 6% (sweeping and marking).
++- Mail: `ActionMailer::MailDeliveryJob` about 5.5%, of which Premailer inline CSS
++  about 4.3%. Mail comes from app actions (notifications, reports, moderation),
++  not from fixtures. No request spec asserts on mail content. A possible later
++  change, but it touches mail rendering for all specs.
++- `Setting` reads about 1.8% and `UserRole.everyone` about 1.5%: both app code.
++  `Rails.cache.clear` after each example stays. Without it, rolled-back settings
++  rows would leave stale cache values.
++- `reload_routes`: about 0.3% (was about 4%).
++- `WebhookService#call`: about 1.5% (was about 22%).
++
++### Next candidates (not done; each needs a look at the examples)
++
++- `spec/requests/api/v1/notifications_spec.rb` and
++  `spec/requests/api/v2/notifications_spec.rb`: `before` blocks call
++  `PostStatusService`, `ReblogService`, `FavouriteService` and friends for each
++  example, at 250-400 ms per example. Sharing them needs the `let(:user)` and
++  `let(:bob)` records to become lookups, and the group fixtures to be built from
++  fixed values. Grouped notifications depend on timestamps. Estimated gain about
++  5 s, with more risk than `cache_spec.rb`.
++- `spec/requests/activitypub/replies_spec.rb`: 45 examples at about 180 ms each.
++  `let(:status)` varies by context (visibility), and `before` blocks change
++  accounts (suspensions, deletions). Not a simple share.
++- Factories phase (next): `Fabricate(:status)` about 20 ms, `Fabricate(:user)`
++  about 10 ms (account, two login activities, bcrypt). These drive the 57%.
++
++### Tried and rejected in this phase
++
++- StackProf wall mode with raw samples: 966 MB dump, out of memory when loaded.
++  Use CPU mode and aggregated output (see "Analysis snippets").
++- Skipping all serialization in request specs (not only when no enabled
++  subscriber exists): not done. The subscriber check keeps the behaviour the same
++  wherever a webhook exists (`admin/webhooks_spec.rb`).
++
++## Phase 3 (factories in spec/models and spec/requests): plan, what changed, results
++
++### Plan items and status
++
++1. Profile the fabricators the same way as the earlier phases: exclusive time,
++   creates and builds, INSERTs and SQL statements per fabricator. **Done.** The
++   hook is a measurement tool (see "Analysis snippets"). It adds no measurable
++   time: models ran in 52.5 s with the hook and 52.2 s without it.
++2. Records that default fabricators create but examples do not need. **Done**:
++   the status bookmark and the two default login activities per user.
++3. Password hashing per fabricated user. **Done**: the digest is memoised in
++   test support (see "What changed").
++4. Real media fixtures (image, video and audio processing). **Checked, not
++   changed** (see "Considered and rejected").
++5. Associated records that a default creates (a local account builds a user and
++   a keypair). **Checked, not changed**: `local?`, `account.user` and signing
++   depend on them.
++6. Factories are shared by the whole suite. Every other spec folder (except
++   `spec/search`, which the default filter excludes, and `spec/system`) was run on
++   its own, with the phase 3 changes in place. **Done**, no failures (see
++   "Verification").
++
++### Findings (profile before this phase, seed 4242)
++
++Fabricator exclusive time was about 44 s of the 52 s models run and about 48 s of
++the 84 s requests run. The rest is example and app code. The largest items:
++
++- **Bookmark per status.** The status fabricator's `after_create` created a
++  bookmark for every status. The bookmark's default account is
++  `Fabricate.build(:account)`, so each status also created a new local account,
++  its user and its keypair. models: 1019 bookmarks, about 11.2 s inclusive.
++  requests: 945 bookmarks, about 10.6 s inclusive. This was the largest single
++  factory cost in both groups.
++- **Login activities.** The user fabricator's `after_create` created two login
++  activities for every `Fabricate(:user)` (admin, moderator, owner and private
++  variants inherit it). requests: 2456 creates, 1.8 s exclusive. models: 270.
++  Built users (`Fabricate.build`) do not run this callback.
++- **bcrypt.** Every user build and create runs Devise's `password=`, which
++  hashes `'123456789'`. Devise sets `stretches = 1` in test, but bcrypt clamps the
++  cost to its minimum of 4, so each hash costs about 1.16 ms. models ran about
++  3090 user builds and creates, requests about 3290.
++- **Media.** The default `Fabricate(:media_attachment)` (a jpg) costs about
++  25 ms. The video and gifv fixture costs about 340 ms each (ffmpeg transcoding).
++  In models, `media_attachment_spec.rb` (about 5 s) is mostly format conversion
++  and the 7.8 MB mp3, which are the examples' subject. The default is not the
++  problem.
++- **What is left per user or account create** (about 16 SQL statements for a
++  `Fabricate(:user)`): uniqueness checks, username blocks, the role lookups and the
++  webhook subscriber lookup. These are app validations and callbacks, not
++  fabricator code.
++
++### What changed (phase 3)
++
++1. `spec/fabricators/status_fabricator.rb`: removed the
++   `after_create { Fabricate(:bookmark, status: status) }` callback, with a comment.
++   No example needed a change: the examples that depend on bookmarks create them
++   explicitly (`bookmarks_spec`, `statuses/bookmarks_spec`,
++   `account_statuses_cleanup_policy_spec`, `bulk_import_*`, ...).
++2. `spec/fabricators/user_fabricator.rb`: removed the
++   `after_create { 2.times { Fabricate(:login_activity, user: user) } }` callback,
++   with a comment. Examples that need login activities create them explicitly
++   (`sessions_controller_spec`, `ip_cleanup_scheduler_spec`, ...).
++3. `spec/support/cached_password_digest.rb` (new; loaded by `rails_helper` with the
++   other support files): prepends to `Devise::Encryptor.singleton_class` and
++   memoises `digest(klass, password)` per (stretches, pepper, password). The value
++   is still a real bcrypt hash, so `valid_password?` (which uses `compare`,
++   unchanged) and `user.password` (the plaintext) behave as before. Only identical
++   passwords share a salt. The `encrypted_password` expectations in
++   `registrations_controller_spec` use other passwords, so they see the same
++   change or no change as before.
++
++No example file changed in this phase, so no assertion changed. The spec-tree
++changes from this phase are the two fabricators and the new support file.
++
++### Results
++
++Single runs (seed 4242, example time from the JSON `duration`):
++
++| Step | models | requests | Notes |
++|---|---:|---:|---|
++| Phase 2 state (pristine for this phase) | 52.2 s | 84.0 s | 1795 and 1877 examples, 0 failures |
++| 1. Status fabricator without the bookmark | 41.3 s | 72.8 s | 0 failures |
++| 2. + user fabricator without login activities, + digest memo | 37.3 s | 71.1 s | 0 failures |
++
++Paired (seed 4242; pristine = phase 2 state, current = this phase; two pairs,
++interleaved, see "Paired runs for phase 3"):
++
++| Run | models | requests |
++|---|---:|---:|
++| pristine, pair 1 | 51.04 s | 85.82 s |
++| current, pair 1 | 38.05 s | 66.70 s |
++| pristine, pair 2 | 48.57 s | 80.38 s |
++| current, pair 2 | 35.45 s | 66.12 s |
++| **mean pristine** | **49.8 s** | **83.1 s** |
++| **mean current** | **36.8 s** | **66.4 s** |
++| change | **-26%** | **-20%** |
++
++Combined: 132.9 s to 103.2 s (**-22%**). Against the original HEAD baseline
++(about 306 s paired), the suite is now about 3x faster, and the phase 3 target of
++10-20% is met.
++
++Work per run (factory hook, same definition as the earlier SQL counts):
++
++| Measure | models before | models after | requests before | requests after |
++|---|---:|---:|---:|---:|
++| SQL statements per run | 78,985 | 58,121 (-26%) | 141,960 | 115,862 (-18%) |
++| INSERTs issued inside fabricators | 14,692 | 10,414 | 19,209 | 13,009 |
++| Fabricator creates | 4721 | 3449 | 8203 | 4811 |
++| Fabricator builds | 5554 | 3550 | 5492 | 3620 |
++| Fabricator exclusive time | 43.8 s | 28.5 s | 47.6 s | 32.6 s |
++
++Per-file, paired mean (seconds, pristine to current):
++
++| spec file | before | after | change |
++|---|---:|---:|---:|
++| `models/account_statuses_cleanup_policy_spec.rb` | 4.02 | 1.93 | -52% |
++| `models/tag_feed_spec.rb` | 3.53 | 2.17 | -39% |
++| `models/status_spec.rb` | 3.32 | 2.07 | -38% |
++| `models/trends/statuses_spec.rb` | 3.19 | 1.82 | -43% |
++| `models/public_feed_spec.rb` | 2.33 | 1.36 | -42% |
++| `models/media_attachment_spec.rb` | 4.98 | 4.95 | -1% (format conversion, see above) |
++| `spec/support/examples/api.rb` (shared examples) | 8.79 | 7.20 | -18% |
++| `requests/activitypub/replies_spec.rb` | 8.29 | 4.26 | -49% |
++| `requests/api/v1/notifications_spec.rb` | 3.91 | 3.28 | -16% |
++| `requests/api/v1/statuses_spec.rb` | 1.99 | 1.60 | -19% |
++| `requests/activitypub/contexts_spec.rb` | 1.92 | 0.99 | -48% |
++| `requests/cache_spec.rb` | 3.37 | 3.31 | -2% (already optimised in phase 2) |
++
++### Verification
++
++- `spec/models`: 1795 examples, 0 failures, in every run. `spec/requests`: 1877
++  examples, 0 failures, in every run (seed 4242).
++- Other spec folders, each run on its own (system and streaming excluded, and the
++  search and js examples are excluded by the default filter): fabrication 115,
++  configuration 1, config 15, generators 1, locales 2, routing 62, presenters 45,
++  chewy 5, mailers 94, views 9, validators 100, helpers 162, policies 230,
++  serializers 172, controllers 333, services 712, workers 329, lib 1313 (2
++  pending, as before). **0 failures.**
++- Semantic checks in a temporary spec outside the repo: `Fabricate(:user).password`
++  is still `'123456789'`; `valid_password?` is true for it and false for another
++  string; an explicit `password:` still wins; `Fabricate(:status).bookmarks` is
++  empty; `Fabricate(:user).login_activities` is empty; `Fabricate(:admin_user)`
++  still has the Admin role.
++- RuboCop: no offences in the changed fabricators and the new support file.
++
++### Paired runs for phase 3
++
++The pristine state for this phase is the phase 2 state: HEAD fabricators and no
++`spec/support/cached_password_digest.rb`. The phase 1 and 2 changes stay in place.
++Only the three phase 3 files are swapped, which keeps `git stash` out of it:
++
++```bash
++cd /app && unset RAILS_LOG_LEVEL
++cp spec/fabricators/status_fabricator.rb spec/fabricators/user_fabricator.rb /tmp/
++cp spec/support/cached_password_digest.rb /tmp/
++git show HEAD:spec/fabricators/status_fabricator.rb > spec/fabricators/status_fabricator.rb
++git show HEAD:spec/fabricators/user_fabricator.rb > spec/fabricators/user_fabricator.rb
++rm spec/support/cached_password_digest.rb
++bundle exec rspec spec/models --seed 4242 --format json --out tmp/perf/pristine_models.json
++bundle exec rspec spec/requests --seed 4242 --format json --out tmp/perf/pristine_requests.json
++cp /tmp/status_fabricator.rb /tmp/user_fabricator.rb spec/fabricators/
++cp /tmp/cached_password_digest.rb spec/support/
++# then the same two runs for the current tree
++```
++
++Restore the files even if a run fails, and check `git status` afterwards.
++
++### Considered and rejected
++
++- **Keep the bookmark but make it cheaper** (bookmark by the status author, one
++  shared bookmarking account, or a remote account). This changes what looks
++  bookmarked to the cleanup policy (it keeps self-bookmarked toots) and to
++  `lib/mastodon/cli/media.rb`. Removing it passed everything, so there is no need.
++- **Default remote or lighter accounts for `Fabricate.build(:account)`**. Most
++  examples depend on the local account, its user and its keypair. Far too broad.
++- **Drop the keypair from the account fabricator**. `account.keypair` is needed for
++  signing and federation examples.
++- **Lower the bcrypt cost**. bcrypt clamps to 4 in its C layer, so the Devise
++  `stretches` setting cannot go lower. Memoising the digest is the only lever, and
++  it is used.
++- **Smaller media fixtures or skipped processing**. These change dimensions,
++  processing state and the examples' subject (format conversion). The
++  video and gifv fixtures (about 340 ms each) stay.
++- **`Fabricate.build` for associated records instead of `Fabricate`**. Many
++  examples expect the associations to be persisted.
++
++### Remaining candidates (not done)
++
++- **App code, report only** (changes need an owner decision):
++  - `Status#set_conversation` builds a `Conversation` for every top-level status
++    (one INSERT per status). The status counter caches (`increment_counter_caches`)
++    write an `account_stats` row for each new local author.
++  - `user_roles` is read by id about twice per user create.
++  - `username_blocks` is checked for each local username.
++  - `UserRole` lookups in the admin and moderator fabricators run once per create.
++- **Example-level setup**: many `let(:user) { Fabricate(:user) }` and `before`
++  blocks create users and statuses per example, in `api/v1` and
++  `spec/support/examples/api.rb`. Reducing them means touching examples, so this is
++  per-spec work, not factory work.
++
++### Patterns for future runs
++
++- A default `after_create` that creates other top-level rows (bookmarks, login
++  activities, related accounts) inflates every example that uses the fabricator.
++  Create such rows explicitly in the examples that need them.
++- A default association built with `Fabricate.build(:account)` is a local account
++  with a user and a keypair as soon as it is saved. Check nested builds with the
++  factory hook before you add a default.
++- Devise hashes on `password=`. A new password still costs about 1 ms per user
++  build. The memo only helps when passwords repeat, as with the fabricator default.
++- Fabricator-attributed time is still the largest share after this phase: about
++  79% of the models example time and about 48% of the requests example time (profile
++  run, app callbacks triggered by fabricators included). Run the factory hook first.
++
++## App-level findings (reported, not changed)
++
++These cost time in production as well as in tests. None is changed here, and
++each needs a decision from the owners.
++
++- `WebhookService#call` serializes before checking for subscribers. Check
++  `Webhook.enabled` first and serialize only when there is something to deliver.
++- `User#role` and similar associations load `UserRole` by id once per user
++  instance (about 5.8k queries per models run).
++- `UsernameBlock` checks run once per account validation (about 5.7k queries).
++
++## Log
++
++- 2026-11-25, models: baseline 134.0 s (single) and paired pristine 128.4 s
++  mean. Final: 50.2 s mean paired (-61%). Requests baseline 165.1 s single,
++  177.7 s paired pristine; 173.3 s paired current.
++- 2026-11-25, requests (phase 2): pristine 163.8 s single, 154.3 s paired.
++  Phase 1 state 140.5 s. Webhook skip for requests and routes reloaded once
++  per group: 95.3 s. Shared records in `cache_spec`: 79.7 s single, 81.2 s
++  paired (-47%). Models re-run at 49.7 s, 0 failures. Combined about 2.2x.
++- Final verification after comment-only edits to `config/environments/test.rb`:
++  models 55.2 s (seed 4242), 1795 examples, 0 failures. Within the noise band
++  above; the paired runs remain the reference numbers.
++- 2026-11-25, phase 3 (factories), models and requests. Baseline (phase 2 state) paired
++  means 49.8 s (models) and 83.1 s (requests). Status fabricator without the implicit
++  bookmark: 41.3 s and 72.8 s single. User fabricator without the default login
++  activities, plus the Devise digest memo: 37.3 s and 71.1 s single. Paired final:
++  36.8 s (models, -26%) and 66.4 s (requests, -20%), about -22% combined. SQL per run:
++  models 78,985 to 58,121, requests 141,960 to 115,862. Other spec folders, each run
++  on its own: 0 failures. Models and requests: 0 failures in every run.
+diff --git a/spec/fabricators/status_fabricator.rb b/spec/fabricators/status_fabricator.rb
+index 2539d48..6097cb3 100644
+--- a/spec/fabricators/status_fabricator.rb
++++ b/spec/fabricators/status_fabricator.rb
+@@ -8,7 +8,7 @@ Fabricator(:status) do
+     status.uri = Faker::Internet.device_token if !status.account.local? && status.uri.nil?
+   end
+ 
+-  after_create do |status|
+-    Fabricate(:bookmark, status: status)
+-  end
++  # Statuses are not bookmarked by default. The bookmark that used to be created
++  # here also created a new local account (with a user and a keypair) for every
++  # status. Specs that need a bookmark create one explicitly.
+ end
+diff --git a/spec/fabricators/user_fabricator.rb b/spec/fabricators/user_fabricator.rb
+index c82a3c9..40a00d6 100644
+--- a/spec/fabricators/user_fabricator.rb
++++ b/spec/fabricators/user_fabricator.rb
+@@ -13,9 +13,8 @@ Fabricator(:user) do
+   current_sign_in_at { Time.zone.now }
+   agreement true
+ 
+-  after_create do |user|
+-    2.times { Fabricate(:login_activity, user: user) }
+-  end
++  # No login activities by default. Specs that need them create them explicitly
++  # with `Fabricate(:login_activity, user: user)`.
+ end
+ 
+ Fabricator(:admin_user, from: :user) do
+diff --git a/spec/models/concerns/status/fetch_replies_concern_spec.rb b/spec/models/concerns/status/fetch_replies_concern_spec.rb
+index e9c81d4..08e64ac 100644
+--- a/spec/models/concerns/status/fetch_replies_concern_spec.rb
++++ b/spec/models/concerns/status/fetch_replies_concern_spec.rb
+@@ -3,7 +3,16 @@
+ require 'rails_helper'
+ 
+ RSpec.describe Status::FetchRepliesConcern do
+-  ActiveRecord.verbose_query_logs = true
++  # Verbose query logs compute the caller source location for every SQL query.
++  # Scope them to this group only: assigning the global at load time leaked into
++  # every other example in the process and slowed down the whole suite.
++  around do |example|
++    previous_verbose_query_logs = ActiveRecord.verbose_query_logs
++    ActiveRecord.verbose_query_logs = true
++    example.run
++  ensure
++    ActiveRecord.verbose_query_logs = previous_verbose_query_logs
++  end
+ 
+   let!(:alice)  { Fabricate(:account, username: 'alice') }
+   let!(:bob)    { Fabricate(:account, username: 'bob', domain: 'other.com') }
+diff --git a/spec/requests/api/v1/csp_spec.rb b/spec/requests/api/v1/csp_spec.rb
+index 5d61d7f..01ba329 100644
+--- a/spec/requests/api/v1/csp_spec.rb
++++ b/spec/requests/api/v1/csp_spec.rb
+@@ -5,7 +5,9 @@ require 'rails_helper'
+ RSpec.describe 'API namespace minimal Content-Security-Policy' do
+   before { stub_tests_controller }
+ 
+-  after { Rails.application.reload_routes! }
++  # Restore the app routes once per group: every example redraws its own test
++  # routes in `before`, and a full reload after each example was costly.
++  after(:all) { Rails.application.reload_routes! } # rubocop:disable RSpec/BeforeAfterAll
+ 
+   it 'returns the correct CSP headers' do
+     get '/api/v1/tests'
+diff --git a/spec/requests/cache_spec.rb b/spec/requests/cache_spec.rb
+index 8fa5a03..f106e09 100644
+--- a/spec/requests/cache_spec.rb
++++ b/spec/requests/cache_spec.rb
+@@ -171,7 +171,20 @@ RSpec.describe 'Caching behavior' do
+   let(:user) { User.find_by(email: 'user@host.example') }
+   let(:token) { Doorkeeper::AccessToken.find_by(resource_owner_id: user.id) }
+ 
+-  before do
++  # Every example in this file uses the same records, so they are created once for
++  # the group instead of once per example. They live in a pinned transaction that
++  # is rolled back in `after(:context)`. Each example still runs in its own
++  # transaction nested inside it, so database changes an example makes are rolled
++  # back as before. Redis data written here is cleared by the global after-hook
++  # after the first example. No assertion in this file reads timelines or bodies
++  # that depend on it.
++  # rubocop:disable RSpec/BeforeAfterAll
++  before(:context) do
++    # rails_helper switches to inline Sidekiq per example, which has not run yet.
++    Sidekiq.testing!(:inline)
++
++    ActiveRecord::Base.connection_pool.pin_connection!(true)
++
+     alice = Fabricate(:account, username: 'alice')
+     user = Fabricate(:moderator_user, email: 'user@host.example')
+     status = Fabricate(:status, account: alice, id: 110_224_538_612_341_312)
+@@ -183,6 +196,11 @@ RSpec.describe 'Caching behavior' do
+     user.account.follow!(alice)
+   end
+ 
++  after(:context) do
++    ActiveRecord::Base.connection_pool.unpin_connection!
++  end
++  # rubocop:enable RSpec/BeforeAfterAll
++
+   context 'when anonymously accessed' do
+     describe '/users/alice' do
+       it 'redirects with proper cache header', :aggregate_failures do
+diff --git a/spec/requests/signature_verification_spec.rb b/spec/requests/signature_verification_spec.rb
+index 9556911..9a722fc 100644
+--- a/spec/requests/signature_verification_spec.rb
++++ b/spec/requests/signature_verification_spec.rb
+@@ -10,7 +10,9 @@ RSpec.describe 'signature verification concern' do
+     travel_to '2023-12-20T10:00:00Z'
+   end
+ 
+-  after { Rails.application.reload_routes! }
++  # Restore the app routes once per group: every example redraws its own test
++  # routes in `before`, and a full reload after each example was costly.
++  after(:all) { Rails.application.reload_routes! } # rubocop:disable RSpec/BeforeAfterAll
+ 
+   # Include the private key so the tests can be easily adjusted and reviewed
+   let(:actor_keypair) do
+diff --git a/spec/support/cached_password_digest.rb b/spec/support/cached_password_digest.rb
+new file mode 100644
+index 0000000..5d65b2e
+--- /dev/null
++++ b/spec/support/cached_password_digest.rb
+@@ -0,0 +1,15 @@
++# frozen_string_literal: true
++
++# Devise hashes the password on every assignment (`password=`). bcrypt cannot go
++# below its minimum cost of 4, so each fabricated user spends about 1 ms hashing
++# the same password. Memoize the digest per plaintext for the test process. The
++# value is still a real bcrypt hash of that password, so `valid_password?` works
++# as before. Only identical passwords now share a salt.
++module CachedPasswordDigest
++  def digest(klass, password)
++    @digests ||= {}
++    @digests[[klass.stretches, klass.pepper, password]] ||= super
++  end
++end
++
++Devise::Encryptor.singleton_class.prepend(CachedPasswordDigest)
+diff --git a/spec/support/skip_unsubscribed_webhook_serialization.rb b/spec/support/skip_unsubscribed_webhook_serialization.rb
+new file mode 100644
+index 0000000..3fcf754
+--- /dev/null
++++ b/spec/support/skip_unsubscribed_webhook_serialization.rb
+@@ -0,0 +1,45 @@
++# frozen_string_literal: true
++
++# WebhookService serializes the whole event payload before it looks up which
++# enabled webhooks subscribe to the event. Specs create many local statuses and
++# accounts without any webhook, where that payload is computed and then thrown
++# away. Skip the serialization only when no enabled webhook subscribes to the
++# event: the subscriber lookup still runs and the enqueued jobs (and so the
++# observable behaviour) are unchanged. This is test-only; the production code is
++# not modified.
++#
++# Enabled per example for the example types listed below (see the around hook).
++module SkipUnsubscribedWebhookSerialization
++  TYPES = %i(model request).freeze
++
++  class << self
++    attr_accessor :enabled
++  end
++
++  private
++
++  def webhooks_for_event
++    return super unless SkipUnsubscribedWebhookSerialization.enabled
++
++    @webhooks_for_event ||= super
++  end
++
++  def serialize_event
++    return super unless SkipUnsubscribedWebhookSerialization.enabled
++    return super if webhooks_for_event.any?
++
++    nil
++  end
++end
++
++WebhookService.prepend(SkipUnsubscribedWebhookSerialization)
++
++RSpec.configure do |config|
++  config.around do |example|
++    previous = SkipUnsubscribedWebhookSerialization.enabled
++    SkipUnsubscribedWebhookSerialization.enabled = SkipUnsubscribedWebhookSerialization::TYPES.include?(example.metadata[:type])
++    example.run
++  ensure
++    SkipUnsubscribedWebhookSerialization.enabled = previous
++  end
++end

@@ -1,0 +1,346 @@
+diff --git a/docs/rspec-performance.md b/docs/rspec-performance.md
+index b82cf47..6faaf65 100644
+--- a/docs/rspec-performance.md
++++ b/docs/rspec-performance.md
+@@ -7,8 +7,9 @@ numbers and the phase log whenever a change is measured.
+   10 minutes.
+ - Phase 1: `spec/models`. Target: at least 30-35% faster. **Done: about 61%
+   faster** (see results).
+-- Phase 2: `spec/requests`. Then the combined target: `spec/models` +
+-  `spec/requests` at least 2x faster than the baseline (see "Phase 2 plan").
++- Phase 2: `spec/requests`. **Done: about 47% faster (paired), about 50% in
++  single runs.** Combined with models the suite is about 2.2x faster than the
++  baseline, which meets the 2x target (see "Phase 2").
+ - Constraints that applied in every phase: no app code changes that alter
+   runtime behaviour, no changes to what examples assert, factories untouched
+   until their own phase, system and streaming specs ignored.
+@@ -44,13 +45,18 @@ local redis-server, 12 vCPU aarch64. `CI` was unset, so `eager_load` was off
+ 
+ ### Paired runs (how to compare pristine vs changed)
+ 
++Stash only `config` and `spec`. A plain `git stash push -u` also stashes the
++untracked `docs/` folder, which holds this file.
++
+ ```bash
+-git stash push -u -m perf-current     # -u also stashes new support files
++git stash push -u -m perf-current -- config spec   # -u includes new support files
+ bundle exec rspec spec/models --seed 4242 --format json --out tmp/perf/pristine.json
+ git stash pop
+ bundle exec rspec spec/models --seed 4242 --format json --out tmp/perf/current.json
+ ```
+ 
++Leave `RAILS_LOG_LEVEL` unset. Setting it to an empty string breaks the Sidekiq
++initializer (`Logger.const_get('')`), and the run fails after about 3 s.
+ Make sure `git stash list` is empty afterwards. Repeat the pair at least twice.
+ 
+ ### Analysis snippets (not part of the repo)
+@@ -67,13 +73,17 @@ d['examples'].each { |e| per_file[e['file_path'].sub(%r{^\./}, '')] += e['run_ti
+ per_file.sort_by { |_, v| -v }.first(25).each { |f, t| printf("%8.2fs  %s\n", t, f) }
+ ```
+ 
+-Sampling profile (wall mode) with StackProf, loaded via `rspec -r`:
++Sampling profile with StackProf, loaded via `rspec -r`. Use CPU mode with
++aggregated output (`raw: false`, `interval: 1000`): the dump is about 2 MB. Wall
++mode with raw samples at 500 us produced a 966 MB dump, which ran out of memory
++when loaded. Wall mode also inflated some files by up to 14x, so take timings
++from the unprofiled JSON and use the profile only for shares.
+ 
+ ```ruby
+-# tmp/profile_hook.rb, load with: bundle exec rspec spec/models -r ./tmp/profile_hook.rb
++# tmp/profile_hook.rb, load with: bundle exec rspec spec/requests -r ./tmp/profile_hook.rb
+ require 'stackprof'
+ RSpec.configure do |config|
+-  config.before(:suite) { StackProf.start(mode: :wall, raw: true, interval: 1000) }
++  config.before(:suite) { StackProf.start(mode: :cpu, raw: false, interval: 1000) }
+   config.after(:suite)  { StackProf.stop; StackProf.results('tmp/stackprof.dump') }
+ end
+ ```
+@@ -265,27 +275,157 @@ later phase): `trends/statuses_spec.rb:140` (1444 queries),
+   `Rails.cache.clear`: negligible (the keyspace is empty between examples).
+ - Routes reload and DNS stubs in `config.before`: negligible in the profile.
+ 
+-## Phase 2 plan (spec/requests)
+-
+-Target: together with models, at most about 150 s combined. With models at
+-about 50 s, requests need to come down to about 100 s from about 175 s, which is
+-about -43%.
+-
+-1. Profile `spec/requests` the same way (the profile hook and the per-file
+-   summary above work unchanged). Expect different hot spots: HTTP stack and
+-   controllers, signed requests (`SignedRequestHelpers`, RSA signing and
+-   verification), serializers, and Devise sign-in in request helpers.
+-2. Look at `cache_spec.rb` (258 examples, 35.6 s) first. It is the largest
+-   single file. Check whether its examples share setup that is rebuilt per
+-   example.
+-3. Shared examples in `spec/support/examples/api.rb` run 239 times. Check their
+-   per-example setup.
+-4. Extend the webhook skip to `type: :request` if the profile still shows
+-   serialization. Check first that no request spec expects serialization with
+-   no subscriber (`spec/requests/admin/webhooks_spec.rb` creates webhooks, so
+-   the skip is inactive there).
+-5. Keep checking for global state assigned at load time:
+-   `grep -rnE "^\s{2}[A-Za-z:]+\.[a-z_]+\s*=[^=~]" spec/`.
++## Phase 2 (spec/requests): plan, what changed, results
++
++### Plan items and status
++
++1. Profile `spec/requests` the same way. **Done.** Hot spots differed from
++   models: webhook serialization, route reloads and per-example setup in one
++   file, not SQL or HTTP.
++2. `cache_spec.rb` (258 examples, the largest file). **Done**, see change 3.
++3. Shared examples in `spec/support/examples/api.rb` (239 examples). **Checked,
++   not changed.** About 35 ms each. The JSON attributes the time of the group
++   that includes them to `api.rb`: each example builds a user (about 10 ms) and
++   a token, then makes one request. What remains is factory cost and the `before`
++   blocks of the including groups (see "Next candidates").
++4. Extend the webhook skip to `type: :request`. **Done**, see change 1. Checked
++   first: `spec/requests/admin/webhooks_spec.rb` only posts an invalid webhook,
++   and no request spec asserts on webhook delivery or payloads. The skip only
++   applies when no enabled webhook subscribes to the event, so it cannot change
++   what is enqueued.
++5. Global state assigned at load time. **Checked: none** in `spec/requests`
++   (`grep -rnE "^\s{0,2}[A-Za-z:]+\.[a-z_]+\s*=[^=~]"` is empty). No `sleep`, no
++   `use_transactional_tests: false`, and no `before(:all)` before this phase.
++
++### Findings (CPU sample shares before this phase, requests)
++
++- Webhook serialization: `WebhookService#call` was about 22% of CPU
++  (`TriggerWebhookWorker#perform` 23%, `serialize_event` 20%,
++  `SerializableResource#to_json` 22%). About 6.7k subscriber lookups and tens of
++  thousands of serializer queries per run (for example `user_ips` and
++  `user_invite_requests` at about 5k each, `account_stats` at about 7.6k). After:
++  about 1.5%.
++- `reload_routes!`: about 4% of CPU. `signature_verification_spec.rb` and
++  `api/v1/csp_spec.rb` ran a full route reload after every example: 31 reloads of
++  about 0.17 s each. After: about 0.3%.
++- `cache_spec.rb`: each of its 258 examples rebuilt the same 8 records (alice, a
++  moderator, two statuses, an invite, a poll, a token, a follow). That was about
++  50 ms per example, about 70% of the file.
++- Time split before this phase (unprofiled hook run, 136 s of example time):
++  about 24 s in SQL (about 18%), about 22 s in request dispatch (1956 requests,
++  about 11 ms each), and the rest in Ruby (fixtures, callbacks, specs).
++
++### What changed
++
++1. `spec/support/skip_unsubscribed_webhook_serialization.rb`: the skip is enabled
++   for `type: :request` as well as `type: :model` (`TYPES` constant). The around
++   hook now runs for every example and restores the previous value.
++2. `spec/requests/signature_verification_spec.rb` and
++   `spec/requests/api/v1/csp_spec.rb`: `after { reload_routes! }` became
++   `after(:all) { reload_routes! }`. Each example still draws its own test routes
++   in `before`, so the examples see the same routes. The app routes are restored
++   once per group. Both `after(:all)` lines carry an inline
++   `rubocop:disable RSpec/BeforeAfterAll`, as in the rest of the spec suite.
++3. `spec/requests/cache_spec.rb`: the shared records are created in
++   `before(:context)` instead of `before`. They live in a connection pinned for the
++   group (`ActiveRecord::Base.connection_pool.pin_connection!(true)`, which begins
++   a non-joinable transaction). `after(:context)` unpins it and rolls back.
++   Each example still runs in its own transactional fixture, nested inside the
++   pinned one, so database changes made by examples are rolled back as before.
++   `Sidekiq.testing!(:inline)` is set in the group hook, because rails_helper
++   sets it per example and that has not run yet at `before(:context)`.
++   Known side effects, checked:
++   - Redis data written by the setup (timelines and similar feeds) is removed by
++     the global `after` hook after the first example. No assertion in
++     `cache_spec.rb` reads timelines or response bodies.
++   - Verified: 258 examples, 0 failures with seeds 1, 4242 and 98765. The test
++     database has no leftover rows after the run, and no open transaction or
++     pinned connection remains.
++
++Pattern for later use: shared records that examples only read can be created
++once per group this way. Before doing it in a file, check that the examples do
++not depend on Redis-held data, and that the records are not defined in a `let`
++that differs per context.
++
++### Results (requests, seed 4242, example time from the JSON `duration`)
++
++| Step | Duration | Change vs previous | Cumulative vs pristine |
++|---|---:|---:|---:|
++| Pristine (HEAD), single run | 163.8 s | | |
++| Phase 1 state (log level only), single run | 140.5 s | -14% | -14% |
++| 1+2. Webhook skip for requests, routes reloaded once per group, single run | 95.3 s | -32% | -42% |
++| 3. Shared records in `cache_spec.rb`, single run | 79.7 s | -16% | -51% |
++| Final, paired with pristine (seed 4242), pristine | 154.3 s | | |
++| Final, paired with pristine (seed 4242), current | 81.2 s | | -47% |
++
++The single-run ladder carries the noise described above. The paired final
++number is the reference.
++
++Per file, paired (pristine to current, seconds):
++
++| spec file | before | after | change |
++|---|---:|---:|---:|
++| `requests/cache_spec.rb` | 32.6 | 3.3 | -90% |
++| `requests/signature_verification_spec.rb` | 6.2 | 0.5 | -92% |
++| `requests/activitypub/replies_spec.rb` | 14.1 | 8.1 | -43% |
++| `support/examples/api.rb` (shared examples) | 13.1 | 8.7 | -33% |
++| `requests/api/v2/notifications_spec.rb` | 7.1 | 4.9 | -32% |
++| `requests/api/v1/notifications_spec.rb` | 4.7 | 3.9 | -16% |
++| `requests/activitypub/contexts_spec.rb` | 3.5 | 1.8 | -48% |
++| `requests/activitypub/outboxes_spec.rb` | 2.5 | 1.2 | -53% |
++| `requests/accounts_spec.rb` | 2.1 | 1.3 | -40% |
++| **total (sum of example time)** | **154.3** | **81.2** | **-47%** |
++
++Combined: `spec/models` 49.7 s (1795 examples, 0 failures, same as after phase 1)
++plus `spec/requests` 81.2 s is about 131 s. The baseline is about 283 s (paired
++pristine, using the phase 1 paired models mean of about 128 s) or 299 s (single
++runs). That is about 2.15x to 2.3x, so the 2x target is met.
++
++SQL per requests run: 141,960 queries, down from 234,378 at the phase 1 state
++(-39%). Most of the drop comes from the webhook serializers and the per-example
++fixtures in `cache_spec.rb`. The remaining largest templates are savepoint and release
++(about 22.9k together), `user_roles` by id (about 9.0k), `settings` reads (about
++7.4k) and `username_blocks` checks (about 7.2k).
++
++### Profile after phase 2 (requests, CPU sample shares, inclusive unless noted)
++
++- `Fabricate` (fixtures): about 57%. This is the biggest remaining cost and
++  belongs to the factories phase.
++- BCrypt: about 5.8% (self). Each fabricated user hashes its password at bcrypt's
++  minimum cost (about 1.1 ms). Factories phase.
++- GC: about 6% (sweeping and marking).
++- Mail: `ActionMailer::MailDeliveryJob` about 5.5%, of which Premailer inline CSS
++  about 4.3%. Mail comes from app actions (notifications, reports, moderation),
++  not from fixtures. No request spec asserts on mail content. A possible later
++  change, but it touches mail rendering for all specs.
++- `Setting` reads about 1.8% and `UserRole.everyone` about 1.5%: both app code.
++  `Rails.cache.clear` after each example stays. Without it, rolled-back settings
++  rows would leave stale cache values.
++- `reload_routes`: about 0.3% (was about 4%).
++- `WebhookService#call`: about 1.5% (was about 22%).
++
++### Next candidates (not done; each needs a look at the examples)
++
++- `spec/requests/api/v1/notifications_spec.rb` and
++  `spec/requests/api/v2/notifications_spec.rb`: `before` blocks call
++  `PostStatusService`, `ReblogService`, `FavouriteService` and friends for each
++  example, at 250-400 ms per example. Sharing them needs the `let(:user)` and
++  `let(:bob)` records to become lookups, and the group fixtures to be built from
++  fixed values. Grouped notifications depend on timestamps. Estimated gain about
++  5 s, with more risk than `cache_spec.rb`.
++- `spec/requests/activitypub/replies_spec.rb`: 45 examples at about 180 ms each.
++  `let(:status)` varies by context (visibility), and `before` blocks change
++  accounts (suspensions, deletions). Not a simple share.
++- Factories phase (next): `Fabricate(:status)` about 20 ms, `Fabricate(:user)`
++  about 10 ms (account, two login activities, bcrypt). These drive the 57%.
++
++### Tried and rejected in this phase
++
++- StackProf wall mode with raw samples: 966 MB dump, out of memory when loaded.
++  Use CPU mode and aggregated output (see "Analysis snippets").
++- Skipping all serialization in request specs (not only when no enabled
++  subscriber exists): not done. The subscriber check keeps the behaviour the same
++  wherever a webhook exists (`admin/webhooks_spec.rb`).
+ 
+ ## Factories phase (later, not started)
+ 
+@@ -313,6 +453,10 @@ each needs a decision from the owners.
+ - 2026-11-25, models: baseline 134.0 s (single) and paired pristine 128.4 s
+   mean. Final: 50.2 s mean paired (-61%). Requests baseline 165.1 s single,
+   177.7 s paired pristine; 173.3 s paired current.
++- 2026-11-25, requests (phase 2): pristine 163.8 s single, 154.3 s paired.
++  Phase 1 state 140.5 s. Webhook skip for requests and routes reloaded once
++  per group: 95.3 s. Shared records in `cache_spec`: 79.7 s single, 81.2 s
++  paired (-47%). Models re-run at 49.7 s, 0 failures. Combined about 2.2x.
+ - Final verification after comment-only edits to `config/environments/test.rb`:
+   models 55.2 s (seed 4242), 1795 examples, 0 failures. Within the noise band
+   above; the paired runs remain the reference numbers.
+diff --git a/spec/requests/api/v1/csp_spec.rb b/spec/requests/api/v1/csp_spec.rb
+index 5d61d7f..01ba329 100644
+--- a/spec/requests/api/v1/csp_spec.rb
++++ b/spec/requests/api/v1/csp_spec.rb
+@@ -5,7 +5,9 @@ require 'rails_helper'
+ RSpec.describe 'API namespace minimal Content-Security-Policy' do
+   before { stub_tests_controller }
+ 
+-  after { Rails.application.reload_routes! }
++  # Restore the app routes once per group: every example redraws its own test
++  # routes in `before`, and a full reload after each example was costly.
++  after(:all) { Rails.application.reload_routes! } # rubocop:disable RSpec/BeforeAfterAll
+ 
+   it 'returns the correct CSP headers' do
+     get '/api/v1/tests'
+diff --git a/spec/requests/cache_spec.rb b/spec/requests/cache_spec.rb
+index 8fa5a03..f106e09 100644
+--- a/spec/requests/cache_spec.rb
++++ b/spec/requests/cache_spec.rb
+@@ -171,7 +171,20 @@ RSpec.describe 'Caching behavior' do
+   let(:user) { User.find_by(email: 'user@host.example') }
+   let(:token) { Doorkeeper::AccessToken.find_by(resource_owner_id: user.id) }
+ 
+-  before do
++  # Every example in this file uses the same records, so they are created once for
++  # the group instead of once per example. They live in a pinned transaction that
++  # is rolled back in `after(:context)`. Each example still runs in its own
++  # transaction nested inside it, so database changes an example makes are rolled
++  # back as before. Redis data written here is cleared by the global after-hook
++  # after the first example. No assertion in this file reads timelines or bodies
++  # that depend on it.
++  # rubocop:disable RSpec/BeforeAfterAll
++  before(:context) do
++    # rails_helper switches to inline Sidekiq per example, which has not run yet.
++    Sidekiq.testing!(:inline)
++
++    ActiveRecord::Base.connection_pool.pin_connection!(true)
++
+     alice = Fabricate(:account, username: 'alice')
+     user = Fabricate(:moderator_user, email: 'user@host.example')
+     status = Fabricate(:status, account: alice, id: 110_224_538_612_341_312)
+@@ -183,6 +196,11 @@ RSpec.describe 'Caching behavior' do
+     user.account.follow!(alice)
+   end
+ 
++  after(:context) do
++    ActiveRecord::Base.connection_pool.unpin_connection!
++  end
++  # rubocop:enable RSpec/BeforeAfterAll
++
+   context 'when anonymously accessed' do
+     describe '/users/alice' do
+       it 'redirects with proper cache header', :aggregate_failures do
+diff --git a/spec/requests/signature_verification_spec.rb b/spec/requests/signature_verification_spec.rb
+index 9556911..9a722fc 100644
+--- a/spec/requests/signature_verification_spec.rb
++++ b/spec/requests/signature_verification_spec.rb
+@@ -10,7 +10,9 @@ RSpec.describe 'signature verification concern' do
+     travel_to '2023-12-20T10:00:00Z'
+   end
+ 
+-  after { Rails.application.reload_routes! }
++  # Restore the app routes once per group: every example redraws its own test
++  # routes in `before`, and a full reload after each example was costly.
++  after(:all) { Rails.application.reload_routes! } # rubocop:disable RSpec/BeforeAfterAll
+ 
+   # Include the private key so the tests can be easily adjusted and reviewed
+   let(:actor_keypair) do
+diff --git a/spec/support/skip_unsubscribed_webhook_serialization.rb b/spec/support/skip_unsubscribed_webhook_serialization.rb
+index 0f0a1dc..3fcf754 100644
+--- a/spec/support/skip_unsubscribed_webhook_serialization.rb
++++ b/spec/support/skip_unsubscribed_webhook_serialization.rb
+@@ -8,8 +8,10 @@
+ # observable behaviour) are unchanged. This is test-only; the production code is
+ # not modified.
+ #
+-# Enabled per example for `type: :model` (see the around hook below).
++# Enabled per example for the example types listed below (see the around hook).
+ module SkipUnsubscribedWebhookSerialization
++  TYPES = %i(model request).freeze
++
+   class << self
+     attr_accessor :enabled
+   end
+@@ -33,10 +35,11 @@ end
+ WebhookService.prepend(SkipUnsubscribedWebhookSerialization)
+ 
+ RSpec.configure do |config|
+-  config.around(:each, type: :model) do |example|
+-    SkipUnsubscribedWebhookSerialization.enabled = true
++  config.around do |example|
++    previous = SkipUnsubscribedWebhookSerialization.enabled
++    SkipUnsubscribedWebhookSerialization.enabled = SkipUnsubscribedWebhookSerialization::TYPES.include?(example.metadata[:type])
+     example.run
+   ensure
+-    SkipUnsubscribedWebhookSerialization.enabled = false
++    SkipUnsubscribedWebhookSerialization.enabled = previous
+   end
+ end

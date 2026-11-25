@@ -1,0 +1,824 @@
+diff --git a/app/controllers/cards/images_controller.rb b/app/controllers/cards/images_controller.rb
+index f4fec16..4537466 100644
+--- a/app/controllers/cards/images_controller.rb
++++ b/app/controllers/cards/images_controller.rb
+@@ -2,7 +2,9 @@ class Cards::ImagesController < ApplicationController
+   include CardScoped
+ 
+   def destroy
+-    @card.image.purge_later
++    # Removing the image through the association runs attachment callbacks, which keep the board's and
++    # account's bytes used up to date. attachment.purge_later would skip them.
++    @card.update!(image: nil)
+ 
+     respond_to do |format|
+       format.html { redirect_to @card }
+diff --git a/app/jobs/account/recalculate_bytes_used_job.rb b/app/jobs/account/recalculate_bytes_used_job.rb
+new file mode 100644
+index 0000000..a860e85
+--- /dev/null
++++ b/app/jobs/account/recalculate_bytes_used_job.rb
+@@ -0,0 +1,9 @@
++class Account::RecalculateBytesUsedJob < ApplicationJob
++  limits_concurrency key: ->(account) { account }
++
++  discard_on ActiveJob::DeserializationError
++
++  def perform(account)
++    account.recalculate_bytes_used_now
++  end
++end
+diff --git a/app/jobs/board/recalculate_bytes_used_job.rb b/app/jobs/board/recalculate_bytes_used_job.rb
+new file mode 100644
+index 0000000..90929e9
+--- /dev/null
++++ b/app/jobs/board/recalculate_bytes_used_job.rb
+@@ -0,0 +1,12 @@
++class Board::RecalculateBytesUsedJob < ApplicationJob
++  # Recalculations for the same board run one at a time, so a slow, older calculation can never
++  # overwrite the result of a newer one. Concurrency is limited on the board rather than on a database
++  # row lock, so the calculation doesn't block writers while it runs.
++  limits_concurrency key: ->(board) { board }
++
++  discard_on ActiveJob::DeserializationError
++
++  def perform(board)
++    board.recalculate_bytes_used_now
++  end
++end
+diff --git a/app/models/account.rb b/app/models/account.rb
+index 18d4f42..7dbd0d0 100644
+--- a/app/models/account.rb
++++ b/app/models/account.rb
+@@ -1,5 +1,5 @@
+ class Account < ApplicationRecord
+-  include Cancellable, Entropic, Incineratable, MultiTenantable, Searchable, Seedeable
++  include Cancellable, Entropic, Incineratable, MultiTenantable, Searchable, Seedeable, Storage
+ 
+   has_one :join_code, dependent: :destroy
+   has_many :users, dependent: :destroy
+diff --git a/app/models/account/data_transfer/board_record_set.rb b/app/models/account/data_transfer/board_record_set.rb
+new file mode 100644
+index 0000000..eff32d0
+--- /dev/null
++++ b/app/models/account/data_transfer/board_record_set.rb
+@@ -0,0 +1,7 @@
++class Account::DataTransfer::BoardRecordSet < Account::DataTransfer::RecordSet
++  # bytes_used is derived from the board's content, so exports leave it out and imports recalculate it.
++  # Leaving it out also keeps exports from older versions importable.
++  def initialize(account)
++    super(account: account, model: ::Board, attributes: ::Board.column_names - %w[ bytes_used ])
++  end
++end
+diff --git a/app/models/account/data_transfer/manifest.rb b/app/models/account/data_transfer/manifest.rb
+index 11aaf6a..f69fd6a 100644
+--- a/app/models/account/data_transfer/manifest.rb
++++ b/app/models/account/data_transfer/manifest.rb
+@@ -28,10 +28,10 @@ class Account::DataTransfer::Manifest
+         Account::DataTransfer::UserRecordSet.new(account),
+         *record_sets_for(
+           ::User::Settings,
+-          ::Tag,
+-          ::Board,
+-          ::Column
++          ::Tag
+         ),
++        Account::DataTransfer::BoardRecordSet.new(account),
++        record_set_for(::Column),
+         Account::DataTransfer::EntropyRecordSet.new(account),
+         *record_sets_for(
+           ::Board::Publication,
+diff --git a/app/models/account/import.rb b/app/models/account/import.rb
+index feb41c4..c9d65b1 100644
+--- a/app/models/account/import.rb
++++ b/app/models/account/import.rb
+@@ -49,6 +49,7 @@ class Account::Import < ApplicationRecord
+ 
+     add_importer_to_all_access_boards
+     reconcile_cards_count
++    recalculate_bytes_used
+ 
+     mark_completed
+   rescue Account::DataTransfer::RecordSet::ConflictError => e
+@@ -82,6 +83,12 @@ class Account::Import < ApplicationRecord
+       account.update_column :cards_count, [ account.cards_count, account.cards.maximum(:number).to_i ].max
+     end
+ 
++    # Imported attachments and embeds are inserted without callbacks, so every board is recalculated.
++    def recalculate_bytes_used
++      account.recalculate_bytes_used_later
++      account.boards.find_each(&:recalculate_bytes_used_later)
++    end
++
+     def add_importer_to_all_access_boards
+       importer = account.users.find_by!(identity: identity)
+ 
+diff --git a/app/models/account/storage.rb b/app/models/account/storage.rb
+new file mode 100644
+index 0000000..c681d9b
+--- /dev/null
++++ b/app/models/account/storage.rb
+@@ -0,0 +1,13 @@
++module Account::Storage
++  extend ActiveSupport::Concern
++
++  def recalculate_bytes_used_later
++    Account::RecalculateBytesUsedJob.perform_later(self)
++  end
++
++  def recalculate_bytes_used_now
++    bytes = boards.sum(:bytes_used)
++
++    Account.where(id: id).where.not(bytes_used: bytes).update_all(bytes_used: bytes)
++  end
++end
+diff --git a/app/models/board.rb b/app/models/board.rb
+index 9f1bcd5..9839f77 100644
+--- a/app/models/board.rb
++++ b/app/models/board.rb
+@@ -1,5 +1,5 @@
+ class Board < ApplicationRecord
+-  include Accessible, AutoPostponing, Broadcastable, Cards, Entropic, Filterable, Publishable, Triageable
++  include Accessible, AutoPostponing, Broadcastable, Cards, Entropic, Filterable, Publishable, Storage, Triageable
+ 
+   belongs_to :creator, class_name: "User", default: -> { Current.user }
+   belongs_to :account, default: -> { creator.account }
+diff --git a/app/models/board/storage.rb b/app/models/board/storage.rb
+new file mode 100644
+index 0000000..43264aa
+--- /dev/null
++++ b/app/models/board/storage.rb
+@@ -0,0 +1,43 @@
++module Board::Storage
++  extend ActiveSupport::Concern
++
++  included do
++    after_destroy_commit :recalculate_account_bytes_used_later
++  end
++
++  def recalculate_bytes_used_later
++    Board::RecalculateBytesUsedJob.perform_later(self)
++  end
++
++  def recalculate_bytes_used_now
++    bytes = calculated_bytes_used
++
++    if Board.where(id: id).where.not(bytes_used: bytes).update_all(bytes_used: bytes).positive?
++      account.recalculate_bytes_used_later
++    end
++  end
++
++  private
++    def recalculate_account_bytes_used_later
++      Account.find_by(id: account_id)&.recalculate_bytes_used_later
++    end
++
++    def calculated_bytes_used
++      counted_attachments.joins(:blob).sum("active_storage_blobs.byte_size")
++    end
++
++    def counted_attachments
++      card_images = ActiveStorage::Attachment.where(record_type: "Card", name: "image", record_id: cards.select(:id))
++      embedded_files = ActiveStorage::Attachment.where(record_type: "ActionText::RichText", name: "embeds", record_id: counted_rich_texts.select(:id))
++
++      card_images.or(embedded_files)
++    end
++
++    def counted_rich_texts
++      board_descriptions = ActionText::RichText.where(record_type: "Board", name: "public_description", record_id: id)
++      card_descriptions = ActionText::RichText.where(record_type: "Card", name: "description", record_id: cards.select(:id))
++      comments = ActionText::RichText.where(record_type: "Comment", name: "body", record_id: Comment.where(card_id: cards.select(:id)).select(:id))
++
++      board_descriptions.or(card_descriptions).or(comments)
++    end
++end
+diff --git a/app/models/card.rb b/app/models/card.rb
+index 19c3fc2..ad0a9c6 100644
+--- a/app/models/card.rb
++++ b/app/models/card.rb
+@@ -18,6 +18,9 @@ class Card < ApplicationRecord
+   after_save   -> { board.touch }, if: :published?
+   after_touch  -> { board.touch }, if: :published?
+   after_update :handle_board_change, if: :saved_change_to_board_id?
++  # Remembered before the save, because handle_board_change saves again and would clear the board change.
++  before_update :remember_board_ids_for_bytes_used, if: :will_save_change_to_board_id?
++  after_update_commit :recalculate_bytes_used_for_remembered_boards, if: :remembered_board_ids_for_bytes_used?
+ 
+   scope :reverse_chronologically, -> { order created_at:     :desc, id: :desc }
+   scope :chronologically,         -> { order created_at:     :asc,  id: :asc  }
+@@ -72,6 +75,19 @@ class Card < ApplicationRecord
+       self.title = "Untitled" if title.blank?
+     end
+ 
++    def remember_board_ids_for_bytes_used
++      @board_ids_for_bytes_used = [ board_id_in_database, board_id ]
++    end
++
++    def remembered_board_ids_for_bytes_used?
++      @board_ids_for_bytes_used.present?
++    end
++
++    def recalculate_bytes_used_for_remembered_boards
++      Board.where(id: @board_ids_for_bytes_used).each(&:recalculate_bytes_used_later)
++      @board_ids_for_bytes_used = nil
++    end
++
+     def handle_board_change
+       old_board = account.boards.find_by(id: board_id_before_last_save)
+ 
+diff --git a/db/migrate/20261122120000_add_bytes_used_to_accounts_and_boards.rb b/db/migrate/20261122120000_add_bytes_used_to_accounts_and_boards.rb
+new file mode 100644
+index 0000000..f735549
+--- /dev/null
++++ b/db/migrate/20261122120000_add_bytes_used_to_accounts_and_boards.rb
+@@ -0,0 +1,9 @@
++class AddBytesUsedToAccountsAndBoards < ActiveRecord::Migration[8.2]
++  # Existing accounts and boards start at zero. Fill them in once after deploying with:
++  #
++  #   bin/rails storage:recalculate_bytes_used
++  def change
++    add_column :accounts, :bytes_used, :bigint, default: 0, null: false
++    add_column :boards, :bytes_used, :bigint, default: 0, null: false
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 81a3526..948e2ea 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
++ActiveRecord::Schema[8.2].define(version: 2026_11_22_120000) do
+   create_table "accesses", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+     t.datetime "accessed_at"
+     t.uuid "account_id", null: false
+@@ -66,6 +66,7 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.bigint "external_account_id"
+     t.string "name", null: false
+     t.datetime "updated_at", null: false
++    t.bigint "bytes_used", default: 0, null: false
+     t.index ["external_account_id"], name: "index_accounts_on_external_account_id", unique: true
+   end
+ 
+@@ -175,6 +176,7 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.uuid "creator_id", null: false
+     t.string "name", null: false
+     t.datetime "updated_at", null: false
++    t.bigint "bytes_used", default: 0, null: false
+     t.index ["account_id"], name: "index_boards_on_account_id"
+     t.index ["creator_id"], name: "index_boards_on_creator_id"
+   end
+diff --git a/db/schema_sqlite.rb b/db/schema_sqlite.rb
+index 1c89abe..512c9f3 100644
+--- a/db/schema_sqlite.rb
++++ b/db/schema_sqlite.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
++ActiveRecord::Schema[8.2].define(version: 2026_11_22_120000) do
+   create_table "accesses", id: :uuid, force: :cascade do |t|
+     t.datetime "accessed_at"
+     t.uuid "account_id", null: false
+@@ -66,6 +66,7 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.bigint "external_account_id"
+     t.string "name", limit: 255, null: false
+     t.datetime "updated_at", null: false
++    t.bigint "bytes_used", default: 0, null: false
+     t.index ["external_account_id"], name: "index_accounts_on_external_account_id", unique: true
+   end
+ 
+@@ -175,6 +176,7 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.uuid "creator_id", null: false
+     t.string "name", limit: 255, null: false
+     t.datetime "updated_at", null: false
++    t.bigint "bytes_used", default: 0, null: false
+     t.index ["account_id"], name: "index_boards_on_account_id"
+     t.index ["creator_id"], name: "index_boards_on_creator_id"
+   end
+diff --git a/lib/rails_ext/active_storage_attachment_bytes_used.rb b/lib/rails_ext/active_storage_attachment_bytes_used.rb
+new file mode 100644
+index 0000000..520c8d7
+--- /dev/null
++++ b/lib/rails_ext/active_storage_attachment_bytes_used.rb
+@@ -0,0 +1,51 @@
++# Keeps Board#bytes_used current as counted files are added and removed. Counted files are card images
++# and files embedded in card descriptions, comments, and board descriptions.
++#
++# Recalculations are enqueued after commit so they always see the committed change. Removals that skip
++# callbacks (attachment.purge, purge_later, or delete) don't reach this hook and must enqueue their own
++# recalculation.
++module ActiveStorageAttachmentBytesUsed
++  extend ActiveSupport::Concern
++
++  included do
++    after_create_commit :recalculate_board_bytes_used_later
++
++    # The board is remembered before the rows are deleted, so a cascading destroy (for example, deleting
++    # a card along with its comments) can still recalculate it after the commit.
++    before_destroy :remember_board_for_bytes_used
++    after_destroy_commit :recalculate_remembered_board_bytes_used_later
++  end
++
++  private
++    def recalculate_board_bytes_used_later
++      board_for_bytes_used&.recalculate_bytes_used_later
++    end
++
++    def remember_board_for_bytes_used
++      @board_id_for_bytes_used = board_for_bytes_used&.id
++    end
++
++    def recalculate_remembered_board_bytes_used_later
++      Board.find_by(id: @board_id_for_bytes_used)&.recalculate_bytes_used_later
++    end
++
++    def board_for_bytes_used
++      if record_type == "Card" && name == "image"
++        record&.board
++      elsif record_type == "ActionText::RichText" && name == "embeds"
++        board_for_rich_text_owner(record&.record)
++      end
++    end
++
++    def board_for_rich_text_owner(owner)
++      case owner
++      when Board then owner
++      when Card then owner.board
++      when Comment then owner.card&.board
++      end
++    end
++end
++
++ActiveSupport.on_load :active_storage_attachment do
++  include ActiveStorageAttachmentBytesUsed
++end
+diff --git a/lib/tasks/storage.rake b/lib/tasks/storage.rake
+new file mode 100644
+index 0000000..624a010
+--- /dev/null
++++ b/lib/tasks/storage.rake
+@@ -0,0 +1,9 @@
++namespace :storage do
++  desc "Recalculate bytes used for every board and account in the background"
++  task recalculate_bytes_used: :environment do
++    Board.find_each(&:recalculate_bytes_used_later)
++    Account.find_each(&:recalculate_bytes_used_later)
++
++    puts "Enqueued bytes used recalculation for #{Board.count} boards and #{Account.count} accounts."
++  end
++end
+diff --git a/test/controllers/cards/images_controller_test.rb b/test/controllers/cards/images_controller_test.rb
+index 5dbedcf..44655a9 100644
+--- a/test/controllers/cards/images_controller_test.rb
++++ b/test/controllers/cards/images_controller_test.rb
+@@ -1,6 +1,8 @@
+ require "test_helper"
+ 
+ class Cards::ImagesControllerTest < ActionDispatch::IntegrationTest
++  include StorageTestHelper
++
+   setup do
+     sign_in_as :kevin
+   end
+@@ -28,4 +30,16 @@ class Cards::ImagesControllerTest < ActionDispatch::IntegrationTest
+     assert_response :no_content
+     assert_not card.reload.image.attached?
+   end
++
++  test "destroy removes the image from the board's usage" do
++    card = cards(:logo)
++    card.image.attach(io: file_fixture("moon.jpg").open, filename: "moon.jpg")
++    perform_bytes_used_jobs
++    assert_equal file_fixture("moon.jpg").size, boards(:writebook).reload.bytes_used
++
++    delete card_image_path(card)
++    perform_bytes_used_jobs
++
++    assert_equal 0, boards(:writebook).reload.bytes_used
++  end
+ end
+diff --git a/test/jobs/board/recalculate_bytes_used_job_test.rb b/test/jobs/board/recalculate_bytes_used_job_test.rb
+new file mode 100644
+index 0000000..8605e42
+--- /dev/null
++++ b/test/jobs/board/recalculate_bytes_used_job_test.rb
+@@ -0,0 +1,28 @@
++require "test_helper"
++
++class Board::RecalculateBytesUsedJobTest < ActiveJob::TestCase
++  test "recalculates the board's usage" do
++    Board.any_instance.expects(:recalculate_bytes_used_now).once
++
++    Board::RecalculateBytesUsedJob.perform_now(boards(:writebook))
++  end
++
++  test "discards the job when the board no longer exists" do
++    board = boards(:private)
++    Board::RecalculateBytesUsedJob.perform_later(board)
++    Board.where(id: board.id).delete_all
++
++    assert_nothing_raised do
++      perform_enqueued_jobs
++    end
++  end
++
++  test "serializes recalculations of the same board" do
++    board = boards(:writebook)
++
++    assert_equal Board::RecalculateBytesUsedJob.new(board).concurrency_key,
++      Board::RecalculateBytesUsedJob.new(board).concurrency_key
++    assert_not_equal Board::RecalculateBytesUsedJob.new(board).concurrency_key,
++      Board::RecalculateBytesUsedJob.new(boards(:private)).concurrency_key
++  end
++end
+diff --git a/test/models/account/data_transfer/board_record_set_test.rb b/test/models/account/data_transfer/board_record_set_test.rb
+new file mode 100644
+index 0000000..4f8ee2f
+--- /dev/null
++++ b/test/models/account/data_transfer/board_record_set_test.rb
+@@ -0,0 +1,43 @@
++require "test_helper"
++
++class Account::DataTransfer::BoardRecordSetTest < ActiveSupport::TestCase
++  test "bytes used is not part of the transferred attributes" do
++    record_set = Account::DataTransfer::BoardRecordSet.new(accounts("37s"))
++
++    assert_includes record_set.attributes, "name"
++    assert_not_includes record_set.attributes, "bytes_used"
++  end
++
++  test "check accepts board exports written before bytes used was tracked" do
++    data = boards(:writebook).attributes.except("bytes_used").merge(
++      "id" => "legacy_board_id_0123456789012",
++      "account_id" => "nonexistent_account_id_1234567",
++      "creator_id" => "nonexistent_user_id_123456789"
++    )
++    record_set = Account::DataTransfer::BoardRecordSet.new(accounts("37s"))
++
++    assert_nothing_raised do
++      record_set.check(from: build_reader(data))
++    end
++  end
++
++  private
++    def build_reader(data)
++      tempfile = Tempfile.new([ "board_export", ".zip" ])
++      tempfile.binmode
++
++      writer = ZipFile::Writer.new(tempfile)
++      writer.add_file("data/boards/#{data['id']}.json", data.to_json)
++      writer.close
++      tempfile.rewind
++
++      @tempfiles ||= []
++      @tempfiles << tempfile
++
++      ZipFile::Reader.new(tempfile)
++    end
++
++    def teardown
++      @tempfiles&.each { |f| f.close; f.unlink }
++    end
++end
+diff --git a/test/models/account/import_test.rb b/test/models/account/import_test.rb
+index c1e9c2f..92a4212 100644
+--- a/test/models/account/import_test.rb
++++ b/test/models/account/import_test.rb
+@@ -1,6 +1,8 @@
+ require "test_helper"
+ 
+ class Account::ImportTest < ActiveSupport::TestCase
++  include StorageTestHelper
++
+   test "cleanup deletes completed imports older than 24 hours" do
+     identity = identities(:david)
+     old_completed = Account::Import.create!(account: Current.account, identity: identity, status: :completed, completed_at: 25.hours.ago)
+@@ -92,6 +94,45 @@ class Account::ImportTest < ActiveSupport::TestCase
+     export_tempfile&.unlink
+   end
+ 
++  test "import recalculates bytes used for imported boards" do
++    source_account = accounts("37s")
++    exporter = users(:david)
++    identity = exporter.identity
++    blob = upload_blob
++    Current.set(account: source_account) do
++      cards(:logo).image.attach(blob)
++    end
++    perform_bytes_used_jobs
++    expected_bytes_used = source_account.reload.boards.sum(:bytes_used)
++    assert_operator expected_bytes_used, :>, 0
++
++    export = Account::Export.create!(account: source_account, user: exporter)
++    export.build
++
++    export_tempfile = Tempfile.new([ "export", ".zip" ])
++    export.file.open { |f| FileUtils.cp(f.path, export_tempfile.path) }
++
++    source_account.destroy!
++    ActiveStorage::Blob.where(id: blob.id).delete_all
++
++    target_account = Account.create_with_owner(account: { name: "Import Test" }, owner: { identity: identity, name: exporter.name })
++    import = Account::Import.create!(identity: identity, account: target_account)
++    Current.set(account: target_account) do
++      import.file.attach(io: File.open(export_tempfile.path), filename: "export.zip", content_type: "application/zip")
++    end
++
++    Current.set(account: target_account) do
++      import.check
++      import.process
++    end
++    perform_bytes_used_jobs
++
++    assert_equal expected_bytes_used, target_account.reload.bytes_used
++  ensure
++    export_tempfile&.close
++    export_tempfile&.unlink
++  end
++
+   test "check sets no failure_reason for unexpected errors" do
+     import = Account::Import.create!(identity: identities(:david), account: Account.create!(name: "Import Test"))
+ 
+diff --git a/test/models/account/storage_test.rb b/test/models/account/storage_test.rb
+new file mode 100644
+index 0000000..ed7c173
+--- /dev/null
++++ b/test/models/account/storage_test.rb
+@@ -0,0 +1,62 @@
++require "test_helper"
++
++class Account::StorageTest < ActiveSupport::TestCase
++  include StorageTestHelper
++
++  setup do
++    Current.session = sessions(:david)
++    @account = accounts("37s")
++  end
++
++  test "bytes used is zero for an account without counted content" do
++    assert_equal 0, accounts(:initech).bytes_used
++  end
++
++  test "sums the usage of all boards" do
++    writebook_blob = upload_blob("moon.jpg")
++    private_blob = upload_blob("avatar.png")
++    private_card = boards(:private).cards.create!(title: "Private card")
++
++    cards(:logo).image.attach(writebook_blob)
++    private_card.image.attach(private_blob)
++    perform_bytes_used_jobs
++
++    assert_equal writebook_blob.byte_size, boards(:writebook).reload.bytes_used
++    assert_equal private_blob.byte_size, boards(:private).reload.bytes_used
++    assert_equal writebook_blob.byte_size + private_blob.byte_size, @account.reload.bytes_used
++  end
++
++  test "usage is recalculated in the background" do
++    blob = upload_blob
++
++    assert_enqueued_with(job: Board::RecalculateBytesUsedJob, args: [ boards(:writebook) ]) do
++      cards(:logo).image.attach(blob)
++    end
++
++    assert_equal 0, @account.reload.bytes_used
++  end
++
++  test "removing a board removes its usage from the account" do
++    writebook_blob = upload_blob("moon.jpg")
++    private_blob = upload_blob("avatar.png")
++    private_card = boards(:private).cards.create!(title: "Private card")
++
++    cards(:logo).image.attach(writebook_blob)
++    private_card.image.attach(private_blob)
++    perform_bytes_used_jobs
++
++    boards(:writebook).destroy!
++    perform_bytes_used_jobs
++
++    assert_equal private_blob.byte_size, @account.reload.bytes_used
++  end
++
++  test "recalculating sums the board values" do
++    boards(:writebook).update_columns(bytes_used: 10)
++    boards(:private).update_columns(bytes_used: 32)
++
++    @account.recalculate_bytes_used_now
++
++    assert_equal 42, @account.reload.bytes_used
++  end
++end
+diff --git a/test/models/board/storage_test.rb b/test/models/board/storage_test.rb
+new file mode 100644
+index 0000000..0e2ac26
+--- /dev/null
++++ b/test/models/board/storage_test.rb
+@@ -0,0 +1,176 @@
++require "test_helper"
++
++class Board::StorageTest < ActiveSupport::TestCase
++  include StorageTestHelper
++
++  setup do
++    Current.session = sessions(:david)
++    @board = boards(:writebook)
++    @card = cards(:logo)
++  end
++
++  test "bytes used is zero when a board has no counted content" do
++    assert_equal 0, boards(:private).bytes_used
++  end
++
++  test "counts card images" do
++    blob = upload_blob
++
++    @card.image.attach(blob)
++    perform_bytes_used_jobs
++
++    assert_equal blob.byte_size, @board.reload.bytes_used
++  end
++
++  test "counts files embedded in card descriptions" do
++    blob = upload_blob
++
++    @card.update!(description: embed_html(blob))
++    perform_bytes_used_jobs
++
++    assert_equal blob.byte_size, @board.reload.bytes_used
++  end
++
++  test "counts files embedded in comments on the board's cards" do
++    blob = upload_blob
++
++    @card.comments.create!(body: embed_html(blob))
++    perform_bytes_used_jobs
++
++    assert_equal blob.byte_size, @board.reload.bytes_used
++  end
++
++  test "counts files embedded in the board description" do
++    blob = upload_blob
++
++    @board.update!(public_description: embed_html(blob))
++    perform_bytes_used_jobs
++
++    assert_equal blob.byte_size, @board.reload.bytes_used
++  end
++
++  test "sums everything counted on the board and its cards" do
++    image = upload_blob("moon.jpg")
++    embedded = upload_blob("avatar.png")
++
++    @card.image.attach(image)
++    @card.update!(description: embed_html(embedded))
++    @card.comments.create!(body: embed_html(embedded))
++    perform_bytes_used_jobs
++
++    assert_equal image.byte_size + 2 * embedded.byte_size, @board.reload.bytes_used
++  end
++
++  test "ignores attachments that are not card images or embeds" do
++    avatar = upload_blob("avatar.png")
++
++    users(:david).avatar.attach(avatar)
++    perform_bytes_used_jobs
++
++    assert_equal 0, @board.reload.bytes_used
++    assert_equal 0, accounts("37s").reload.bytes_used
++  end
++
++  test "does not count content from other boards" do
++    blob = upload_blob
++    other_card = boards(:private).cards.create!(title: "Private card")
++
++    other_card.image.attach(blob)
++    perform_bytes_used_jobs
++
++    assert_equal 0, @board.reload.bytes_used
++    assert_equal blob.byte_size, boards(:private).reload.bytes_used
++  end
++
++  test "usage is calculated in the background" do
++    blob = upload_blob
++
++    assert_enqueued_with(job: Board::RecalculateBytesUsedJob, args: [ @board ]) do
++      @card.image.attach(blob)
++    end
++
++    assert_equal 0, @board.reload.bytes_used
++  end
++
++  test "updates when a card image is removed" do
++    blob = upload_blob
++    @card.image.attach(blob)
++    perform_bytes_used_jobs
++
++    @card.update!(image: nil)
++    perform_bytes_used_jobs
++
++    assert_equal 0, @board.reload.bytes_used
++  end
++
++  test "replacing a card image counts only the new image" do
++    old_image = upload_blob("moon.jpg")
++    new_image = upload_blob("avatar.png")
++    @card.image.attach(old_image)
++    perform_bytes_used_jobs
++
++    @card.image.attach(new_image)
++    perform_bytes_used_jobs
++
++    assert_equal new_image.byte_size, @board.reload.bytes_used
++  end
++
++  test "updates when an embedded file is removed from a card description" do
++    blob = upload_blob
++    @card.update!(description: embed_html(blob))
++    perform_bytes_used_jobs
++
++    @card.update!(description: "No files anymore")
++    perform_bytes_used_jobs
++
++    assert_equal 0, @board.reload.bytes_used
++  end
++
++  test "updates when a comment with files is deleted" do
++    blob = upload_blob
++    comment = @card.comments.create!(body: embed_html(blob))
++    perform_bytes_used_jobs
++    assert_equal blob.byte_size, @board.reload.bytes_used
++
++    comment.destroy!
++    perform_bytes_used_jobs
++
++    assert_equal 0, @board.reload.bytes_used
++  end
++
++  test "updates when a card with files is deleted" do
++    blob = upload_blob
++    @card.image.attach(blob)
++    perform_bytes_used_jobs
++
++    @card.destroy!
++    perform_bytes_used_jobs
++
++    assert_equal 0, @board.reload.bytes_used
++  end
++
++  test "moves usage with a card that changes boards" do
++    blob = upload_blob
++    @card.image.attach(blob)
++    perform_bytes_used_jobs
++
++    @card.move_to(boards(:private))
++    perform_bytes_used_jobs
++
++    assert_equal 0, @board.reload.bytes_used
++    assert_equal blob.byte_size, boards(:private).reload.bytes_used
++  end
++
++  test "recalculating does not change the board's updated_at or enqueue needless account updates" do
++    blob = upload_blob
++    @card.image.attach(blob)
++    perform_bytes_used_jobs
++    updated_at = @board.reload.updated_at
++
++    assert_no_enqueued_jobs(only: Account::RecalculateBytesUsedJob) do
++      @board.recalculate_bytes_used_now
++    end
++
++    assert_equal updated_at, @board.reload.updated_at
++  end
++end
+diff --git a/test/test_helpers/storage_test_helper.rb b/test/test_helpers/storage_test_helper.rb
+new file mode 100644
+index 0000000..889cf2a
+--- /dev/null
++++ b/test/test_helpers/storage_test_helper.rb
+@@ -0,0 +1,23 @@
++module StorageTestHelper
++  BYTES_USED_JOBS = [ Board::RecalculateBytesUsedJob, Account::RecalculateBytesUsedJob ].freeze
++
++  def upload_blob(filename = "moon.jpg")
++    ActiveStorage::Blob.create_and_upload!(
++      io: file_fixture(filename).open,
++      filename: filename,
++      content_type: "image/jpeg"
++    )
++  end
++
++  def embed_html(blob)
++    %(<action-text-attachment sgid="#{blob.attachable_sgid}"></action-text-attachment>)
++  end
++
++  # Runs pending bytes used recalculations, including the account recalculations that board
++  # recalculations enqueue, and leaves unrelated jobs alone.
++  def perform_bytes_used_jobs
++    while enqueued_jobs.any? { |job| BYTES_USED_JOBS.include?(job[:job]) }
++      perform_enqueued_jobs only: BYTES_USED_JOBS
++    end
++  end
++end

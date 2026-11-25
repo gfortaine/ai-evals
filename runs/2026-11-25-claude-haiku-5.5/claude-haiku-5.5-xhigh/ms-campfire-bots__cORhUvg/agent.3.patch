@@ -1,0 +1,930 @@
+diff --git a/README.md b/README.md
+index 487547d..be2137a 100644
+--- a/README.md
++++ b/README.md
+@@ -8,7 +8,7 @@ expect, including:
+ - File attachments with previews
+ - Search
+ - Notifications (via Web Push)
+-- Chat bots that post messages over HTTP, and that get a webhook when they're mentioned (see [bots](docs/bots.md))
++- Chat bots that post messages over HTTP, and that get a webhook when they're mentioned or join a room (see [bots](docs/bots.md))
+ - @mentions
+ 
+ ## Running your own Campfire instance
+diff --git a/app/controllers/bots_controller.rb b/app/controllers/bots_controller.rb
+index ec46e5e..e77aa81 100644
+--- a/app/controllers/bots_controller.rb
++++ b/app/controllers/bots_controller.rb
+@@ -46,8 +46,9 @@ class BotsController < ApplicationController
+     end
+ 
+     # Browsers send an empty avatar field when no file was picked, which mustn't clear the existing avatar. An empty
+-    # webhook URL does clear it, so that's left alone.
++    # webhook URL does clear it, so that's left alone. The switch's hidden field sends false when it's off, so a form
++    # always says which it is; a request that leaves the field out leaves the switch as it was.
+     def bot_params
+-      params.require(:bot).permit(:name, :avatar, :webhook_url).compact
++      params.require(:bot).permit(:name, :avatar, :webhook_url, :join_all_open_rooms).compact
+     end
+ end
+diff --git a/app/jobs/bot/webhook_job.rb b/app/jobs/bot/webhook_job.rb
+index 5b871cb..8494316 100644
+--- a/app/jobs/bot/webhook_job.rb
++++ b/app/jobs/bot/webhook_job.rb
+@@ -1,8 +1,9 @@
+ class Bot::WebhookJob < ApplicationJob
+-  # The bot or the message may be deleted before the job runs. Then there's nothing to ask.
++  # The bot, or the message or room it's asked about, may be deleted before the job runs. Then there's nothing to ask.
+   discard_on ActiveJob::DeserializationError
+ 
+-  def perform(bot, message)
+-    Bot::Webhook.new(bot, message).deliver
++  # The subject is a Message that mentions the bot, or a Room that the bot has joined.
++  def perform(bot, subject)
++    Bot::Webhook.new(bot, subject).deliver
+   end
+ end
+diff --git a/app/models/bot.rb b/app/models/bot.rb
+index 3486a9c..68644a4 100644
+--- a/app/models/bot.rb
++++ b/app/models/bot.rb
+@@ -4,6 +4,9 @@
+ # error reports.
+ #
+ # A bot may also have a webhook URL. Mentions of the bot are sent there, and the bot can answer in the response.
++#
++# Bots don't join open rooms on their own. With "join all open rooms" on, a bot is a member of every open room: the
++# ones that exist when the switch is turned on, and the ones created later. Turning it off keeps its memberships.
+ class Bot < ApplicationRecord
+   has_secure_token :bot_key
+ 
+@@ -16,6 +19,8 @@ class Bot < ApplicationRecord
+   validates :name, presence: true
+   validate :webhook_url_must_be_http_url
+ 
++  after_save :join_open_rooms, if: -> { saved_change_to_join_all_open_rooms?(to: true) }
++
+   scope :ordered, -> { joins(:user).order("LOWER(users.name)") }
+   scope :active, -> { joins(:user).merge(User.active) }
+   scope :created_by, ->(user) { where(creator: user) }
+@@ -65,6 +70,14 @@ class Bot < ApplicationRecord
+       user || build_user(password: SecureRandom.base58(64))
+     end
+ 
++    # Joins every open room that exists now. Rooms opened later add the bot when they're created (see Rooms::Open).
++    # This runs in the same transaction as the save, so the bot's memberships are all or nothing.
++    def join_open_rooms
++      return unless user.active?
++
++      Rooms::Open.find_each { |room| room.memberships.grant_to(user) }
++    end
++
+     # Laid out the way the composer lays out a typed message: one block, line breaks kept, markup escaped.
+     def html_from_text(text)
+       lines = text.lines(chomp: true).map { |line| ERB::Util.html_escape(line) }
+diff --git a/app/models/bot/webhook.rb b/app/models/bot/webhook.rb
+index a0db029..b8cecdc 100644
+--- a/app/models/bot/webhook.rb
++++ b/app/models/bot/webhook.rb
+@@ -2,9 +2,9 @@ require "net/http"
+ require "zlib"
+ require "restricted_http/private_network_guard"
+ 
+-# Tells a bot's webhook about a mention, and posts the bot's answer into the room when it gives one.
+-#
+-# The webhook is asked with a JSON POST. The answer is in the HTTP response:
++# Tells a bot's webhook about something that happened to it, and posts the bot's answer into the room when it gives one.
++# Two things are told: a mention of the bot, given as the Message that mentions it, and the bot joining a room, given as
++# the Room. Both are sent as a JSON POST, and both are answered the same way:
+ #
+ # - 200 with a text/plain or text/html body: the body is posted into the room as the bot's message.
+ # - 204, or any other response: nothing is posted. Redirects aren't followed.
+@@ -35,8 +35,11 @@ class Bot::Webhook
+ 
+   attr_reader :bot, :message, :room
+ 
+-  def initialize(bot, message)
+-    @bot, @message, @room = bot, message, message.room
++  # The subject is a Message that mentions the bot, or a Room that the bot has just joined.
++  def initialize(bot, subject)
++    @bot = bot
++    @message = subject if subject.is_a?(Message)
++    @room = subject.is_a?(Room) ? subject : subject.room
+   end
+ 
+   def deliver
+@@ -50,19 +53,31 @@ class Bot::Webhook
+ 
+   # The JSON sent to the webhook. Paths are relative: the bot knows its Campfire origin.
+   def payload
+-    {
+-      event: "mention",
+-      author: { id: message.creator.id, name: message.creator.name },
+-      room: { id: room.id, name: room_name, reply_to: routes.room_bot_messages_path(room, bot.bot_key) },
+-      message: {
+-        id: message.id,
+-        body: { text: text, html: html },
+-        link: routes.room_at_message_path(room, message)
+-      }
+-    }
++    message ? mention_payload : joined_payload
+   end
+ 
+   private
++    def mention_payload
++      {
++        event: "mention",
++        author: { id: message.creator.id, name: message.creator.name },
++        room: room_json,
++        message: {
++          id: message.id,
++          body: { text: text, html: html },
++          link: routes.room_at_message_path(room, message)
++        }
++      }
++    end
++
++    def joined_payload
++      { event: "joined", room: room_json }
++    end
++
++    def room_json
++      { id: room.id, name: room_name, reply_to: routes.room_bot_messages_path(room, bot.bot_key) }
++    end
++
+     def routes
+       Rails.application.routes.url_helpers
+     end
+diff --git a/app/models/room.rb b/app/models/room.rb
+index 3ae9d0c..40a4599 100644
+--- a/app/models/room.rb
++++ b/app/models/room.rb
+@@ -2,7 +2,11 @@ class Room < ApplicationRecord
+   has_many :memberships, dependent: :delete_all do
+     def grant_to(users)
+       room = proxy_association.owner
+-      Membership.insert_all(Array(users).collect { |user| { room_id: room.id, user_id: user.id, involvement: room.default_involvement } })
++      attributes = Array(users).collect { |user| { room_id: room.id, user_id: user.id, involvement: room.default_involvement } }
++
++      # RETURNING only includes the memberships this grant created, so someone who was already in the room isn't announced again.
++      inserted = Membership.insert_all(attributes, returning: %i[ user_id ])
++      room.announce_joined_bots(inserted.rows.flatten)
+     end
+ 
+     def revoke_from(users)
+@@ -51,6 +55,21 @@ class Room < ApplicationRecord
+     ask_mentioned_bots_later(message)
+   end
+ 
++  # Sends a joined event to the webhooks of the bots that were just added to this room. Direct rooms never send one.
++  # The events go out once the memberships have committed, so a webhook never hears about a membership that rolls back.
++  # Bots are few, so they're matched in Ruby: a query with every new member's id would be as long as the account.
++  def announce_joined_bots(user_ids)
++    return if direct? || user_ids.empty?
++
++    Room.current_transaction.after_commit do
++      joined_user_ids = user_ids.to_set
++
++      Bot.active.with_webhook.find_each do |bot|
++        Bot::WebhookJob.perform_later(bot, self) if joined_user_ids.include?(bot.user_id)
++      end
++    end
++  end
++
+   def open?
+     is_a?(Rooms::Open)
+   end
+diff --git a/app/models/rooms/open.rb b/app/models/rooms/open.rb
+index 813aaec..b5a35c4 100644
+--- a/app/models/rooms/open.rb
++++ b/app/models/rooms/open.rb
+@@ -1,9 +1,10 @@
+ # Rooms open to all users on the account. When a new user is added to the account, they're automatically granted membership.
++# Bots are the exception: they're granted membership only when they're set to join all open rooms.
+ class Rooms::Open < Room
+   after_save_commit :grant_access_to_all_users
+ 
+   private
+     def grant_access_to_all_users
+-      memberships.grant_to(User.active) if type_previously_changed?(to: "Rooms::Open")
++      memberships.grant_to(User.active.joining_open_rooms) if type_previously_changed?(to: "Rooms::Open")
+     end
+ end
+diff --git a/app/models/user.rb b/app/models/user.rb
+index 63d819b..eb7cf9e 100644
+--- a/app/models/user.rb
++++ b/app/models/user.rb
+@@ -21,12 +21,15 @@ class User < ApplicationRecord
+ 
+   has_secure_password validations: false
+ 
+-  after_create_commit :grant_membership_to_open_rooms
++  after_create_commit :grant_membership_to_open_rooms, unless: :bot?
+ 
+   scope :ordered, -> { order("LOWER(name)") }
+   scope :filtered_by, ->(query) { where("name like ?", "%#{query}%") }
+   scope :without_bots, -> { where.not(id: Bot.select(:user_id)) }
+ 
++  # People always join open rooms. Bots do only when they're set to join all of them (see Bot).
++  scope :joining_open_rooms, -> { where.not(id: Bot.where(join_all_open_rooms: false).select(:user_id)) }
++
+   def bot?
+     bot.present?
+   end
+diff --git a/app/views/bots/_form.html.erb b/app/views/bots/_form.html.erb
+index f6f8efb..2fd91d6 100644
+--- a/app/views/bots/_form.html.erb
++++ b/app/views/bots/_form.html.erb
+@@ -31,7 +31,20 @@
+     </label>
+   </div>
+ 
+-  <p class="txt-subtle txt-small margin-none">Optional. Campfire sends each mention of this bot to this address as JSON, and the bot can answer in the response. Leave it empty to remove the webhook.</p>
++  <p class="txt-subtle txt-small margin-none">Optional. Campfire sends each mention of this bot, and each room the bot joins, to this address as JSON, and the bot can answer in the response. Leave it empty to remove the webhook.</p>
++
++  <div class="flex flex-column gap">
++    <label class="flex align-center gap pad-block pad-inline fill-shade border-radius txt-align-start">
++      <span class="flex-item-grow">Add to all open rooms</span>
++
++      <span class="switch flex-item-no-shrink">
++        <%= form.check_box :join_all_open_rooms, class: "switch__input" %>
++        <span class="switch__btn round"></span>
++      </span>
++    </label>
++
++    <p class="txt-subtle txt-small margin-none">The bot joins every open room, including rooms created later. Turning this off leaves it in the rooms it's already in.</p>
++  </div>
+ 
+   <%= form.button class: "btn btn--reversed center txt-large", type: "submit" do %>
+     <%= image_tag "check.svg", aria: { hidden: "true" }, size: 20 %>
+diff --git a/db/migrate/20261119024133_add_join_all_open_rooms_to_bots.rb b/db/migrate/20261119024133_add_join_all_open_rooms_to_bots.rb
+new file mode 100644
+index 0000000..5f65a30
+--- /dev/null
++++ b/db/migrate/20261119024133_add_join_all_open_rooms_to_bots.rb
+@@ -0,0 +1,5 @@
++class AddJoinAllOpenRoomsToBots < ActiveRecord::Migration[8.1]
++  def change
++    add_column :bots, :join_all_open_rooms, :boolean, default: false, null: false
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index e42b85d..e0245a3 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.1].define(version: 2026_11_19_021951) do
++ActiveRecord::Schema[8.1].define(version: 2026_11_19_024133) do
+   create_table "accounts", force: :cascade do |t|
+     t.datetime "created_at", null: false
+     t.text "custom_styles"
+@@ -83,6 +83,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_19_021951) do
+     t.string "bot_key", null: false
+     t.datetime "created_at", null: false
+     t.integer "creator_id", null: false
++    t.boolean "join_all_open_rooms", default: false, null: false
+     t.datetime "updated_at", null: false
+     t.integer "user_id", null: false
+     t.string "webhook_url"
+diff --git a/docs/bots.md b/docs/bots.md
+index 387d33a..dd7bf77 100644
+--- a/docs/bots.md
++++ b/docs/bots.md
+@@ -1,13 +1,14 @@
+ # Chat bots
+ 
+-Bots are members of rooms that post messages over HTTP, and that can be asked about mentions over HTTP (webhooks).
++Bots are members of rooms that post messages over HTTP, and that are told over HTTP (webhooks) about mentions of them and about the rooms they join.
+ A bot is set up by a chat member and then driven by a shell script or CI job, which authenticates with the bot's
+ code.
+ 
+ ## Setting up a bot (people)
+ 
+ 1. Open account settings (`/account/edit`) and click the bot icon, "Set up chat bots" (`/bots`).
+-2. "Add a chat bot" opens `/bots/new`. The bot name is required, the avatar and the webhook URL are optional.
++2. "Add a chat bot" opens `/bots/new`. The bot name is required. The avatar, the webhook URL and the "Add to all open
++   rooms" switch are optional. The switch is off by default (see below).
+    "Save changes" creates the bot and returns to `/bots`. (Webhooks are described below.)
+ 3. Each bot on the list shows its name and its **bot code** in a read-only "Bot code" field. Copy it into your
+    script or CI secrets. Treat it like a password.
+@@ -20,8 +21,12 @@ Who sees and manages what:
+ - The bots page lists all of them on one page (no pagination).
+ - Bots are left out of the people list on the account page, since they're managed from `/bots`.
+ 
+-Bots join all open rooms, like any new person. They can be added to closed rooms the same way people are
+-(the access switches in the room's settings).
++Bots do not join open rooms by default, unlike people. The "Add to all open rooms" switch makes a bot a member of every
++open room: the rooms that exist when the switch is turned on, and each open room created later. Turning the switch off
++keeps the bot in the rooms it is already in, and only stops new open rooms from adding it. Bots can be added to closed
++rooms the same way people are (the access switches in the room's settings).
++
++A bot that is not in a room can't post there: the message endpoint answers `404 Not Found` (see "Posting messages").
+ 
+ ## Posting messages (bots)
+ 
+@@ -74,7 +79,7 @@ The request is `POST <webhook URL>` with `Content-Type: application/json`:
+ }
+ ```
+ 
+-- `event` is always `mention` for now. More event types may come later.
++- `event` is `mention` for a mention. A bot is also told when it joins a room, with the `joined` event (see "Joining rooms").
+ - `message.body.text` is the message as text, with the bot's own @mention taken out, so it reads as the command
+   addressed to the bot. Other mentions read as `@Name`.
+ - `message.body.html` is the whole rich-text body, cleaned the way the room cleans messages. Mentions are
+@@ -117,6 +122,27 @@ Webhook URLs must be `http` or `https`. Campfire fetches webhooks the same way i
+ addresses that are private or internal (loopback, private networks, link-local) are refused. A webhook on the same
+ private network as Campfire doesn't work today. See "Known limits (webhooks)".
+ 
++## Joining rooms (webhooks)
++
++Whenever a bot is added to a room, its webhook receives a `joined` event, once for each room it joins. That holds
++whether a person added the bot to a closed room, a person turned its switch on (which adds it to the open rooms), or
++a new open room picked it up when it was created. Direct conversations never send it, and neither does a bot without a webhook URL.
++
++```json
++{
++  "event": "joined",
++  "room": { "id": 5, "name": "Ops", "reply_to": "/rooms/5/<bot-code>/messages" }
++}
++```
++
++- `room.id` and `room.name` are the room. `room.reply_to` is the bot's posting URL for the room, as for a mention.
++- The bot answers the same way as for a mention. A `200` with `Content-Type: text/plain` or `text/html` is posted into
++  the room as the bot's message, so a bot can say hello that way. A `204`, or any other response, posts nothing.
++- The event is sent once the membership has committed. A membership that is rolled back sends nothing, and a bot that
++  has left the room by the time its webhook answers doesn't post.
++- Adding a bot back after it was removed is a new join, so it is announced again. Granting a bot a room it is already
++  in announces nothing.
++
+ ## Design notes
+ 
+ **Data model.** A bot is a `bots` row (`user_id`, `creator_id`, `bot_key`) that points at an ordinary `users`
+@@ -142,6 +168,19 @@ bot, so one slow webhook doesn't hold up the others. `Bot::Webhook` builds the p
+ the answer. Nothing on the posting request's path talks to a webhook, and the job arguments are GlobalIDs, so the
+ queue never holds a payload or a bot code.
+ 
++**Joins.** Bots' memberships are granted through `room.memberships.grant_to`, which every path that adds a bot uses:
++creating a room, granting access to a closed room, opening a room, and the switch. It asks the database which
++memberships it inserted (`INSERT ... RETURNING`), so a bot is announced only when its membership is new, and a bot that
++is already in the room isn't counted twice. `Room#announce_joined_bots` then queues a `Bot::WebhookJob` for each such
++bot that has a webhook, through `Room.current_transaction.after_commit`: outside a transaction that runs at once, and
++inside one it waits for the commit. A rolled-back grant queues nothing, and a job never runs before the membership it
++announces exists.
++
++**Who joins open rooms.** People are granted every open room when they are created (`User#grant_membership_to_open_rooms`,
++which skips bots). A bot gets open rooms only through its switch, a boolean column on `bots` (`join_all_open_rooms`,
++default off). `Bot#join_open_rooms` runs in the save that turns the switch on, and `Rooms::Open` grants a new open room
++to `User.joining_open_rooms`: people, plus the bots whose switch is on.
++
+ **Fetching webhooks** uses `RestrictedHTTP::PrivateNetworkGuard`, as link unfurling does (see `SECURITY.md`: any member
+ can make Campfire fetch a URL, so the destination is checked). The checked address is pinned with `ipaddr:`, so a DNS
+ change between the check and the connection can't move the request to an internal host. Redirects aren't followed,
+@@ -199,23 +238,26 @@ Known limits (webhooks):
+   webhook call. They go to the operator's own `SENTRY_DSN`.
+ - Replies over 64 KB are dropped, not truncated.
+ - Edits that add a mention don't ask the bot.
++- Turning the switch on sends one `joined` event per open room, each a separate webhook call. There is no batching.
+ 
+ ## Code map
+ 
+ - `app/models/bot.rb` (credential, creator, name/avatar delegated to the user, webhook URL, `post_text`/`post_html`, `deactivate`)
+-- `app/models/user.rb` (`has_one :bot`, `bot?`, `without_bots`)
++- `app/models/user.rb` (`has_one :bot`, `bot?`, `without_bots`, `joining_open_rooms`)
++- `app/models/rooms/open.rb` (grants a new open room to the people and the bots that join all open rooms)
+ - `app/controllers/bots_controller.rb` (`/bots` management pages)
+ - `app/controllers/bots/messages_controller.rb` (the posting API)
+ - `app/views/bots/` (list, form, new, edit)
+ - `lib/rails_ext/filtered_bot_path.rb` (log masking)
+-- `db/migrate/*_create_bots.rb`, `db/migrate/*_add_webhook_url_to_bots.rb`
+-- `app/models/bot/webhook.rb` (the webhook call: payload, request, reply posting)
+-- `app/jobs/bot/webhook_job.rb` (one webhook call, per bot and message)
++- `db/migrate/*_create_bots.rb`, `db/migrate/*_add_webhook_url_to_bots.rb`, `db/migrate/*_add_join_all_open_rooms_to_bots.rb`
++- `app/models/bot/webhook.rb` (the webhook call for a mention or a join: payload, request, reply posting)
++- `app/jobs/bot/webhook_job.rb` (one webhook call, per bot and mention or join)
+ - `app/jobs/room/ask_mentioned_bots_job.rb` (finds the mentioned bots for a message, one webhook job each)
+ - `app/models/message/mentionee.rb` (`mentioned_bots`, the bots a message asks)
+-- `app/models/room.rb` (`receive` enqueues the ask job)
++- `app/models/room.rb` (`receive` enqueues the ask job; `memberships.grant_to` and `announce_joined_bots` send joined events)
+ 
+ Tests: `test/models/bot_test.rb`, `test/models/bot/webhook_test.rb`, `test/models/message_test.rb` (mention cases),
++`test/models/room_test.rb` (joined events), `test/models/rooms/open_test.rb` (bots and new open rooms),
+ `test/jobs/bot/webhook_job_test.rb`, `test/jobs/room/ask_mentioned_bots_job_test.rb`,
+ `test/controllers/bots_controller_test.rb`, `test/controllers/bots/messages_controller_test.rb`,
+ `test/lib/rails_ext/filtered_bot_path_test.rb`, plus bot cases in the accounts, users, autocomplete, messages and
+diff --git a/test/controllers/bots/messages_controller_test.rb b/test/controllers/bots/messages_controller_test.rb
+index f685777..983e564 100644
+--- a/test/controllers/bots/messages_controller_test.rb
++++ b/test/controllers/bots/messages_controller_test.rb
+@@ -7,8 +7,8 @@ class Bots::MessagesControllerTest < ActionDispatch::IntegrationTest
+   setup do
+     host! "once.campfire.test"
+ 
+-    @bot = Bot.create!(name: "Deploy Bot", creator: users(:david))
+-    @room = rooms(:hq) # an open room, which the bot joins automatically
++    @bot = Bot.create!(name: "Deploy Bot", creator: users(:david), join_all_open_rooms: true)
++    @room = rooms(:hq) # an open room, which the bot joins because it's set to join all open rooms
+   end
+ 
+   test "posting the raw body as a message from the bot" do
+@@ -169,4 +169,16 @@ class Bots::MessagesControllerTest < ActionDispatch::IntegrationTest
+     assert_response :success
+     assert_select ".message__author strong", text: "Deploy Bot"
+   end
++
++  test "a bot that doesn't join open rooms gets not found for them until it's added to one" do
++    quiet = Bot.create!(name: "Quiet Bot", creator: users(:david))
++
++    post room_bot_messages_url(@room, quiet.bot_key), params: "Hello", headers: FORM_CONTENT_TYPE
++    assert_response :not_found
++
++    @room.memberships.grant_to(quiet.user)
++
++    post room_bot_messages_url(@room, quiet.bot_key), params: "Hello", headers: FORM_CONTENT_TYPE
++    assert_response :created
++  end
+ end
+diff --git a/test/controllers/bots_controller_test.rb b/test/controllers/bots_controller_test.rb
+index f1a6aac..5917b5b 100644
+--- a/test/controllers/bots_controller_test.rb
++++ b/test/controllers/bots_controller_test.rb
+@@ -78,7 +78,7 @@ class BotsControllerTest < ActionDispatch::IntegrationTest
+     end
+   end
+ 
+-  test "create makes a bot user that joins every open room and redirects to the list" do
++  test "create makes a bot user and redirects to the list" do
+     assert_difference -> { Bot.count }, +1 do
+       assert_difference -> { User.count }, +1 do
+         post bots_url, params: { bot: { name: "Deploy Bot 2" } }
+@@ -90,7 +90,80 @@ class BotsControllerTest < ActionDispatch::IntegrationTest
+     bot = Bot.last
+     assert_equal "Deploy Bot 2", bot.name
+     assert_equal users(:david), bot.creator
++  end
++
++  test "create without the switch joins no open rooms, since bots don't join them by default" do
++    post bots_url, params: { bot: { name: "Deploy Bot 2" } }
++
++    assert_not Bot.last.join_all_open_rooms?
++    assert_empty Bot.last.user.rooms
++  end
++
++  test "create with the switch on joins every open room, and the joined events go to the bot's webhook" do
++    post bots_url, params: { bot: { name: "Deploy Bot 2", webhook_url: "https://hooks.example.com/deploy", join_all_open_rooms: "1" } }
++
++    bot = Bot.last
++    assert bot.join_all_open_rooms?
+     assert_equal Rooms::Open.count, bot.user.rooms.opens.count
++    assert_enqueued_jobs Rooms::Open.count, only: Bot::WebhookJob
++  end
++
++  test "create with the switch off, as the unchecked form sends it, joins no open rooms" do
++    post bots_url, params: { bot: { name: "Deploy Bot 2", join_all_open_rooms: "0" } }
++
++    assert_not Bot.last.join_all_open_rooms?
++    assert_empty Bot.last.user.rooms
++  end
++
++  test "update turns the switch on, which joins every open room, and off again, which keeps the memberships" do
++    assert_empty @bot.user.rooms
++
++    patch bot_url(@bot), params: { bot: { name: "Deploy Bot", join_all_open_rooms: "1" } }
++
++    assert @bot.reload.join_all_open_rooms?
++    assert_equal Rooms::Open.count, @bot.user.rooms.opens.count
++
++    patch bot_url(@bot), params: { bot: { name: "Deploy Bot", join_all_open_rooms: "0" } }
++
++    assert_not @bot.reload.join_all_open_rooms?
++    assert_equal Rooms::Open.count, @bot.user.rooms.opens.count
++  end
++
++  test "update without the switch field leaves the switch alone" do
++    @bot.update!(join_all_open_rooms: true)
++
++    patch bot_url(@bot), params: { bot: { name: "Renamed Bot" } }
++
++    assert @bot.reload.join_all_open_rooms?
++  end
++
++  test "new has an Add to all open rooms switch, which is off by default" do
++    get new_bot_url
++
++    assert_select "form[action=?]", bots_path do
++      assert_select "label", text: "Add to all open rooms" do
++        assert_select "input[type=checkbox][name=?]", "bot[join_all_open_rooms]"
++        assert_select "input[type=checkbox][name=?][checked]", "bot[join_all_open_rooms]", count: 0
++      end
++    end
++  end
++
++  test "edit shows the switch on when the bot joins all open rooms" do
++    @bot.update!(join_all_open_rooms: true)
++
++    get edit_bot_url(@bot)
++
++    assert_select "label", text: "Add to all open rooms" do
++      assert_select "input[type=checkbox][name=?][checked]", "bot[join_all_open_rooms]"
++    end
++  end
++
++  test "edit shows the switch off when the bot doesn't join all open rooms" do
++    get edit_bot_url(@bot)
++
++    assert_select "label", text: "Add to all open rooms" do
++      assert_select "input[type=checkbox][name=?]:not([checked])", "bot[join_all_open_rooms]"
++    end
+   end
+ 
+   test "create with an avatar attaches it to the bot" do
+diff --git a/test/controllers/rooms/closeds_controller_test.rb b/test/controllers/rooms/closeds_controller_test.rb
+index 60941f3..1294cb6 100644
+--- a/test/controllers/rooms/closeds_controller_test.rb
++++ b/test/controllers/rooms/closeds_controller_test.rb
+@@ -88,6 +88,18 @@ class Rooms::ClosedsControllerTest < ActionDispatch::IntegrationTest
+     end
+   end
+ 
++  test "granting a bot access to a closed room sends its webhook a joined event, once" do
++    bot = Bot.create!(name: "Deploy Bot", creator: users(:david), webhook_url: "https://hooks.example.com/deploy")
++    room = rooms(:designers)
++
++    assert_enqueued_with job: Bot::WebhookJob, args: [ bot, room ] do
++      put rooms_closed_url(room), params: { room: { name: room.name }, user_ids: [ *room.user_ids, bot.user.id ] }
++    end
++
++    assert_enqueued_jobs 1, only: Bot::WebhookJob
++    assert_includes room.reload.users, bot.user
++  end
++
+   test "edit offers bots for access to a closed room, the same way as people" do
+     bot = Bot.create!(name: "Deploy Bot", creator: users(:david))
+ 
+diff --git a/test/jobs/bot/webhook_job_test.rb b/test/jobs/bot/webhook_job_test.rb
+index ae05b8d..a4176e1 100644
+--- a/test/jobs/bot/webhook_job_test.rb
++++ b/test/jobs/bot/webhook_job_test.rb
+@@ -2,8 +2,7 @@ require "test_helper"
+ 
+ class Bot::WebhookJobTest < ActiveSupport::TestCase
+   setup do
+-    @bot = Bot.create!(name: "Deploy Bot", creator: users(:david), webhook_url: "https://hooks.example.com/deploy")
+-    rooms(:hq).memberships.grant_to(@bot.user)
++    @bot = Bot.create!(name: "Deploy Bot", creator: users(:david), webhook_url: "https://hooks.example.com/deploy", join_all_open_rooms: true)
+     @message = rooms(:hq).messages.create!(creator: users(:jason), body: "<div>#{mention_attachment_for(@bot.user)} hi</div>")
+   end
+ 
+@@ -13,7 +12,14 @@ class Bot::WebhookJobTest < ActiveSupport::TestCase
+     Bot::WebhookJob.perform_now(@bot, @message)
+   end
+ 
++  test "the job asks the bot's webhook about a room the bot has joined" do
++    Bot::Webhook.any_instance.expects(:deliver).once
++
++    Bot::WebhookJob.perform_now(@bot, rooms(:hq))
++  end
++
+   test "a bot deleted before its job runs is quietly dropped" do
++    clear_enqueued_jobs
+     Bot::WebhookJob.perform_later(@bot, @message)
+     @bot.delete
+ 
+@@ -21,4 +27,15 @@ class Bot::WebhookJobTest < ActiveSupport::TestCase
+       perform_enqueued_jobs only: Bot::WebhookJob
+     end
+   end
++
++  test "a room deleted before its joined job runs is quietly dropped" do
++    room = Rooms::Open.create!(name: "Short-lived", creator: users(:david))
++    clear_enqueued_jobs
++    Bot::WebhookJob.perform_later(@bot, room)
++    room.destroy
++
++    assert_nothing_raised do
++      perform_enqueued_jobs only: Bot::WebhookJob
++    end
++  end
+ end
+diff --git a/test/models/bot/webhook_test.rb b/test/models/bot/webhook_test.rb
+index 92bd449..2e194cb 100644
+--- a/test/models/bot/webhook_test.rb
++++ b/test/models/bot/webhook_test.rb
+@@ -4,7 +4,7 @@ class Bot::WebhookTest < ActiveSupport::TestCase
+   WEBHOOK_URL = "https://hooks.example.com/deploy"
+ 
+   setup do
+-    @bot = Bot.create!(name: "Deploy Bot", creator: users(:david), webhook_url: WEBHOOK_URL)
++    @bot = Bot.create!(name: "Deploy Bot", creator: users(:david), webhook_url: WEBHOOK_URL, join_all_open_rooms: true)
+     @room = rooms(:hq)
+     @author = users(:jason)
+ 
+@@ -301,6 +301,68 @@ class Bot::WebhookTest < ActiveSupport::TestCase
+     end
+   end
+ 
++  test "the joined payload says which room the bot joined, and how to reply to it" do
++    payload = Bot::Webhook.new(@bot, @room).payload
++
++    assert_equal({ event: "joined", room: { id: @room.id, name: "HQ", reply_to: "/rooms/#{@room.id}/#{@bot.bot_key}/messages" } }, payload)
++  end
++
++  test "the joined event is sent to the webhook as JSON, with no author or message" do
++    stub_webhook_answer status: 204, content_type: nil, body: nil
++
++    Bot::Webhook.new(@bot, @room).deliver
++
++    assert_requested :post, WEBHOOK_URL, headers: { "Content-Type" => "application/json" } do |request|
++      JSON.parse(request.body) == { "event" => "joined", "room" => { "id" => @room.id, "name" => "HQ", "reply_to" => "/rooms/#{@room.id}/#{@bot.bot_key}/messages" } }
++    end
++  end
++
++  test "a 200 text/plain answer to a joined event is posted into the room as the bot's message" do
++    stub_webhook_answer status: 200, content_type: "text/plain", body: "Hello, HQ!"
++
++    assert_difference -> { @room.messages.count }, +1 do
++      Bot::Webhook.new(@bot, @room).deliver
++    end
++
++    reply = @room.messages.ordered.last
++    assert_equal @bot.user, reply.creator
++    assert_equal "Hello, HQ!", reply.plain_text_body
++  end
++
++  test "a 200 text/html answer to a joined event is posted as the bot's rich text" do
++    stub_webhook_answer status: 200, content_type: "text/html", body: "<div>Ready <strong>to deploy</strong></div>"
++
++    Bot::Webhook.new(@bot, @room).deliver
++
++    reply = @room.messages.ordered.last
++    assert_equal @bot.user, reply.creator
++    assert_includes reply.body.body.to_html, "<strong>to deploy</strong>"
++  end
++
++  test "a 204 answer to a joined event posts nothing" do
++    stub_webhook_answer status: 204, content_type: nil, body: nil
++
++    assert_no_difference -> { Message.count } do
++      Bot::Webhook.new(@bot, @room).deliver
++    end
++  end
++
++  test "a joined event isn't sent once the bot has left the room" do
++    @room.memberships.where(user: @bot.user).delete_all
++
++    assert_not_requested :post, WEBHOOK_URL do
++      Bot::Webhook.new(@bot, @room).deliver
++    end
++  end
++
++  test "a bot that was deactivated before its joined event isn't asked" do
++    @bot.user.deactivate
++
++    assert_not_requested :post, WEBHOOK_URL do
++      Bot::Webhook.new(@bot.reload, @room).deliver
++    end
++  end
++
+   private
+     def create_message_mentioning(user, *parts)
+       Message.create!(room: @room, creator: @author, body: "<div>#{mention_attachment_for(user)}#{parts.join}</div>")
+diff --git a/test/models/bot_test.rb b/test/models/bot_test.rb
+index ea60353..7617e6c 100644
+--- a/test/models/bot_test.rb
++++ b/test/models/bot_test.rb
+@@ -20,13 +20,85 @@ class BotTest < ActiveSupport::TestCase
+     end
+   end
+ 
+-  test "a new bot joins every open room, like any new user" do
++  test "a new bot joins no open rooms unless it's set to join all of them" do
+     bot = Bot.create!(name: "Deploy Bot", creator: @creator)
+ 
++    assert_not bot.join_all_open_rooms?
++    assert_empty bot.user.rooms
++  end
++
++  test "a bot set to join all open rooms is a member of every open room, but not of closed rooms" do
++    bot = Bot.create!(name: "Deploy Bot", creator: @creator, join_all_open_rooms: true)
++
+     assert_equal Rooms::Open.count, bot.user.rooms.opens.count
+     assert_not_includes bot.user.rooms, rooms(:watercooler)
+   end
+ 
++  test "turning the switch on adds the bot to the open rooms that exist" do
++    bot = Bot.create!(name: "Deploy Bot", creator: @creator)
++
++    bot.update!(join_all_open_rooms: true)
++
++    assert_equal Rooms::Open.count, bot.user.rooms.opens.count
++    assert_not_includes bot.user.rooms, rooms(:watercooler)
++  end
++
++  test "turning the switch off keeps the bot's current memberships" do
++    bot = Bot.create!(name: "Deploy Bot", creator: @creator, join_all_open_rooms: true)
++
++    bot.update!(join_all_open_rooms: false)
++
++    assert_equal Rooms::Open.count, bot.user.rooms.opens.count
++  end
++
++  test "a banned bot isn't added to open rooms, even when its switch is turned on" do
++    bot = Bot.create!(name: "Deploy Bot", creator: @creator)
++    bot.user.update!(status: :banned)
++
++    bot.update!(join_all_open_rooms: true)
++
++    assert_empty bot.user.rooms.opens
++  end
++
++  test "turning the switch off stops the bot joining open rooms created later" do
++    bot = Bot.create!(name: "Deploy Bot", creator: @creator, join_all_open_rooms: true)
++    bot.update!(join_all_open_rooms: false)
++
++    room = Rooms::Open.create!(name: "Later", creator: @creator)
++
++    assert_not_includes room.users, bot.user
++  end
++
++  test "an open room created later adds the bots that join all open rooms, and no others" do
++    joining = Bot.create!(name: "Deploy Bot", creator: @creator, join_all_open_rooms: true)
++    quiet = Bot.create!(name: "Quiet Bot", creator: @creator)
++
++    room = Rooms::Open.create!(name: "Later", creator: @creator)
++
++    assert_includes room.users, joining.user
++    assert_not_includes room.users, quiet.user
++  end
++
++  test "a closed room that becomes open adds the bots that join all open rooms" do
++    joining = Bot.create!(name: "Deploy Bot", creator: @creator, join_all_open_rooms: true)
++
++    room = rooms(:watercooler).becomes!(Rooms::Open)
++    room.save!
++
++    assert_includes room.users, joining.user
++  end
++
++  test "saving a bot again doesn't add it back to open rooms it was removed from" do
++    bot = Bot.create!(name: "Deploy Bot", creator: @creator, join_all_open_rooms: true)
++    room = Rooms::Open.create!(name: "Later", creator: @creator)
++    assert_includes room.users, bot.user
++
++    room.memberships.where(user: bot.user).delete_all
++    bot.update!(name: "Renamed Bot")
++
++    assert_not_includes room.users.reload, bot.user
++  end
++
+   test "a bot has a unique, unguessably long bot key" do
+     first = Bot.create!(name: "First", creator: @creator)
+     second = Bot.create!(name: "Second", creator: @creator)
+@@ -62,8 +134,14 @@ class BotTest < ActiveSupport::TestCase
+     assert_not users(:david).bot?
+   end
+ 
++  test "people still join every open room when they're created, unlike bots" do
++    person = User.create!(name: "New Person", password: "secret123456")
++
++    assert_equal Rooms::Open.count, person.rooms.opens.count
++  end
++
+   test "deactivating a bot deactivates its user, removes it from rooms, and deletes its bot key" do
+-    bot = Bot.create!(name: "Deploy Bot", creator: @creator)
++    bot = Bot.create!(name: "Deploy Bot", creator: @creator, join_all_open_rooms: true)
+     user = bot.user
+     bot_key = bot.bot_key
+     assert user.memberships.without_direct_rooms.any?
+diff --git a/test/models/room_test.rb b/test/models/room_test.rb
+index b113726..7403a19 100644
+--- a/test/models/room_test.rb
++++ b/test/models/room_test.rb
+@@ -34,4 +34,97 @@ class RoomTest < ActiveSupport::TestCase
+     room = Rooms::Closed.create_for({ name: "Hello!", creator: users(:david) }, users: [ users(:kevin), users(:david) ])
+     assert room.memberships.all? { |m| m.involved_in_mentions? }
+   end
++
++  test "a bot added to a room is announced to its webhook, once" do
++    bot = create_bot_with_webhook
++
++    assert_enqueued_with job: Bot::WebhookJob, args: [ bot, rooms(:watercooler) ] do
++      rooms(:watercooler).memberships.grant_to(bot.user)
++    end
++
++    rooms(:watercooler).memberships.grant_to(bot.user)
++    assert_enqueued_jobs 1, only: Bot::WebhookJob
++  end
++
++  test "a bot that's already in a room isn't announced again when it's granted again" do
++    bot = create_bot_with_webhook
++    rooms(:watercooler).memberships.grant_to(bot.user)
++
++    assert_no_enqueued_jobs only: Bot::WebhookJob do
++      rooms(:watercooler).memberships.revise(granted: bot.user)
++    end
++  end
++
++  test "a person added to a room isn't announced to any webhook" do
++    create_bot_with_webhook
++
++    assert_no_enqueued_jobs only: Bot::WebhookJob do
++      rooms(:watercooler).memberships.grant_to(users(:kevin))
++    end
++  end
++
++  test "a bot without a webhook isn't announced, since there's nothing to tell" do
++    Bot.create!(name: "Quiet Bot", creator: users(:david)).tap do |bot|
++      assert_no_enqueued_jobs only: Bot::WebhookJob do
++        rooms(:watercooler).memberships.grant_to(bot.user)
++      end
++    end
++  end
++
++  test "direct rooms never announce a bot as joined" do
++    bot = create_bot_with_webhook
++
++    assert_no_enqueued_jobs only: Bot::WebhookJob do
++      rooms(:david_and_jason).memberships.grant_to(bot.user)
++    end
++  end
++
++  test "a bot added to a closed room when the room is created is announced" do
++    bot = create_bot_with_webhook
++    room = Rooms::Closed.create_for({ name: "Hello!", creator: users(:david) }, users: [ bot.user ])
++
++    assert_enqueued_with job: Bot::WebhookJob, args: [ bot, room ]
++  end
++
++  test "a bot set to join all open rooms is announced to each open room it joins" do
++    assert_enqueued_jobs Rooms::Open.count, only: Bot::WebhookJob do
++      create_bot_with_webhook(join_all_open_rooms: true)
++    end
++  end
++
++  test "an open room created later announces the bots that join all open rooms" do
++    bot = create_bot_with_webhook(join_all_open_rooms: true)
++    room = Rooms::Open.create!(name: "Later", creator: users(:david))
++
++    assert_enqueued_with job: Bot::WebhookJob, args: [ bot, room ]
++  end
++
++  test "the announcement waits until the membership commits" do
++    bot = create_bot_with_webhook
++
++    Room.transaction do
++      rooms(:watercooler).memberships.grant_to(bot.user)
++
++      assert_no_enqueued_jobs only: Bot::WebhookJob
++    end
++
++    assert_enqueued_jobs 1, only: Bot::WebhookJob
++  end
++
++  test "a membership that rolls back is never announced" do
++    bot = create_bot_with_webhook
++
++    Room.transaction do
++      rooms(:watercooler).memberships.grant_to(bot.user)
++      raise ActiveRecord::Rollback
++    end
++
++    assert_no_enqueued_jobs only: Bot::WebhookJob
++    assert_not_includes rooms(:watercooler).reload.users, bot.user
++  end
++
++  private
++    def create_bot_with_webhook(**attributes)
++      Bot.create!(name: "Deploy Bot", creator: users(:david), webhook_url: "https://hooks.example.com/deploy", **attributes)
++    end
+ end
+diff --git a/test/models/rooms/open_test.rb b/test/models/rooms/open_test.rb
+index 87d9a8f..e7b7659 100644
+--- a/test/models/rooms/open_test.rb
++++ b/test/models/rooms/open_test.rb
+@@ -11,4 +11,24 @@ class Rooms::OpenTest < ActiveSupport::TestCase
+     room.save!
+     assert_equal User.count, room.users.count
+   end
++
++  test "grants access to people and to bots that join all open rooms, but not to other bots" do
++    joining = Bot.create!(name: "Joining Bot", creator: users(:david), join_all_open_rooms: true)
++    quiet = Bot.create!(name: "Quiet Bot", creator: users(:david))
++
++    room = Rooms::Open.create!(name: "With bots", creator: users(:david))
++
++    assert_includes room.users, joining.user
++    assert_not_includes room.users, quiet.user
++    assert_equal User.active.joining_open_rooms.count, room.users.count
++  end
++
++  test "joining open rooms leaves out bots unless they're set to join all of them" do
++    quiet = Bot.create!(name: "Quiet Bot", creator: users(:david))
++    joining = Bot.create!(name: "Joining Bot", creator: users(:david), join_all_open_rooms: true)
++
++    assert_includes User.joining_open_rooms, joining.user
++    assert_not_includes User.joining_open_rooms, quiet.user
++    assert_includes User.joining_open_rooms, users(:david)
++  end
+ end

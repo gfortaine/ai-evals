@@ -1,0 +1,418 @@
+diff --git a/app/controllers/users_controller.rb b/app/controllers/users_controller.rb
+index d1db65c..1b854e5 100644
+--- a/app/controllers/users_controller.rb
++++ b/app/controllers/users_controller.rb
+@@ -3,7 +3,7 @@ class UsersController < ApplicationController
+ 
+   before_action :verify_join_code, only: %i[ new create ]
+   before_action :ensure_can_administer, only: %i[ update destroy ]
+-  before_action :set_user, only: %i[ update destroy ]
++  before_action :set_user, only: %i[ update ]
+ 
+ 
+   def index
+@@ -27,8 +27,9 @@ class UsersController < ApplicationController
+     redirect_to users_url
+   end
+ 
++  # Also erases deactivated accounts, which can still hold personal data.
+   def destroy
+-    @user.deactivate
++    User.find(params[:id]).erase
+     redirect_to users_url
+   end
+ 
+diff --git a/app/models/book.rb b/app/models/book.rb
+index 90b8292..03fc8ed 100644
+--- a/app/models/book.rb
++++ b/app/models/book.rb
+@@ -1,6 +1,8 @@
+ class Book < ApplicationRecord
+   include Accessable, Authorship, Sluggable
+ 
++  DELETED_AUTHOR = "Deleted author"
++
+   has_many :leaves, dependent: :destroy
+   has_one_attached :cover, dependent: :purge_later
+ 
+@@ -16,4 +18,24 @@ class Book < ApplicationRecord
+   def markable
+     leaves.active.positioned.map { it.leafable.markable }.join("\n\n")
+   end
++
++  # Destroys the book with all of its content. Leaf only destroys the current
++  # version of each page, so superseded revisions (kept in edits) are destroyed
++  # here as well, and search index entries are removed by leaf id.
++  def erase
++    transaction do
++      leaf_ids = leaves.ids
++      leafables = leaves.pluck(:leafable_type, :leafable_id) |
++        Edit.where(leaf_id: leaf_ids).pluck(:leafable_type, :leafable_id)
++
++      Leaf.delete_from_search_index(leaf_ids)
++      leaves.destroy_all
++
++      leafables.uniq.group_by(&:first).each do |type, pairs|
++        type.constantize.where(id: pairs.map(&:last)).destroy_all
++      end
++
++      destroy!
++    end
++  end
+ end
+diff --git a/app/models/leaf/searchable.rb b/app/models/leaf/searchable.rb
+index d90c5c9..7fbcbae 100644
+--- a/app/models/leaf/searchable.rb
++++ b/app/models/leaf/searchable.rb
+@@ -4,7 +4,7 @@ module Leaf::Searchable
+   included do
+     after_create_commit  :create_in_search_index,   if: :searchable?
+     after_update_commit  :update_in_search_index,   if: :searchable?
+-    after_destroy_commit :remove_from_search_index, if: :searchable?
++    after_destroy_commit :remove_from_search_index
+ 
+     scope :favoring_title, -> { order(Arel.sql("bm25(leaf_search_index, 2.0)")) }
+   end
+@@ -14,6 +14,12 @@ module Leaf::Searchable
+       all.map &:reindex
+     end
+ 
++    # Removes index entries by leaf id, whatever their content is now. Used when
++    # leaves are destroyed in bulk, where per-record callbacks are not relied on.
++    def delete_from_search_index(ids)
++      connection.execute sanitize_sql([ "delete from leaf_search_index where rowid in (?)", ids ])
++    end
++
+     def sanitize_query_syntax(terms)
+       terms = terms.to_s
+       terms = remove_invalid_search_characters(terms)
+diff --git a/app/models/user.rb b/app/models/user.rb
+index 4829eaf..10ea9a7 100644
+--- a/app/models/user.rb
++++ b/app/models/user.rb
+@@ -1,5 +1,5 @@
+ class User < ApplicationRecord
+-  include Authoring, Role, Transferable
++  include Authoring, Role, Transferable, Erasable
+ 
+   has_many :sessions, dependent: :destroy
+   has_secure_password validations: false
+diff --git a/app/models/user/authoring.rb b/app/models/user/authoring.rb
+index bc70db7..ce2c811 100644
+--- a/app/models/user/authoring.rb
++++ b/app/models/user/authoring.rb
+@@ -5,6 +5,6 @@ module User::Authoring
+     has_many :created_books, class_name: "Book", foreign_key: :creator_id,
+       inverse_of: :creator, dependent: :destroy
+ 
+-    has_many :reading_marks
++    has_many :reading_marks, dependent: :delete_all
+   end
+ end
+diff --git a/app/models/user/erasable.rb b/app/models/user/erasable.rb
+new file mode 100644
+index 0000000..cdbb9f3
+--- /dev/null
++++ b/app/models/user/erasable.rb
+@@ -0,0 +1,51 @@
++module User::Erasable
++  extend ActiveSupport::Concern
++
++  # #deactivate rewrites alice@example.com to alice-deactivated-<uuid>@example.com.
++  # This matches that inserted part, so the original address can be recovered.
++  DEACTIVATED_ADDRESS_SUFFIX = /-deactivated-\h{8}-\h{4}-\h{4}-\h{4}-\h{12}(?=@)/
++
++  class_methods do
++    # Every account that has used +email_address+, either as its current address or
++    # as the address it was rewritten from on deactivation. Sign-in events are keyed
++    # by the address people signed in with, so this is how a request by address
++    # finds all of them.
++    def for_email_address(email_address)
++      local, domain = email_address.to_s.split("@", 2)
++      return [] unless domain
++
++      where(email_address: email_address)
++        .or(where("email_address LIKE ?", "#{local}-deactivated-%@#{domain}"))
++        .select { it.erasure_addresses.include?(email_address) }
++    end
++  end
++
++  def original_email_address
++    email_address.sub(DEACTIVATED_ADDRESS_SUFFIX, "")
++  end
++
++  def erasure_addresses
++    [ email_address, original_email_address ].uniq
++  end
++
++  # Permanently removes this person, whether or not they were deactivated.
++  #
++  # Books they created that are shared with everyone stay, with their name taken
++  # off. Any other book they created is erased along with its content.
++  def erase
++    transaction do
++      created_books.with_everyone_access.each do |book|
++        book.update! creator: nil, author: Book::DELETED_AUTHOR
++      end
++      created_books.where(everyone_access: false).each(&:erase)
++
++      # Sessions go in bulk: destroying each one would write a signed-out event under
++      # the address being erased. The sign-in log is cleared after that, and before
++      # destroy!, so nothing is written under the address once erase has run.
++      sessions.delete_all
++      SignInEvent.for_address(erasure_addresses).delete_all
++
++      destroy!
++    end
++  end
++end
+diff --git a/script/admin/erase-user b/script/admin/erase-user
+new file mode 100755
+index 0000000..1638594
+--- /dev/null
++++ b/script/admin/erase-user
+@@ -0,0 +1,18 @@
++#!/usr/bin/env ruby
++require File.expand_path("../../config/environment", File.dirname(__FILE__))
++
++abort "Usage: #{$0} <email-address>" unless ARGV.length == 1
++
++# Matches accounts by current address and by the original address of accounts
++# that were deactivated (their address is rewritten, see User#deactivate).
++users = User.for_email_address(ARGV.first)
++
++if users.empty?
++  puts "User not found"
++  exit -1
++end
++
++users.each do |user|
++  user.erase
++  puts "Erased user #{user.id}"
++end
+diff --git a/test/controllers/users_controller_test.rb b/test/controllers/users_controller_test.rb
+index e0ca8db..a09e051 100644
+--- a/test/controllers/users_controller_test.rb
++++ b/test/controllers/users_controller_test.rb
+@@ -63,13 +63,42 @@ class UsersControllerTest < ActionDispatch::IntegrationTest
+ 
+   test "destroy" do
+     sign_in :david
++    kevin = users(:kevin)
+ 
+-    assert_difference -> { User.active.count }, -1 do
+-      delete user_url(users(:kevin))
++    assert_difference -> { User.count }, -1 do
++      delete user_url(kevin)
+     end
+ 
+     assert_redirected_to users_url
+-    assert_nil User.active.find_by(id: users(:kevin).id)
++    assert_not User.exists?(kevin.id)
++  end
++
++  test "destroy erases a deactivated account and its sign-in events" do
++    sign_in :david
++    kevin = users(:kevin)
++    SignInEvent.create!(email_address: "kevin@example.com", action: "signed_in")
++    kevin.deactivate
++
++    assert_difference -> { User.count }, -1 do
++      delete user_url(kevin)
++    end
++
++    assert_redirected_to users_url
++    assert_not User.exists?(kevin.id)
++    assert_empty SignInEvent.for_address("kevin@example.com")
++  end
++
++  test "destroy erases the books they created that are not shared with everyone" do
++    sign_in :david
++    kevin = users(:kevin)
++    book = Book.create!(title: "Kevin's draft", everyone_access: false, creator: kevin)
++    book.press(Page.new(body: "kevin's words"), title: "Draft")
++
++    assert_difference -> { Book.count }, -1 do
++      delete user_url(kevin)
++    end
++
++    assert_not Book.exists?(book.id)
+   end
+ 
+   test "destroy is not allowed to non-admins" do
+@@ -77,5 +106,6 @@ class UsersControllerTest < ActionDispatch::IntegrationTest
+ 
+     delete user_url(users(:david))
+     assert_response :forbidden
++    assert User.exists?(users(:david).id)
+   end
+ end
+diff --git a/test/models/leaf/searchable_test.rb b/test/models/leaf/searchable_test.rb
+index 4446433..fee3944 100644
+--- a/test/models/leaf/searchable_test.rb
++++ b/test/models/leaf/searchable_test.rb
+@@ -81,4 +81,14 @@ class Leaf::SearchableTest < ActiveSupport::TestCase
+     leaves = Leaf.search("findme")
+     assert_equal "<mark>findme</mark> fake highlight", leaves.first.title_match
+   end
++
++  test "destroying a leaf removes its index entry even if its content is no longer searchable" do
++    leaf = books(:handbook).press(Section.new(body: "quokka"), title: "Marsupials")
++    leaf.leafable.update!(body: nil)
++
++    leaf.destroy!
++
++    assert_equal 0, ActiveRecord::Base.connection.select_value(
++      Leaf.sanitize_sql([ "select count(*) from leaf_search_index where rowid = ?", leaf.id ]))
++  end
+ end
+diff --git a/test/models/user/erasable_test.rb b/test/models/user/erasable_test.rb
+new file mode 100644
+index 0000000..8878df9
+--- /dev/null
++++ b/test/models/user/erasable_test.rb
+@@ -0,0 +1,144 @@
++require "test_helper"
++
++class User::ErasableTest < ActiveSupport::TestCase
++  setup do
++    @kevin = users(:kevin)
++    @david = users(:david)
++  end
++
++  test "erase removes the user" do
++    @kevin.erase
++
++    assert_not User.exists?(@kevin.id)
++  end
++
++  test "erase removes their sessions, accesses and reading marks" do
++    @kevin.sessions.start!(user_agent: "Test", ip_address: "127.0.0.1")
++    ReadingMark.remember(leaves(:welcome_page), user: @kevin)
++    assert @kevin.accesses.any?
++
++    @kevin.erase
++
++    assert_not Session.exists?(user_id: @kevin.id)
++    assert_not Access.exists?(user_id: @kevin.id)
++    assert_not ReadingMark.exists?(user_id: @kevin.id)
++  end
++
++  test "erase removes their sign-in events, including those from sessions still open" do
++    @kevin.sessions.start!(user_agent: "Test", ip_address: "127.0.0.1")
++    SignInEvent.create!(email_address: "kevin@example.com", action: "signed_in")
++    SignInEvent.create!(email_address: "david@example.com", action: "signed_in")
++
++    @kevin.erase
++
++    assert_empty SignInEvent.for_address("kevin@example.com")
++    assert_equal 1, SignInEvent.for_address("david@example.com").count
++  end
++
++  test "erase erases books they created that are not shared with everyone, including all content" do
++    book = Book.create!(title: "Kevin's draft", everyone_access: false, creator: @kevin)
++    page = book.press(Page.new(body: "original draft wording"), title: "Draft page")
++    page.edit(leafable_params: { body: "revised draft wording" })
++    book.press(Section.new(body: "a section"), title: "Draft section")
++    book.press(Picture.new(caption: "a picture"), title: "Draft picture")
++    stale = book.press(Section.new(body: "stale wording"), title: "Stale section")
++    stale.leafable.update!(body: nil)
++    book.update_access(editors: [ @david.id ], readers: [])
++    ReadingMark.remember(page, user: @david)
++    leaf_ids = book.leaves.ids
++
++    # The edit keeps the original version of the page in the edit history.
++    revision_id = Edit.find_by!(leaf: page).leafable_id
++    assert_includes Leaf.search("draft"), page
++
++    assert_difference -> { Page.count }, -2 do
++      assert_difference -> { Section.count }, -2 do
++        assert_difference -> { Picture.count }, -1 do
++          @kevin.erase
++        end
++      end
++    end
++
++    assert_not Book.exists?(book.id)
++    assert_empty Leaf.where(id: leaf_ids)
++    assert_empty Edit.where(leaf_id: leaf_ids)
++    assert_not Page.exists?(revision_id)
++    assert_not ActionText::Markdown.exists?(record_type: "Page", record_id: revision_id)
++    assert_empty Access.where(book_id: book.id)
++    assert_empty ReadingMark.where(leaf_id: leaf_ids)
++    assert_empty Leaf.search("draft")
++    assert_equal 0, search_index_rows(leaf_ids)
++  end
++
++  test "erase keeps books they created that are shared with everyone, with their name taken off" do
++    book = Book.create!(title: "Kevin's guide", everyone_access: true, creator: @kevin, author: "Kevin Kumar")
++    book.update_access(editors: [], readers: [])
++    leaf = book.press(Page.new(body: "guide wording"), title: "Guide page")
++
++    @kevin.erase
++
++    book.reload
++    assert_nil book.creator_id
++    assert_equal "Deleted author", book.author
++    assert_equal [ leaf ], book.leaves.to_a
++    assert_equal "guide wording", leaf.reload.page.body.content.to_s.strip
++    assert_includes Leaf.search("guide"), leaf
++    assert_not book.accessable?(user: @kevin)
++    assert book.accessable?(user: @david)
++  end
++
++  test "erase leaves other people's books, content and sign-in events alone" do
++    handbook_leaf_ids = books(:handbook).leaves.ids.sort
++    ReadingMark.remember(leaves(:welcome_page), user: @david)
++
++    @kevin.erase
++
++    assert Book.exists?(books(:handbook).id)
++    assert_equal handbook_leaf_ids, books(:handbook).leaves.ids.sort
++    assert ReadingMark.exists?(user_id: @david.id, leaf_id: leaves(:welcome_page).id)
++    assert User.exists?(@david.id)
++  end
++
++  test "erase removes a deactivated account, including its sign-in events under the address it signed in with" do
++    SignInEvent.create!(email_address: "kevin@example.com", action: "signed_in")
++    book = Book.create!(title: "Kevin's old draft", everyone_access: false, creator: @kevin)
++    book.press(Page.new(body: "old draft"), title: "Old draft")
++    @kevin.deactivate
++    kevin = User.find(@kevin.id)
++    assert_not kevin.active?
++    assert_match(/\Akevin-deactivated-\h{8}-\h{4}-\h{4}-\h{4}-\h{12}@example\.com\z/, kevin.email_address)
++
++    kevin.erase
++
++    assert_not User.exists?(kevin.id)
++    assert_not Book.exists?(book.id)
++    assert_empty SignInEvent.for_address("kevin@example.com")
++  end
++
++  test "original_email_address recovers the address a deactivated account signed in with" do
++    assert_equal "kevin@example.com", @kevin.original_email_address
++
++    @kevin.deactivate
++    kevin = User.find(@kevin.id)
++
++    assert_equal "kevin@example.com", kevin.original_email_address
++    assert_equal [ kevin.email_address, "kevin@example.com" ], kevin.erasure_addresses
++  end
++
++  test "for_email_address finds accounts by current or original address" do
++    @kevin.deactivate
++
++    assert_equal [ @kevin.id ], User.for_email_address("kevin@example.com").map(&:id)
++    assert_equal [ @david.id ], User.for_email_address("david@example.com").map(&:id)
++    assert_empty User.for_email_address("kev@example.com")
++    assert_empty User.for_email_address("kevin@example.org")
++    assert_empty User.for_email_address("not-an-address")
++  end
++
++  private
++    def search_index_rows(leaf_ids)
++      ActiveRecord::Base.connection.select_value(
++        Leaf.sanitize_sql([ "select count(*) from leaf_search_index where rowid in (?)", leaf_ids ])
++      )
++    end
++end

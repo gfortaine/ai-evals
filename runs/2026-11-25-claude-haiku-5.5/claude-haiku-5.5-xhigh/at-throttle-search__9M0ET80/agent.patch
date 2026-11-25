@@ -1,0 +1,284 @@
+diff --git a/app/controllers/books/searches_controller.rb b/app/controllers/books/searches_controller.rb
+index 5268c55..dca8b65 100644
+--- a/app/controllers/books/searches_controller.rb
++++ b/app/controllers/books/searches_controller.rb
+@@ -3,7 +3,21 @@ class Books::SearchesController < ApplicationController
+ 
+   include BookScoped
+ 
++  # Anyone can search a published book without signing in, so one address could
++  # otherwise run full-text queries against every book as fast as it likes.
++  SEARCH_LIMITER = SlidingWindowLimiter.new(name: "book-search", limit: 30, window: 1.minute)
++
++  before_action :refuse_when_over_search_limit, only: :create
++
+   def create
+     @leaves = @book.leaves.active.search(params[:search]).favoring_title.limit(50)
+   end
++
++  private
++    def refuse_when_over_search_limit
++      unless SEARCH_LIMITER.allow?(request.remote_ip)
++        response.headers["Retry-After"] = SEARCH_LIMITER.window.to_s
++        render :rate_limited, status: :too_many_requests
++      end
++    end
+ end
+diff --git a/app/views/books/searches/rate_limited.html.erb b/app/views/books/searches/rate_limited.html.erb
+new file mode 100644
+index 0000000..76d930c
+--- /dev/null
++++ b/app/views/books/searches/rate_limited.html.erb
+@@ -0,0 +1,7 @@
++<%= turbo_frame_tag :search do %>
++  <%= render "books/searches/form", book: @book %>
++
++  <div class="search__results flex flex-column margin-block-start">
++    <p class="search__no_matches txt-align-center">Too many searches. Try again in a minute.</p>
++  </div>
++<% end %>
+diff --git a/lib/sliding_window_limiter.rb b/lib/sliding_window_limiter.rb
+new file mode 100644
+index 0000000..a290b36
+--- /dev/null
++++ b/lib/sliding_window_limiter.rb
+@@ -0,0 +1,48 @@
++# Lets through at most +limit+ events per key in any stretch of +window+
++# seconds. The counts live in Rails.cache, so every server process shares them.
++#
++# Events are counted in one-second buckets. A check first counts the current
++# event in the bucket for this second, then sums the buckets covering the last
++# +window+ seconds. If that total is over the limit, the event is taken back out
++# and refused, so refused requests never count against the key. Counting before
++# reading means requests that race each other can't all read the same stale
++# total and get through together.
++#
++# If the cache can't count (the null store, or Redis being unavailable), events
++# are allowed rather than refused.
++class SlidingWindowLimiter
++  attr_reader :name, :limit, :window
++
++  def initialize(name:, limit:, window:)
++    @name = name
++    @limit = limit
++    @window = window.to_i
++  end
++
++  def allow?(key)
++    second = Time.now.to_i
++    bucket = bucket_key(key, second)
++
++    return true unless Rails.cache.increment(bucket, 1, expires_in: window)
++
++    if events_in_window(key, second) > limit
++      Rails.cache.decrement(bucket, 1)
++      false
++    else
++      true
++    end
++  end
++
++  private
++    def events_in_window(key, second)
++      keys = ((second - window + 1)..second).map { |s| bucket_key(key, s) }
++
++      # Counters are written with INCRBY, which Redis stores as raw integers,
++      # so they have to be read back raw.
++      Rails.cache.read_multi(*keys, raw: true).values.sum(&:to_i)
++    end
++
++    def bucket_key(key, second)
++      "rate-limit/#{name}/#{key}/#{second}"
++    end
++end
+diff --git a/test/controllers/books/searches_rate_limit_test.rb b/test/controllers/books/searches_rate_limit_test.rb
+new file mode 100644
+index 0000000..fa1c8f7
+--- /dev/null
++++ b/test/controllers/books/searches_rate_limit_test.rb
+@@ -0,0 +1,109 @@
++require "test_helper"
++
++class Books::SearchesRateLimitTest < ActionDispatch::IntegrationTest
++  setup do
++    @original_cache = Rails.cache
++    Rails.cache = ActiveSupport::Cache::MemoryStore.new
++
++    books(:handbook).update!(published: true)
++    books(:manual).update!(published: true)
++    Leaf.reindex_all
++
++    @address = { "REMOTE_ADDR" => "198.51.100.10" }
++  end
++
++  teardown do
++    Rails.cache = @original_cache
++  end
++
++  test "refuses searches past thirty a minute from one address with 429" do
++    30.times { search books(:handbook), from: @address }
++    assert_response :success
++
++    search books(:handbook), from: @address
++
++    assert_response :too_many_requests
++    assert_equal "60", response.headers["Retry-After"]
++    assert_not_equal 302, response.status
++  end
++
++  test "a refused search keeps the search form and says why there are no results" do
++    30.times { search books(:handbook), from: @address }
++
++    search books(:handbook), from: @address
++
++    assert_response :too_many_requests
++    assert_select "turbo-frame#search form#search_form"
++    assert_in_body "Too many searches"
++  end
++
++  test "the limit covers every book, not each book separately" do
++    15.times do
++      search books(:handbook), from: @address
++      search books(:manual), from: @address
++    end
++    assert_response :success
++
++    search books(:manual), from: @address
++
++    assert_response :too_many_requests
++  end
++
++  test "other addresses still get results from the same book" do
++    30.times { search books(:handbook), from: @address }
++    search books(:handbook), from: @address
++    assert_response :too_many_requests
++
++    search books(:handbook), from: { "REMOTE_ADDR" => "198.51.100.11" }
++
++    assert_response :success
++    assert_select "a", text: /Thanks for reading/i
++  end
++
++  test "the refused address can still open the book's pages" do
++    30.times { search books(:handbook), from: @address }
++    search books(:handbook), from: @address
++    assert_response :too_many_requests
++
++    get book_slug_path(books(:handbook)), headers: @address
++
++    assert_response :success
++  end
++
++  test "searching needs no sign-in and a refused search doesn't redirect" do
++    30.times { search books(:handbook), from: @address }
++
++    search books(:handbook), from: @address
++
++    assert_response :too_many_requests
++    assert_nil response.location
++  end
++
++  test "an address is served again once it has been quiet for a minute" do
++    30.times { search books(:handbook), from: @address }
++    search books(:handbook), from: @address
++    assert_response :too_many_requests
++
++    travel 1.minute
++
++    search books(:handbook), from: @address
++    assert_response :success
++  end
++
++  test "an address that stopped bursting is served again within five minutes" do
++    30.times { search books(:handbook), from: @address }
++    search books(:handbook), from: @address
++    assert_response :too_many_requests
++
++    travel 5.minutes
++
++    search books(:handbook), from: @address
++    assert_response :success
++    assert_select "a", text: /Thanks for reading/i
++  end
++
++  private
++    def search(book, from:)
++      post book_search_path(book), params: { search: "Thanks" }, headers: from
++    end
++end
+diff --git a/test/lib/sliding_window_limiter_test.rb b/test/lib/sliding_window_limiter_test.rb
+new file mode 100644
+index 0000000..743be89
+--- /dev/null
++++ b/test/lib/sliding_window_limiter_test.rb
+@@ -0,0 +1,70 @@
++require "test_helper"
++
++class SlidingWindowLimiterTest < ActiveSupport::TestCase
++  setup do
++    @original_cache = Rails.cache
++    Rails.cache = ActiveSupport::Cache::MemoryStore.new
++    @limiter = SlidingWindowLimiter.new(name: "test", limit: 3, window: 1.minute)
++  end
++
++  teardown do
++    Rails.cache = @original_cache
++  end
++
++  test "allows up to the limit and refuses the rest" do
++    assert_equal [ true, true, true, false, false ], Array.new(5) { @limiter.allow?("1.2.3.4") }
++  end
++
++  test "keeps a separate count for each key" do
++    3.times { @limiter.allow?("1.2.3.4") }
++
++    assert_not @limiter.allow?("1.2.3.4")
++    assert @limiter.allow?("5.6.7.8")
++  end
++
++  test "frees a slot once the event that used it is a full window old" do
++    travel_to Time.zone.local(2025, 1, 1, 12, 0, 0) do
++      3.times { @limiter.allow?("1.2.3.4") }
++      assert_not @limiter.allow?("1.2.3.4")
++    end
++
++    travel_to Time.zone.local(2025, 1, 1, 12, 0, 59) do
++      assert_not @limiter.allow?("1.2.3.4")
++    end
++
++    travel_to Time.zone.local(2025, 1, 1, 12, 1, 0) do
++      assert @limiter.allow?("1.2.3.4")
++    end
++  end
++
++  test "a burst straddling a clock minute can't get more than the limit through" do
++    travel_to Time.zone.local(2025, 1, 1, 12, 0, 30) do
++      2.times { assert @limiter.allow?("1.2.3.4") }
++    end
++
++    travel_to Time.zone.local(2025, 1, 1, 12, 1, 0) do
++      assert @limiter.allow?("1.2.3.4")
++      assert_not @limiter.allow?("1.2.3.4")
++    end
++  end
++
++  test "refused events don't extend the refusal" do
++    travel_to Time.zone.local(2025, 1, 1, 12, 0, 0) do
++      3.times { @limiter.allow?("1.2.3.4") }
++    end
++
++    travel_to Time.zone.local(2025, 1, 1, 12, 0, 10) do
++      5.times { assert_not @limiter.allow?("1.2.3.4") }
++    end
++
++    travel_to Time.zone.local(2025, 1, 1, 12, 1, 0) do
++      assert @limiter.allow?("1.2.3.4")
++    end
++  end
++
++  test "allows everything when the cache can't count" do
++    Rails.cache = ActiveSupport::Cache::NullStore.new
++
++    assert_equal [ true ] * 10, Array.new(10) { @limiter.allow?("1.2.3.4") }
++  end
++end

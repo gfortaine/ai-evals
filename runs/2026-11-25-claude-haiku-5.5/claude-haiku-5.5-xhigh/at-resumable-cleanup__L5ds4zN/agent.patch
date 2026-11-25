@@ -1,0 +1,226 @@
+diff --git a/app/jobs/title_cleanup_job.rb b/app/jobs/title_cleanup_job.rb
+index 13721ed..8053c46 100644
+--- a/app/jobs/title_cleanup_job.rb
++++ b/app/jobs/title_cleanup_job.rb
+@@ -1,11 +1,39 @@
+ class TitleCleanupJob < ApplicationJob
++  CHECKPOINT = "title_cleanup"
++
+   def perform
+-    Leaf.find_each(order: :asc) do |leaf|
+-      leaf.update!(title: cleaned(leaf.title))
+-    end
++    # A leaf's search index entry is updated just after its commit, so a run interrupted in between
++    # leaves that entry stale. Only the last cleaned leaf can be affected, so refresh it before resuming.
++    last_cleaned_leaf&.reindex
++
++    loop { break unless clean_next_leaf }
+   end
+ 
+   private
++    # Cleaning a leaf and advancing the checkpoint past it commit together, so an interruption rolls
++    # back at most the leaf in progress and the next run resumes at that leaf. Committed leaves are
++    # never cleaned again. The checkpoint is read inside the transaction, so overlapping runs (SQLite
++    # starts transactions immediately) cannot both clean the same leaf.
++    #
++    # Returns false once there are no leaves left after the checkpoint.
++    def clean_next_leaf
++      JobCheckpoint.transaction do
++        checkpoint = JobCheckpoint.for(CHECKPOINT)
++        leaf = Leaf.where("id > ?", checkpoint.last_processed_id).order(:id).first
++
++        if leaf
++          leaf.update!(title: cleaned(leaf.title))
++          checkpoint.update!(last_processed_id: leaf.id)
++        end
++
++        leaf.present?
++      end
++    end
++
++    def last_cleaned_leaf
++      Leaf.find_by(id: JobCheckpoint.for(CHECKPOINT).last_processed_id)
++    end
++
+     def cleaned(title)
+       title.delete_prefix('"').delete_suffix('"')
+     end
+diff --git a/app/models/job_checkpoint.rb b/app/models/job_checkpoint.rb
+new file mode 100644
+index 0000000..642b144
+--- /dev/null
++++ b/app/models/job_checkpoint.rb
+@@ -0,0 +1,6 @@
++class JobCheckpoint < ApplicationRecord
++  # The checkpoint for a named job, created on first use.
++  def self.for(name)
++    find_or_create_by!(name: name)
++  end
++end
+diff --git a/db/migrate/20261122213039_create_job_checkpoints.rb b/db/migrate/20261122213039_create_job_checkpoints.rb
+new file mode 100644
+index 0000000..5a764de
+--- /dev/null
++++ b/db/migrate/20261122213039_create_job_checkpoints.rb
+@@ -0,0 +1,10 @@
++class CreateJobCheckpoints < ActiveRecord::Migration[8.0]
++  def change
++    create_table :job_checkpoints do |t|
++      t.string :name, null: false, index: { unique: true }
++      t.integer :last_processed_id, null: false, default: 0
++
++      t.timestamps
++    end
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index e033199..6b37826 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.0].define(version: 2024_09_28_005927) do
++ActiveRecord::Schema[8.0].define(version: 2026_11_22_213039) do
+   create_table "accesses", force: :cascade do |t|
+     t.integer "user_id", null: false
+     t.integer "book_id", null: false
+@@ -94,6 +94,14 @@ ActiveRecord::Schema[8.0].define(version: 2024_09_28_005927) do
+     t.index ["leafable_type", "leafable_id"], name: "index_edits_on_leafable"
+   end
+ 
++  create_table "job_checkpoints", force: :cascade do |t|
++    t.string "name", null: false
++    t.integer "last_processed_id", default: 0, null: false
++    t.datetime "created_at", null: false
++    t.datetime "updated_at", null: false
++    t.index ["name"], name: "index_job_checkpoints_on_name", unique: true
++  end
++
+   create_table "leaves", force: :cascade do |t|
+     t.integer "book_id", null: false
+     t.string "leafable_type", null: false
+diff --git a/test/jobs/title_cleanup_job_test.rb b/test/jobs/title_cleanup_job_test.rb
+new file mode 100644
+index 0000000..6a9abb6
+--- /dev/null
++++ b/test/jobs/title_cleanup_job_test.rb
+@@ -0,0 +1,117 @@
++require "test_helper"
++
++class TitleCleanupJobTest < ActiveSupport::TestCase
++  class Interrupted < StandardError; end
++
++  setup do
++    # The legacy exporter wrapped every title in quotes, and some real titles legitimately open with a quoted phrase.
++    @expected = {} # leaf id => title once cleaned
++    @legacy = {}   # leaf id => title as the exporter stored it
++    Leaf.order(:id).each do |leaf|
++      @expected[leaf.id] = %("Quoted" #{leaf.title})
++      @legacy[leaf.id] = %("#{@expected[leaf.id]}")
++      leaf.update_column :title, @legacy[leaf.id]
++    end
++    @ids = @expected.keys.sort
++  end
++
++  test "strips the wrapping quotes and keeps the inner quotes" do
++    TitleCleanupJob.perform_now
++
++    assert_cleaned_exactly_once
++  end
++
++  test "running again does not strip the inner quotes a second time" do
++    TitleCleanupJob.perform_now
++    TitleCleanupJob.perform_now
++
++    assert_cleaned_exactly_once
++  end
++
++  test "the search index follows the cleaned titles" do
++    TitleCleanupJob.perform_now
++
++    indexed = Leaf.connection.select_rows("select rowid, title from leaf_search_index").to_h
++    assert_not_empty indexed
++    indexed.each { |id, title| assert_equal @expected[id], title }
++  end
++
++  test "after an interruption, the next run resumes at the leaf it was on" do
++    job = TitleCleanupJob.new
++    attempts = 0
++    interrupt_on_second_leaf = ->(original, title) do
++      attempts += 1
++      raise Interrupted if attempts == 2
++      original.call(title)
++    end
++
++    stubbing(job, :cleaned, interrupt_on_second_leaf) do
++      assert_raises(Interrupted) { job.perform }
++    end
++
++    seen = []
++    record_titles = ->(original, title) { seen << title; original.call(title) }
++    stubbing(resumed = TitleCleanupJob.new, :cleaned, record_titles) { resumed.perform }
++
++    # Only the leaf that was in progress (the second) is redone; the first was committed and is not touched again.
++    assert_equal @ids.drop(1).map { @legacy[it] }, seen
++    assert_cleaned_exactly_once
++  end
++
++  test "an interruption after a leaf is cleaned but before progress is recorded rolls that leaf back" do
++    fail_to_record_progress = ->(original, name) do
++      original.call(name).tap do |checkpoint|
++        checkpoint.define_singleton_method(:update!) { |*| raise Interrupted }
++      end
++    end
++
++    stubbing(JobCheckpoint, :for, fail_to_record_progress) do
++      assert_raises(Interrupted) { TitleCleanupJob.perform_now }
++    end
++
++    assert_equal @legacy[@ids.first], Leaf.find(@ids.first).title
++
++    TitleCleanupJob.perform_now
++
++    assert_cleaned_exactly_once
++  end
++
++  test "the next run refreshes the search entry of the leaf it resumes after" do
++    leaf = leaves(:welcome_page)
++    leaf.reindex # the search entry as it was before the leaf was cleaned
++    Leaf.where(id: ..leaf.id).each { |cleaned_leaf| cleaned_leaf.update_column :title, @expected[cleaned_leaf.id] }
++    JobCheckpoint.create!(name: TitleCleanupJob::CHECKPOINT, last_processed_id: leaf.id)
++
++    TitleCleanupJob.perform_now
++
++    assert_equal @expected[leaf.id], indexed_title(leaf.id)
++    assert_cleaned_exactly_once
++  end
++
++  test "skips the leaves an existing checkpoint already covers" do
++    JobCheckpoint.create!(name: TitleCleanupJob::CHECKPOINT, last_processed_id: @ids.second)
++
++    TitleCleanupJob.perform_now
++
++    @ids.first(2).each { |id| assert_equal @legacy[id], Leaf.find(id).title }
++    @ids.drop(2).each { |id| assert_equal @expected[id], Leaf.find(id).title }
++  end
++
++  private
++    def assert_cleaned_exactly_once
++      @expected.each { |id, title| assert_equal title, Leaf.find(id).title }
++    end
++
++    def indexed_title(id)
++      Leaf.connection.select_value("select title from leaf_search_index where rowid = #{Integer(id)}")
++    end
++
++    # Replaces +name+ on +object+ while the block runs. The replacement receives the original method first.
++    def stubbing(object, name, replacement)
++      original = object.method(name)
++      object.define_singleton_method(name) { |*args| replacement.call(original, *args) }
++      yield
++    ensure
++      object.define_singleton_method(name, original) if original
++    end
++end

@@ -1,0 +1,4786 @@
+diff --git a/app/assets/images/bot.svg b/app/assets/images/bot.svg
+new file mode 100644
+index 0000000..f1561ee
+--- /dev/null
++++ b/app/assets/images/bot.svg
+@@ -0,0 +1 @@
++<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><g fill="none" stroke="#000" stroke-linecap="round" stroke-linejoin="round" stroke-width="2"><rect x="4" y="7" width="16" height="13" rx="3"/><path d="m12 7v-2.5"/><path d="m2 12v3"/><path d="m22 12v3"/><path d="m9 15.5h6"/></g><circle cx="12" cy="2.5" r="1.5"/><circle cx="9" cy="12.5" r="1.5"/><circle cx="15" cy="12.5" r="1.5"/></svg>
+diff --git a/app/controllers/accounts_controller.rb b/app/controllers/accounts_controller.rb
+index 55a0e2e..9813fe8 100644
+--- a/app/controllers/accounts_controller.rb
++++ b/app/controllers/accounts_controller.rb
+@@ -9,8 +9,11 @@ class AccountsController < ApplicationController
+   end
+ 
+   def update
+-    @account.update!(account_params)
+-    redirect_to edit_account_url, notice: "✓"
++    if @account.update(account_params)
++      redirect_to edit_account_url, notice: "✓"
++    else
++      redirect_to edit_account_url, alert: @account.errors.full_messages.to_sentence
++    end
+   end
+ 
+   private
+@@ -18,8 +21,9 @@ class AccountsController < ApplicationController
+       @account = Current.account
+     end
+ 
++    # Bots per member is permitted at the top level, not in settings, so that it always goes through its validation.
+     def account_params
+-      params.require(:account).permit(:name, :logo, settings: {})
++      params.require(:account).permit(:name, :logo, :bots_per_member, settings: [ :restrict_room_creation_to_administrators ])
+     end
+ 
+     def account_users
+diff --git a/app/controllers/bots/messages_controller.rb b/app/controllers/bots/messages_controller.rb
+new file mode 100644
+index 0000000..14d8c1d
+--- /dev/null
++++ b/app/controllers/bots/messages_controller.rb
+@@ -0,0 +1,80 @@
++# Lets bots post messages from scripts and CI jobs. The bot code in the path is the only credential, and the
++# raw request body is the message: no JSON envelope, no field names. Multipart uploads are the one exception: their
++# `attachment` file becomes the message, as it does when a person posts a file.
++#
++# A bot that floods a room is refused with 429 Too Many Requests while it's cooling down, and a suspended bot gets
++# 403 Forbidden (see Bot::Flooding and Bot::Suspension).
++class Bots::MessagesController < ApplicationController
++  include ActiveStorage::SetCurrent
++
++  allow_unauthenticated_access
++  skip_forgery_protection
++
++  before_action :set_bot, :ensure_not_suspended, :ensure_not_cooling_down, :set_room, :ensure_content_present
++
++  rescue_from(Bot::Suspended) { head :forbidden }
++  rescue_from(Bot::RateLimited) { |error| head :too_many_requests, "Retry-After" => error.retry_after.to_s }
++
++  def create
++    message = @bot.post_message(@room, **message_attributes)
++
++    head :created, location: message_path(message)
++  end
++
++  private
++    # The body is the message, not parameters. Left alone, Rails would parse it as a form or JSON document
++    # before any action runs, and a body such as "100% done" would be rejected with a 400. Multipart is the
++    # exception, since its attachment has to be parsed.
++    def process_action(*)
++      request.request_parameters = {} unless multipart?
++      super
++    end
++
++    def set_bot
++      @bot = Bot.authenticate(params[:bot_code])
++      head :unauthorized unless @bot
++    end
++
++    def ensure_not_suspended
++      head :forbidden if @bot.suspended?
++    end
++
++    # Every attempt during a cooldown counts, so this runs before the room and content are checked.
++    def ensure_not_cooling_down
++      @bot.refuse_during_cooldown!
++    end
++
++    def set_room
++      @room = @bot.user.rooms.find_by(id: params[:room_id])
++      head :not_found unless @room
++    end
++
++    def ensure_content_present
++      head :unprocessable_content if message_text.blank? && uploaded_attachment.nil?
++    end
++
++    def message_attributes
++      { body: (message_html if message_text.present?), attachment: uploaded_attachment }.compact
++    end
++
++    def message_html
++      Bot.html_from_text(message_text)
++    end
++
++    # Like the web app, a message is either text or a file, so a multipart request carries no text.
++    def message_text
++      @message_text ||= (multipart? ? "" : request_text).gsub(/\r\n?/, "\n").strip
++    end
++
++    def request_text
++      request.raw_post.dup.force_encoding(Encoding::UTF_8).scrub
++    end
++
++    def uploaded_attachment
++      params[:attachment] if multipart? && params[:attachment].is_a?(ActionDispatch::Http::UploadedFile)
++    end
++
++    def multipart?
++      request.media_type == "multipart/form-data"
++    end
++end
+diff --git a/app/controllers/bots/reactivations_controller.rb b/app/controllers/bots/reactivations_controller.rb
+new file mode 100644
+index 0000000..8ed001e
+--- /dev/null
++++ b/app/controllers/bots/reactivations_controller.rb
+@@ -0,0 +1,20 @@
++# Administrators decide when a suspended bot comes back. Nobody else can reactivate one, not even its creator.
++class Bots::ReactivationsController < ApplicationController
++  before_action :ensure_administrator
++  before_action :set_bot
++
++  def create
++    @bot.reactivate!
++
++    redirect_to bots_url
++  end
++
++  private
++    def ensure_administrator
++      head :forbidden unless Current.user.administrator?
++    end
++
++    def set_bot
++      @bot = Bot.find(params[:bot_id])
++    end
++end
+diff --git a/app/controllers/bots_controller.rb b/app/controllers/bots_controller.rb
+new file mode 100644
+index 0000000..8b97c2c
+--- /dev/null
++++ b/app/controllers/bots_controller.rb
+@@ -0,0 +1,64 @@
++class BotsController < ApplicationController
++  before_action :set_bot, only: %i[ edit update destroy ]
++  before_action :ensure_can_administer, only: %i[ edit update destroy ]
++  before_action :ensure_can_add_bots, only: %i[ new create ]
++
++  def index
++    @bots = visible_bots.ordered.preload(:creator, user: :avatar_attachment)
++  end
++
++  def new
++    @bot = Bot.new
++  end
++
++  def create
++    @bot = Bot.new(bot_params)
++
++    if @bot.save
++      redirect_to bots_url
++    else
++      render :new, status: :unprocessable_content
++    end
++  end
++
++  def edit
++  end
++
++  def update
++    if @bot.update(bot_params)
++      redirect_to bots_url
++    else
++      render :edit, status: :unprocessable_content
++    end
++  end
++
++  def destroy
++    @bot.user.deactivate
++
++    redirect_to bots_url
++  end
++
++  private
++    def set_bot
++      @bot = Bot.find(params[:id])
++    end
++
++    def ensure_can_administer
++      head :forbidden unless Current.user.can_administer?(@bot)
++    end
++
++    # The list says why, so a member at the limit is sent back to it.
++    def ensure_can_add_bots
++      redirect_to bots_url unless Current.user.can_add_bots?
++    end
++
++    # Administrators manage every bot; everyone else only the bots they created.
++    def visible_bots
++      Current.user.can_administer? ? Bot.all : Current.user.bots
++    end
++
++    # A file field submits nothing when no file is chosen, which must not clear the current avatar.
++    def bot_params
++      params.require(:bot).permit(:name, :avatar, :webhook_url, :add_to_all_open_rooms).reject { |key, value| key == "avatar" && value.blank? }
++    end
++end
+diff --git a/app/helpers/bots_helper.rb b/app/helpers/bots_helper.rb
+new file mode 100644
+index 0000000..160c43e
+--- /dev/null
++++ b/app/helpers/bots_helper.rb
+@@ -0,0 +1,20 @@
++module BotsHelper
++  def bot_avatar_tag(bot, **options)
++    if bot.user&.persisted?
++      image_tag fresh_user_avatar_path(bot.user), **options
++    else
++      image_tag "default-avatar.svg", **options
++    end
++  end
++
++  # Why a suspended bot was suspended, in words for the list.
++  def bot_suspension_reason(bot)
++    case bot.suspension_reason
++    when "flooding"
++      "Went over its limit of #{Bot::MAX_MESSAGES} messages in #{Bot::WINDOW.to_i} seconds, then kept trying during the " \
++        "#{Bot::COOLDOWN.to_i}-second cooldown."
++    when "failing_webhook"
++      "Its webhook failed #{Bot::WEBHOOK_FAILURE_LIMIT} times in a row."
++    end
++  end
++end
+diff --git a/app/jobs/bot/joined_job.rb b/app/jobs/bot/joined_job.rb
+new file mode 100644
+index 0000000..3d0ec4d
+--- /dev/null
++++ b/app/jobs/bot/joined_job.rb
+@@ -0,0 +1,12 @@
++# Tells a bot that it has joined a room. See Bot::Webhook.
++class Bot::JoinedJob < ApplicationJob
++  # The bot or the room may be deleted before the job runs, in which case there's nothing to tell.
++  discard_on ActiveJob::DeserializationError
++
++  def perform(bot, room)
++    # The bot may have left the room, been banned, been suspended, or lost its webhook since it joined. Then it isn't told.
++    return unless bot.webhook_active? && bot.user.rooms.exists?(room.id)
++
++    Bot::Webhook.new(bot, Bot::Webhook::JoinedPayload.new(bot, room)).deliver
++  end
++end
+diff --git a/app/jobs/bot/webhook_job.rb b/app/jobs/bot/webhook_job.rb
+new file mode 100644
+index 0000000..8183e9c
+--- /dev/null
++++ b/app/jobs/bot/webhook_job.rb
+@@ -0,0 +1,11 @@
++# Calls the webhooks of the bots a message mentions. See Bot::Webhook.
++class Bot::WebhookJob < ApplicationJob
++  # The message may be deleted before the job runs, in which case there's nothing to tell the bots.
++  discard_on ActiveJob::DeserializationError
++
++  def perform(message)
++    message.mentioned_bots_with_webhooks.each do |bot|
++      Bot::Webhook.new(bot, Bot::Webhook::Payload.new(bot, message)).deliver
++    end
++  end
++end
+diff --git a/app/models/account.rb b/app/models/account.rb
+index dfa9bea..c802ef8 100644
+--- a/app/models/account.rb
++++ b/app/models/account.rb
+@@ -6,9 +6,34 @@ class Account < ApplicationRecord
+     attachable.variant :small, resize_to_limit: [ 192, 192 ], format: :png
+   end
+ 
+-  has_json :settings, restrict_room_creation_to_administrators: false
++  has_json :settings, restrict_room_creation_to_administrators: false, bots_per_member: 5
++
++  # How many bots each member can have. Administrators aren't limited, and lowering the limit never removes bots.
++  validates :bots_per_member, numericality: { only_integer: true, greater_than_or_equal_to: 0 }
++
++  after_save { @bots_per_member_before_type_cast = nil }
+ 
+   def logo_variant(size)
+     logo.variant(size).processed if logo.variable?
+   end
++
++  def reload(...)
++    @bots_per_member_before_type_cast = nil
++    super
++  end
++
++  def bots_per_member
++    settings.bots_per_member
++  end
++
++  # Settings cast on assignment, so "2.5" would quietly become 2 and "abc" would become 0. Keeping what was typed lets
++  # validation refuse those. Once the account is saved or reloaded, validation goes back to the stored value.
++  def bots_per_member=(value)
++    @bots_per_member_before_type_cast = value
++    settings.bots_per_member = value
++  end
++
++  def bots_per_member_before_type_cast
++    @bots_per_member_before_type_cast || bots_per_member
++  end
+ end
+diff --git a/app/models/bot.rb b/app/models/bot.rb
+new file mode 100644
+index 0000000..915459a
+--- /dev/null
++++ b/app/models/bot.rb
+@@ -0,0 +1,107 @@
++# Bots post into rooms over HTTP, authenticating with their code. Each bot acts through its own user, so its
++# messages, memberships and notifications work exactly as they do for people. The code is the bot's credential:
++# whoever holds it can post as the bot, so it's only shown to the bot's creator and to administrators.
++#
++# A bot may also have a webhook URL. When a message mentions the bot, or the bot is added to a room, Bot::Webhook calls
++# that URL.
++#
++# Bots join only the rooms they're added to, unless they're set to add_to_all_open_rooms. Then they're members of every
++# open room, including ones created later (see User.joining_open_rooms and Rooms::Open).
++#
++# A bot that floods a room, or whose webhook keeps failing, is suspended (see Bot::Flooding and Bot::Suspension).
++class Bot < ApplicationRecord
++  include Flooding, Suspension
++
++  # Raised when a suspended bot tries to post. The bot API answers 403 Forbidden.
++  class Suspended < StandardError; end
++
++  # Raised when a bot is refused a message, because it's cooling down or the message would go over its limit. The bot
++  # API answers 429 Too Many Requests, with Retry-After set to retry_after seconds.
++  class RateLimited < StandardError
++    attr_reader :retry_after
++
++    def initialize(retry_after)
++      @retry_after = retry_after
++      super("Chat bot is rate limited for #{retry_after} more seconds")
++    end
++  end
++
++  has_secure_token :code
++
++  belongs_to :user, autosave: true
++  belongs_to :creator, class_name: "User", default: -> { Current.user }
++  has_many :joined_rooms, class_name: "Bot::JoinedRoom", dependent: :delete_all
++
++  normalizes :webhook_url, with: ->(url) { url.strip.presence }
++
++  validates :name, presence: true
++  validate :webhook_url_must_be_http_url, if: :webhook_url?
++  validate :creator_must_be_under_bot_limit, on: :create
++
++  after_save :join_open_rooms, if: :add_to_all_open_rooms?
++
++  delegate :name, to: :user, allow_nil: true
++
++  scope :ordered, -> { joins(:user).order("LOWER(users.name)") }
++  # Bots that get webhooks: they have one, they aren't suspended, and their user is active.
++  scope :with_active_webhook, -> { joins(:user).merge(User.active).where.not(webhook_url: nil).where(suspended_at: nil) }
++
++  class << self
++    # Only bots whose user is active can authenticate, so banning a user stops its bots at once. Deactivating a
++    # user destroys its bot outright (see User#deactivate).
++    def authenticate(code)
++      joins(:user).merge(User.active).find_by(code: code) if code.present?
++    end
++
++    # Bot text is plain text, so it's escaped before being stored as rich text: markup in it is shown as written.
++    # Line breaks are kept.
++    def html_from_text(text)
++      ERB::Util.html_escape(text.gsub(/\r\n?/, "\n").strip).gsub("\n", "<br>")
++    end
++
++    # HTML from a bot is kept to the markup messages are shown with. Attachments are dropped, so a bot can't mention
++    # people, which would ping them, the way a person can with the @-mention autocomplete.
++    def html_from_html(html)
++      fragment = ActionText::Content.new(html).fragment.replace(ActionText::Attachment.tag_name) { nil }
++
++      ContentFilters::TextMessagePresentationFilters.apply(ActionText::Content.new(fragment, canonicalize: false)).to_html
++    end
++  end
++
++  def name=(name)
++    bot_user.name = name
++  end
++
++  def avatar=(avatar)
++    bot_user.avatar = avatar
++  end
++
++  private
++    # Bots never sign in, so this password only satisfies the user's password digest.
++    def bot_user
++      user || build_user(password: SecureRandom.hex)
++    end
++
++    # Runs on every save while the switch is on, so the bot is in every open room, not just the ones that existed when
++    # the switch was turned on. Rooms it's already in are skipped, so nothing is added or announced twice.
++    def join_open_rooms
++      Rooms::Open.where.not(id: user.memberships.select(:room_id)).each do |room|
++        room.memberships.grant_to user
++      end
++    end
++
++    # Only creating a bot counts, so lowering the account's limit never removes or blocks existing bots. Validation runs
++    # inside the save's transaction, and SQLite runs write transactions one at a time, so two creations for the same
++    # member can't both see room under the limit.
++    def creator_must_be_under_bot_limit
++      if creator && !creator.can_add_bots?
++        limit = Current.account.bots_per_member
++        errors.add :base, "You’ve reached the limit of #{limit} #{"chat bot".pluralize(limit)}."
++      end
++    end
++
++    def webhook_url_must_be_http_url
++      uri = URI.parse(webhook_url) rescue nil
++      errors.add :webhook_url, "must be an http or https address" unless uri.is_a?(URI::HTTP) && uri.host.present?
++    end
++end
+diff --git a/app/models/bot/flooding.rb b/app/models/bot/flooding.rb
+new file mode 100644
+index 0000000..e8d684b
+--- /dev/null
++++ b/app/models/bot/flooding.rb
+@@ -0,0 +1,93 @@
++# Stops a bot from flooding a room. A bot may post at most MAX_MESSAGES messages in any WINDOW, counting messages posted
++# through the bot API and webhook replies alike. The message that goes over that limit is refused and starts a COOLDOWN,
++# during which every attempt to post is refused too. MAX_COOLDOWN_ATTEMPTS attempts within one cooldown suspend the bot
++# (see Bot::Suspension).
++#
++# Messages are counted from the messages table, so there's no separate record of posting to keep in step. A refused
++# attempt isn't a message, so it doesn't count towards the limit. The cooldown is longer than the window, so once it has
++# passed, the window is always clear.
++#
++# The check, the cooldown bookkeeping and the insert all run under the bot's row lock. Two posts can't both see room
++# under the limit, whether they come from the API or from webhook replies. Attachments are processed after the
++# transaction, since that can be slow and would otherwise hold the lock.
++module Bot::Flooding
++  extend ActiveSupport::Concern
++
++  MAX_MESSAGES = 10
++  WINDOW = 10.seconds
++  COOLDOWN = 30.seconds
++  MAX_COOLDOWN_ATTEMPTS = 5
++
++  # Posts a message as the bot, and returns it. Raises Bot::Suspended if the bot is suspended, or Bot::RateLimited if the
++  # message is refused, with the seconds left to wait.
++  def post_message(room, **attributes)
++    message, retry_after = with_lock { post_unless_limited(room, attributes) }
++
++    raise Bot::RateLimited.new(retry_after) if retry_after
++
++    message.process_attachment
++    message.broadcast_create
++    message
++  end
++
++  # Checks an attempt to post against the cooldown, before anything else about the attempt is checked. So during a
++  # cooldown, every attempt is refused and counts, even one that would have been refused for another reason, such as an
++  # unknown room. Raises Bot::Suspended or Bot::RateLimited, like post_message.
++  def refuse_during_cooldown!
++    retry_after = with_lock do
++      raise Bot::Suspended if suspended?
++
++      attempt_during_cooldown
++    end
++
++    raise Bot::RateLimited.new(retry_after) if retry_after
++  end
++
++  private
++    # Raising here would roll back the cooldown bookkeeping, so refusals are returned, and raised once the transaction
++    # has committed.
++    def post_unless_limited(room, attributes)
++      raise Bot::Suspended if suspended?
++
++      if (retry_after = attempt_during_cooldown)
++        [ nil, retry_after ]
++      elsif message_limit_reached?
++        start_cooldown
++        [ nil, COOLDOWN.to_i ]
++      else
++        [ room.messages.create!(attributes.merge(creator: user)), nil ]
++      end
++    end
++
++    # Counts the attempt if the bot is cooling down, and returns the seconds left to wait. Returns nil otherwise.
++    def attempt_during_cooldown
++      return unless cooling_down?
++
++      count_cooldown_attempt
++      seconds_until_cooldown_ends
++    end
++
++    def cooling_down?
++      cooldown_until.present? && cooldown_until.future?
++    end
++
++    def message_limit_reached?
++      user.messages.where(Message.arel_table[:created_at].gt(WINDOW.ago)).count >= MAX_MESSAGES
++    end
++
++    def start_cooldown
++      update_columns cooldown_until: COOLDOWN.from_now, cooldown_attempts: 0
++    end
++
++    def count_cooldown_attempt
++      attempts = cooldown_attempts + 1
++      update_columns cooldown_attempts: attempts
++
++      suspend!(:flooding) if attempts >= MAX_COOLDOWN_ATTEMPTS
++    end
++
++    # Rounded up, so a client that waits this long isn't refused again.
++    def seconds_until_cooldown_ends
++      (cooldown_until - Time.current).ceil
++    end
++end
+diff --git a/app/models/bot/joined_room.rb b/app/models/bot/joined_room.rb
+new file mode 100644
+index 0000000..b22efd3
+--- /dev/null
++++ b/app/models/bot/joined_room.rb
+@@ -0,0 +1,8 @@
++# Records that a bot has been told it joined a room. A bot is told once per room, so this row is what stops a bot that's
++# removed from a room and added back being told again. See Room#notify_bots_joined.
++class Bot::JoinedRoom < ApplicationRecord
++  self.table_name = "bot_joined_rooms"
++
++  belongs_to :bot
++  belongs_to :room
++end
+diff --git a/app/models/bot/suspension.rb b/app/models/bot/suspension.rb
+new file mode 100644
+index 0000000..0cd9bd8
+--- /dev/null
++++ b/app/models/bot/suspension.rb
+@@ -0,0 +1,61 @@
++# A suspended bot can't post, and gets no webhooks. It keeps its rooms, messages and place in its owner's bot limit,
++# and stays on the bots page, where an administrator can reactivate it.
++#
++# Bots are suspended for flooding (see Bot::Flooding), or when ten webhook deliveries fail in a row. A delivery succeeds
++# when the bot answers with a 2xx, and fails otherwise, including on a timeout, a connection error, or an address that's
++# refused (see Bot::Webhook).
++#
++# Every change here happens under a row lock, so the counts and the suspension are never read stale by a concurrent
++# post or delivery.
++module Bot::Suspension
++  extend ActiveSupport::Concern
++
++  WEBHOOK_FAILURE_LIMIT = 10
++
++  included do
++    enum :suspension_reason, { flooding: "flooding", failing_webhook: "failing_webhook" }, validate: { allow_nil: true }
++  end
++
++  def suspended?
++    suspended_at.present?
++  end
++
++  # Whether the bot is called at all: it has a webhook, it isn't suspended, and its user is active.
++  def webhook_active?
++    webhook_url? && !suspended? && user.active?
++  end
++
++  def suspend!(reason)
++    with_lock do
++      next if suspended?
++
++      update_columns suspended_at: Time.current, suspension_reason: reason
++      Rails.logger.warn "Bot #{id} suspended for #{reason}"
++    end
++  end
++
++  # Administrators decide when a bot comes back. Its counters start again, so it isn't refused for what it did before.
++  def reactivate!
++    with_lock do
++      next unless suspended?
++
++      update_columns suspended_at: nil, suspension_reason: nil, cooldown_until: nil, cooldown_attempts: 0,
++        consecutive_webhook_failures: 0
++      Rails.logger.info "Bot #{id} reactivated"
++    end
++  end
++
++  def webhook_delivered
++    with_lock do
++      update_columns consecutive_webhook_failures: 0 if consecutive_webhook_failures.positive?
++    end
++  end
++
++  def webhook_failed
++    with_lock do
++      update_columns consecutive_webhook_failures: consecutive_webhook_failures + 1
++
++      suspend!(:failing_webhook) if consecutive_webhook_failures >= WEBHOOK_FAILURE_LIMIT
++    end
++  end
++end
+diff --git a/app/models/bot/webhook.rb b/app/models/bot/webhook.rb
+new file mode 100644
+index 0000000..95ff75f
+--- /dev/null
++++ b/app/models/bot/webhook.rb
+@@ -0,0 +1,149 @@
++require "net/http"
++require "restricted_http/private_network_guard"
++
++# Calls a bot's webhook with an event (a mention, or the bot joining a room), and posts what the bot answers with:
++#
++# - 200 with text/plain or text/html: the body is posted into the room the event is about, as the bot's message.
++# - 204, or any other status: nothing is posted. A bot that wants to reply later can post over the bot API, using the
++#   reply_to path in the payload.
++#
++# The payload is one of Bot::Webhook::Payload (a mention) or Bot::Webhook::JoinedPayload. Bot::WebhookJob and
++# Bot::JoinedJob run this, so a slow or broken webhook never holds up the person who posted the message or added the bot.
++#
++# A delivery succeeds when the bot answers with any 2xx. Anything else (another status, a timeout, a connection error)
++# is a failed delivery, and counts towards suspending the bot (see Bot::Suspension). A reply is posted through the same
++# limits as the bot API (see Bot::Flooding), so a reply can be refused, and then it isn't posted.
++class Bot::Webhook
++  OPEN_TIMEOUT = 5 # seconds
++  READ_TIMEOUT = 10 # seconds
++  MAX_REPLY_SIZE = 1.megabyte
++  REPLY_CONTENT_TYPES = %w[ text/plain text/html ]
++
++  # Raised while reading a reply that's too big, to abandon the rest of the response.
++  class ReplyTooLarge < StandardError; end
++
++  # Failures reaching a bot are expected, so they're logged rather than retried. Anything else is a bug and raises.
++  DELIVERY_FAILURES = [
++    Timeout::Error, SocketError, SystemCallError, IOError, OpenSSL::SSL::SSLError,
++    Net::ProtocolError, Net::HTTPBadResponse, Zlib::Error,
++    RestrictedHTTP::Violation, Surfguard::Unresolvable
++  ]
++
++  attr_reader :bot, :payload
++
++  delegate :room, to: :payload
++
++  def initialize(bot, payload)
++    @bot, @payload = bot, payload
++  end
++
++  def deliver
++    # Suspended bots, and those whose user is banned or deactivated, aren't called. Jobs check this too, but a bot can be
++    # suspended while its job waits in the queue.
++    return unless bot.webhook_active?
++
++    delivered, reply = attempt
++
++    if delivered
++      bot.webhook_delivered
++      post_reply(reply) if reply.present? && bot_in_room?
++    else
++      bot.webhook_failed
++    end
++  rescue ActiveRecord::RecordNotFound
++    # The bot was deleted while its webhook was being called, so there's nothing left to count or post.
++  end
++
++  private
++    def url
++      @url ||= URI.parse(bot.webhook_url)
++    end
++
++    # Returns whether the bot answered with a 2xx, and its reply. A call that gets no response at all is logged, and counts
++    # as not delivered.
++    def attempt
++      fetch_reply
++    rescue *DELIVERY_FAILURES => e
++      Rails.logger.warn "Webhook for bot #{bot.id} produced no reply: #{e.class} #{e.message}"
++      [ false, nil ]
++    end
++
++    # The address is checked and then pinned, so the connection goes to the address that was checked, even if DNS
++    # changes in between. Redirects aren't followed, so a bot can't send us somewhere that wasn't checked.
++    def fetch_reply
++      ip = RestrictedHTTP::PrivateNetworkGuard.resolve(url.host)
++
++      Net::HTTP.start(url.host, url.port, ipaddr: ip, use_ssl: url.scheme == "https",
++          open_timeout: OPEN_TIMEOUT, read_timeout: READ_TIMEOUT, write_timeout: READ_TIMEOUT) do |http|
++        http.request(build_request) do |response|
++          # Returning from inside the block means the body of anything but a 200 is never read.
++          return [ response.is_a?(Net::HTTPSuccess), reply_from(response) ]
++        end
++      end
++    end
++
++    def reply_from(response)
++      return reply_html(response) if response.is_a?(Net::HTTPOK)
++
++      Rails.logger.info "Webhook for bot #{bot.id} answered #{response.code}, so nothing is posted" unless response.is_a?(Net::HTTPNoContent)
++      nil
++    end
++
++    def build_request
++      Net::HTTP::Post.new(url, "Content-Type" => "application/json").tap do |request|
++        request.body = payload.to_json
++      end
++    end
++
++    def reply_html(response)
++      unless REPLY_CONTENT_TYPES.include?(response.content_type&.downcase)
++        Rails.logger.info "Webhook for bot #{bot.id} answered 200 with #{response.content_type.inspect}, so nothing is posted"
++        return
++      end
++
++      text = decode(read_reply(response), response.type_params["charset"])
++
++      if response.content_type.downcase == "text/html"
++        Bot.html_from_html(text)
++      else
++        Bot.html_from_text(text)
++      end
++    rescue ReplyTooLarge
++      Rails.logger.info "Webhook for bot #{bot.id} answered with more than #{MAX_REPLY_SIZE} bytes, so nothing is posted"
++      nil
++    end
++
++    def read_reply(response)
++      body = +""
++
++      response.read_body do |chunk|
++        body << chunk
++        raise ReplyTooLarge if body.bytesize > MAX_REPLY_SIZE
++      end
++
++      body
++    end
++
++    # Falls back to UTF-8 when the reply names no charset, or one Ruby doesn't know. Invalid bytes are replaced.
++    def decode(body, charset)
++      encoding = Encoding.find(charset || "UTF-8") rescue Encoding::UTF_8
++
++      body.force_encoding(encoding).encode(Encoding::UTF_8, invalid: :replace, undef: :replace)
++    end
++
++    # A bot that was removed from the room since the event can't post into it, the same as over the bot API.
++    def bot_in_room?
++      bot.user.rooms.exists?(room.id)
++    end
++
++    # A reply that's refused, for suspension or the limit on messages, is logged and dropped, the same as any other reply
++    # that can't be posted.
++    def post_reply(html)
++      # Only bot messages with visible text are posted. A reply of nothing but markup is left out.
++      return unless ActionText::Content.new(html).to_plain_text.present?
++
++      bot.post_message(room, body: html)
++    rescue Bot::Suspended, Bot::RateLimited => e
++      Rails.logger.info "Webhook for bot #{bot.id} replied, but the reply wasn't posted: #{e.class}"
++    end
++end
+diff --git a/app/models/bot/webhook/joined_payload.rb b/app/models/bot/webhook/joined_payload.rb
+new file mode 100644
+index 0000000..3a90ff4
+--- /dev/null
++++ b/app/models/bot/webhook/joined_payload.rb
+@@ -0,0 +1,22 @@
++# The JSON a bot's webhook receives when the bot is added to a room, whether by a person or automatically. Direct
++# rooms never produce one. Like the mention payload, paths are relative, and reply_to is the bot's own posting URL
++# for the room.
++class Bot::Webhook::JoinedPayload
++  attr_reader :bot, :room
++
++  def initialize(bot, room)
++    @bot, @room = bot, room
++  end
++
++  def as_json(*)
++    {
++      event: "joined",
++      room: { id: room.id, name: room.name, reply_to: routes.bot_messages_path(room_id: room.id, bot_code: bot.code) }
++    }
++  end
++
++  private
++    def routes
++      Rails.application.routes.url_helpers
++    end
++end
+diff --git a/app/models/bot/webhook/payload.rb b/app/models/bot/webhook/payload.rb
+new file mode 100644
+index 0000000..19f0e01
+--- /dev/null
++++ b/app/models/bot/webhook/payload.rb
+@@ -0,0 +1,52 @@
++# The JSON a bot's webhook receives when a message mentions it. Paths are relative: the bot knows its own Campfire
++# origin. The reply_to path is the bot's own posting URL for the room, so a bot can reply later over the bot API.
++class Bot::Webhook::Payload
++  attr_reader :bot, :message
++
++  delegate :room, to: :message
++
++  def initialize(bot, message)
++    @bot, @message = bot, message
++  end
++
++  def as_json(*)
++    {
++      event: "mention",
++      author: { id: message.creator.id, name: message.creator.name },
++      room: { id: room.id, name: room_name, reply_to: routes.bot_messages_path(room_id: room.id, bot_code: bot.code) },
++      message: {
++        id: message.id,
++        body: { text: text, html: html },
++        link: routes.room_at_message_path(room_id: room.id, message_id: message.id)
++      }
++    }
++  end
++
++  private
++    def routes
++      Rails.application.routes.url_helpers
++    end
++
++    # Direct rooms have no name of their own, so they're named after the people in them, other than the bot.
++    def room_name
++      if room.direct?
++        room.users.without(bot.user).pluck(:name).to_sentence.presence
++      else
++        room.name
++      end
++    end
++
++    # The text the bot is being asked, without the bot's own mention: "@Deploy Bot restart it" reads "restart it".
++    # Mentions of other people stay as "@Name".
++    def text
++      content = message.body.body.fragment.replace(ActionText::Attachment.tag_name) do |node|
++        ActionText::Attachable.from_node(node) == bot.user ? nil : node
++      end
++
++      ActionText::Content.new(content, canonicalize: false).to_plain_text.strip
++    end
++
++    def html
++      message.body.to_s
++    end
++end
+diff --git a/app/models/message.rb b/app/models/message.rb
+index 8316d48..0b58d2e 100644
+--- a/app/models/message.rb
++++ b/app/models/message.rb
+@@ -10,6 +10,7 @@ class Message < ApplicationRecord
+ 
+   before_create -> { self.client_message_id ||= Random.uuid }
+   after_create_commit -> { room.receive(self) }
++  after_create_commit :trigger_bot_webhooks_later
+ 
+   scope :ordered, -> { order(:created_at) }
+   scope :with_creator, -> { preload(creator: :avatar_attachment) }
+@@ -41,4 +42,10 @@ class Message < ApplicationRecord
+       Sound.find_by_name match[:name]
+     end
+   end
++
++  private
++    # The webhooks run in a job, so the person posting the message never waits on a bot.
++    def trigger_bot_webhooks_later
++      Bot::WebhookJob.perform_later(self) if may_mention_anyone?
++    end
+ end
+diff --git a/app/models/message/mentionee.rb b/app/models/message/mentionee.rb
+index c109f9c..e23bde7 100644
+--- a/app/models/message/mentionee.rb
++++ b/app/models/message/mentionee.rb
+@@ -5,6 +5,20 @@ module Message::Mentionee
+     room.users.where(id: mentioned_users.map(&:id))
+   end
+ 
++  # Bots mentioned in this message that are in its room, are active, and have a webhook. A bot's own messages mention
++  # nothing for this purpose, since a bot's reply can mention another bot, and that would set off a loop.
++  def mentioned_bots_with_webhooks
++    return Bot.none if creator.bot
++
++    Bot.with_active_webhook.where(user: mentionees)
++  end
++
++  # A check made when the message is created, so it doesn't look anything up: it only says whether the body has any
++  # attachment that could be a mention.
++  def may_mention_anyone?
++    body.body&.fragment&.find_all(ActionText::Attachment.tag_name).present?
++  end
++
+   private
+     def mentioned_users
+       if body.body
+diff --git a/app/models/room.rb b/app/models/room.rb
+index 20865fc..fb5b98c 100644
+--- a/app/models/room.rb
++++ b/app/models/room.rb
+@@ -2,7 +2,11 @@ class Room < ApplicationRecord
+   has_many :memberships, dependent: :delete_all do
+     def grant_to(users)
+       room = proxy_association.owner
+-      Membership.insert_all(Array(users).collect { |user| { room_id: room.id, user_id: user.id, involvement: room.default_involvement } })
++      rows = Array(users).collect { |user| { room_id: room.id, user_id: user.id, involvement: room.default_involvement } }
++
++      # Only the rows that were inserted come back, so a membership that already existed doesn't announce anything.
++      granted = Membership.insert_all(rows, returning: %i[ user_id ])
++      room.notify_bots_joined granted.rows.flatten
+     end
+ 
+     def revoke_from(users)
+@@ -19,6 +23,7 @@ class Room < ApplicationRecord
+ 
+   has_many :users, through: :memberships
+   has_many :messages, dependent: :destroy
++  has_many :bot_joins, class_name: "Bot::JoinedRoom", dependent: :delete_all
+ 
+   belongs_to :creator, class_name: "User", default: -> { Current.user }
+ 
+@@ -66,6 +71,25 @@ class Room < ApplicationRecord
+     "mentions"
+   end
+ 
++  # Tells each bot in user_ids that it has joined this room, through its webhook. A bot is told once per room, so one
++  # that's been told before (and was removed and added back, say) isn't told again. Direct rooms are private
++  # conversations, so bots aren't told about joining them. The record of who's been told is written now, inside the
++  # transaction, but the webhooks are only queued once it commits, so a bot never hears about a grant that's rolled back.
++  def notify_bots_joined(user_ids)
++    return if direct? || user_ids.empty?
++
++    bots = Bot.with_active_webhook.where(user_id: user_ids).to_a
++    return if bots.empty?
++
++    first_joins = Bot::JoinedRoom.insert_all(bots.map { |bot| { bot_id: bot.id, room_id: id } }, returning: %i[ bot_id ])
++    told_bot_ids = first_joins.rows.flatten
++    told_bots = bots.select { |bot| told_bot_ids.include?(bot.id) }
++
++    ActiveRecord.after_all_transactions_commit do
++      told_bots.each { |bot| Bot::JoinedJob.perform_later(bot, self) }
++    end
++  end
++
+   private
+     # Open and closed rooms convert into each other freely. A direct room can't become
+     # either: its participants agreed to a private conversation, not to one whose
+diff --git a/app/models/rooms/open.rb b/app/models/rooms/open.rb
+index 813aaec..7b01480 100644
+--- a/app/models/rooms/open.rb
++++ b/app/models/rooms/open.rb
+@@ -4,6 +4,6 @@ class Rooms::Open < Room
+ 
+   private
+     def grant_access_to_all_users
+-      memberships.grant_to(User.active) if type_previously_changed?(to: "Rooms::Open")
++      memberships.grant_to(User.active.joining_open_rooms) if type_previously_changed?(to: "Rooms::Open")
+     end
+ end
+diff --git a/app/models/user.rb b/app/models/user.rb
+index 4880c63..c08c581 100644
+--- a/app/models/user.rb
++++ b/app/models/user.rb
+@@ -15,6 +15,9 @@ class User < ApplicationRecord
+   has_many :sessions, dependent: :destroy
+   has_many :bans, dependent: :destroy
+ 
++  has_one :bot, dependent: :destroy
++  has_many :bots, foreign_key: :creator_id
++
+   enum :status, %i[ active deactivated banned ], default: :active
+ 
+   has_secure_password validations: false
+@@ -24,6 +27,15 @@ class User < ApplicationRecord
+   scope :ordered, -> { order("LOWER(name)") }
+   scope :filtered_by, ->(query) { where("name like ?", "%#{query}%") }
+ 
++  # People always join open rooms. Bots join them only when they're set to add_to_all_open_rooms.
++  scope :joining_open_rooms, -> { where.not(id: Bot.where(add_to_all_open_rooms: false).select(:user_id)) }
++
++  # Administrators aren't limited. Anyone else can have up to the account's bots per member. Deleting a bot destroys it,
++  # so only bots that still exist count.
++  def can_add_bots?
++    administrator? || bots.count < Current.account.bots_per_member
++  end
++
+   def initials
+     name.scan(/\b\w/).join
+   end
+@@ -40,6 +52,7 @@ class User < ApplicationRecord
+       push_subscriptions.delete_all
+       searches.delete_all
+       sessions.delete_all
++      bot&.destroy!
+ 
+       update! status: :deactivated, email_address: deactived_email_address
+     end
+@@ -50,7 +63,10 @@ class User < ApplicationRecord
+   end
+ 
+   private
++    # A bot's user is skipped. Bots join open rooms only when they're set to, and the bot does that itself (see Bot).
+     def grant_membership_to_open_rooms
++      return if bot
++
+       Membership.insert_all(Rooms::Open.pluck(:id).collect { |room_id| { room_id: room_id, user_id: id } })
+     end
+ 
+diff --git a/app/views/accounts/edit.html.erb b/app/views/accounts/edit.html.erb
+index 98da79d..b50f38f 100644
+--- a/app/views/accounts/edit.html.erb
++++ b/app/views/accounts/edit.html.erb
+@@ -5,14 +5,18 @@
+     <%= link_back_to_last_room_visited %>
+   </div>
+ 
+-  <% if Current.user.administrator? %>
+-    <div class="flex align-center gap flex-item-justify-end">
++  <div class="flex align-center gap flex-item-justify-end">
++    <%= link_to bots_path, class: "btn", style: "view-transition-name: chat-bots", title: "Set up chat bots", aria: { label: "Set up chat bots" } do %>
++      <%= image_tag "bot.svg", size: 20, aria: { hidden: "true" } %>
++    <% end %>
++
++    <% if Current.user.administrator? %>
+       <%= link_to edit_account_custom_styles_path, class: "btn", style: "view-transition-name: custom-styles" do %>
+         <%= image_tag "art.svg", size: 20, aria: { hidden: "true" } %>
+         <span class="for-screen-reader">Custom styles</span>
+       <% end %>
+-    </div>
+-  <% end %>
++    <% end %>
++  </div>
+ <% end %>
+ 
+ <section class="panel txt-align-center flex flex-column gap" style="view-transition-name: account-settings">
+@@ -83,6 +87,18 @@
+ 
+       <% end %>
+     </div>
++    <% if Current.user.administrator? %>
++      <div class="margin-block-start pad-block pad-inline-double fill-shade border-radius">
++        <%= form_with model: @account, method: :patch, data: { controller: "form" }, class: "flex align-center gap center" do |form| %>
++          <label for="account_bots_per_member" class="flex-item-grow flex align-center gap txt-align-start">
++            <%= image_tag "bot.svg", class: "colorize--black", aria: { hidden: "true" }, size: 18 %> Bots per member
++          </label>
++
++          <%= form.number_field :bots_per_member, class: "input txt-align-center", style: "inline-size: 10ch",
++                data: { action: "change->form#submit" } %>
++        <% end %>
++      </div>
++    <% end %>
+   <% else %>
+     <%= account_logo_tag style: "txt-xx-large center" %>
+     <h1 class="flex-item-grow txt-x-large"><%= @account.name %></h1>
+diff --git a/app/views/bots/_bot.html.erb b/app/views/bots/_bot.html.erb
+new file mode 100644
+index 0000000..5f22035
+--- /dev/null
++++ b/app/views/bots/_bot.html.erb
+@@ -0,0 +1,49 @@
++<li class="flex flex-column gap margin-none" id="<%= dom_id(bot) %>">
++  <div class="flex align-center gap">
++    <figure class="avatar flex-item-no-shrink" style="--avatar-size: 3.75ch;">
++      <%= bot_avatar_tag bot, aria: { hidden: "true" }, size: 48, loading: :lazy %>
++    </figure>
++
++    <div class="min-width flex-item-grow">
++      <div class="overflow-ellipsis fill-shade"><strong><%= bot.name %></strong></div>
++      <% if bot.creator != Current.user %>
++        <div class="overflow-ellipsis txt-small txt-subtle">Created by <%= bot.creator.name %></div>
++      <% end %>
++    </div>
++
++    <hr class="separator" aria-hidden="true">
++
++    <%= link_to edit_bot_path(bot), class: "btn txt-small flex-item-no-shrink", title: "Edit #{bot.name}", aria: { label: "Edit #{bot.name}" } do %>
++      <%= image_tag "pencil.svg", aria: { hidden: "true" }, size: 20 %>
++    <% end %>
++  </div>
++
++  <% if bot.suspended? %>
++    <div class="flex align-center gap">
++      <div class="flex-item-grow txt-small">
++        <strong class="txt-negative">Suspended</strong>
++        <span class="txt-subtle"><%= bot_suspension_reason(bot) %></span>
++      </div>
++
++      <% if Current.user.administrator? %>
++        <%= button_to bot_reactivation_path(bot), class: "btn txt-small flex-item-no-shrink",
++              data: { turbo_confirm: "Are you sure you want to reactivate this chat bot? It will be able to post and receive webhooks again." } do %>
++          <%= image_tag "check.svg", aria: { hidden: "true" }, size: 20 %>
++          <span>Reactivate</span>
++        <% end %>
++      <% end %>
++    </div>
++  <% end %>
++
++  <div class="flex align-center gap">
++    <label for="<%= dom_id(bot, :code) %>" class="txt-small flex-item-no-shrink">Bot code</label>
++
++    <input type="text" id="<%= dom_id(bot, :code) %>" class="input input--code flex-item-grow txt-small"
++      value="<%= bot.code %>" readonly autocomplete="off" spellcheck="false">
++
++    <%= button_to_copy_to_clipboard(bot.code) do %>
++      <%= image_tag "copy-paste.svg", aria: { hidden: "true" }, size: 20, class: "colorize--black" %>
++      <span class="for-screen-reader">Copy bot code</span>
++    <% end %>
++  </div>
++</li>
+diff --git a/app/views/bots/_form.html.erb b/app/views/bots/_form.html.erb
+new file mode 100644
+index 0000000..e6012fe
+--- /dev/null
++++ b/app/views/bots/_form.html.erb
+@@ -0,0 +1,53 @@
++<%= form_with model: bot, class: "flex flex-column gap" do |form| %>
++  <div class="align-center center avatar__form gap" data-controller="upload-preview">
++    <label class="btn avatar input--file txt-xx-large">
++      <%= bot_avatar_tag bot, role: "presentation", size: 300, data: { upload_preview_target: "image" } %>
++      <%= form.file_field :avatar, class: "input", accept: "image/*",
++            data: { upload_preview_target: "input", action: "upload-preview#previewImage" } %>
++      <span class="for-screen-reader">Upload avatar</span>
++    </label>
++  </div>
++
++  <div class="flex align-center gap">
++    <label class="flex align-center gap flex-item-grow txt-large input input--actor">
++      <span class="for-screen-reader">Name the bot</span>
++      <%= form.text_field :name, class: "input txt-large", placeholder: "Name the bot", autocomplete: "off",
++            autofocus: true, required: true, data: { "1p-ignore": true } %>
++      <%= image_tag "person.svg", aria: { hidden: "true" }, size: 24, class: "colorize--black" %>
++    </label>
++  </div>
++
++  <div class="flex flex-column gap">
++    <div class="flex align-center gap">
++      <label class="flex align-center gap flex-item-grow txt-large input input--actor">
++        <span class="for-screen-reader">Webhook URL</span>
++        <%= form.url_field :webhook_url, class: "input txt-large", placeholder: "Webhook URL", autocomplete: "off",
++              spellcheck: "false", data: { "1p-ignore": true } %>
++        <%= image_tag "link.svg", aria: { hidden: "true" }, size: 24, class: "colorize--black" %>
++      </label>
++    </div>
++
++    <p class="txt-small txt-subtle margin-none">Optional. Mentions of this bot and room joins are sent to this address as JSON.</p>
++  </div>
++
++  <div class="flex flex-column gap">
++    <label class="flex align-center gap txt-large">
++      <span class="flex-item-grow">Add to all open rooms</span>
++      <span class="switch flex-item-no-shrink">
++        <%= form.check_box :add_to_all_open_rooms, class: "switch__input" %>
++        <span class="switch__btn round"></span>
++      </span>
++    </label>
++
++    <p class="txt-small txt-subtle margin-none">When on, the bot joins every open room, including rooms created later. Otherwise it joins only the rooms it's added to.</p>
++  </div>
++
++  <% if bot.errors.any? %>
++    <p class="txt-negative margin-none"><%= bot.errors.full_messages.to_sentence %></p>
++  <% end %>
++
++  <%= form.button class: "btn btn--reversed center txt-large", type: "submit" do %>
++    <%= image_tag "check.svg", aria: { hidden: "true" }, size: 20 %>
++    <span class="for-screen-reader">Save changes</span>
++  <% end %>
++<% end %>
+diff --git a/app/views/bots/edit.html.erb b/app/views/bots/edit.html.erb
+new file mode 100644
+index 0000000..9f85f0f
+--- /dev/null
++++ b/app/views/bots/edit.html.erb
+@@ -0,0 +1,24 @@
++<% @page_title = "Edit chat bot" %>
++
++<% content_for :head do %>
++  <%# The form shows the webhook URL, which can carry a secret, so keep the page out of Turbo's page cache. %>
++  <%= tag.meta name: "turbo-cache-control", content: "no-cache" %>
++<% end %>
++
++<% content_for :nav do %>
++  <div class="flex-item-justify-start">
++    <%= link_back_to bots_path %>
++  </div>
++<% end %>
++
++<section class="panel txt-align-center" style="view-transition-name: bot-<%= @bot.id %>">
++  <%= render "bots/form", bot: @bot %>
++</section>
++
++<section class="panel txt-align-center">
++  <%= button_to bot_path(@bot), method: :delete, class: "btn btn--negative max-width",
++        data: { turbo_confirm: "Are you sure you want to delete this chat bot? Its code will stop working, and it can’t be undone." } do %>
++    <%= image_tag "trash.svg", aria: { hidden: "true" }, size: 20 %>
++    <span>Delete this chat bot</span>
++  <% end %>
++</section>
+diff --git a/app/views/bots/index.html.erb b/app/views/bots/index.html.erb
+new file mode 100644
+index 0000000..231fd2e
+--- /dev/null
++++ b/app/views/bots/index.html.erb
+@@ -0,0 +1,39 @@
++<% @page_title = "Chat bots" %>
++
++<% content_for :head do %>
++  <%# The page shows bot codes, which are credentials, so keep it out of Turbo's page cache. %>
++  <%= tag.meta name: "turbo-cache-control", content: "no-cache" %>
++<% end %>
++
++<% content_for :nav do %>
++  <div class="flex-item-justify-start">
++    <%= link_back_to_last_room_visited %>
++  </div>
++
++  <% if Current.user.can_add_bots? %>
++    <div class="flex-item-justify-end">
++      <%= link_to new_bot_path, class: "btn" do %>
++        <%= image_tag "add.svg", aria: { hidden: "true" }, size: 20 %>
++        <span>Add a chat bot</span>
++      <% end %>
++    </div>
++  <% end %>
++<% end %>
++
++<section class="panel panel--wide flex flex-column gap">
++  <h1 class="txt-align-center txt-large margin-none">Chat bots</h1>
++
++  <% unless Current.user.can_add_bots? %>
++    <p class="txt-align-center txt-subtle margin-none">You’ve reached the limit of <%= pluralize Current.account.bots_per_member, "chat bot" %>.</p>
++  <% end %>
++
++  <div class="pad-inline fill-shade border-radius" id="bots">
++    <menu class="pad flex flex-column gap">
++      <%= render partial: "bots/bot", collection: @bots %>
++
++      <% if @bots.empty? %>
++        <li class="txt-align-center txt-subtle margin-none">No chat bots yet.</li>
++      <% end %>
++    </menu>
++  </div>
++</section>
+diff --git a/app/views/bots/new.html.erb b/app/views/bots/new.html.erb
+new file mode 100644
+index 0000000..8e6f50e
+--- /dev/null
++++ b/app/views/bots/new.html.erb
+@@ -0,0 +1,11 @@
++<% @page_title = "Add a chat bot" %>
++
++<% content_for :nav do %>
++  <div class="flex-item-justify-start">
++    <%= link_back_to bots_path %>
++  </div>
++<% end %>
++
++<section class="panel txt-align-center" style="view-transition-name: new-bot">
++  <%= render "bots/form", bot: @bot %>
++</section>
+diff --git a/config/initializers/filter_parameter_logging.rb b/config/initializers/filter_parameter_logging.rb
+index bb9432c..10be64a 100644
+--- a/config/initializers/filter_parameter_logging.rb
++++ b/config/initializers/filter_parameter_logging.rb
+@@ -4,5 +4,5 @@
+ # sensitive information. See the ActiveSupport::ParameterFilter documentation for supported
+ # notations and behaviors.
+ Rails.application.config.filter_parameters += [
+-  :passw, :email, :secret, :token, :_key, :crypt, :salt, :certificate, :otp, :ssn, :cvv, :cvc, :endpoint, "message.body"
++  :passw, :email, :secret, :token, :_key, :crypt, :salt, :certificate, :otp, :ssn, :cvv, :cvc, :endpoint, :code, "message.body"
+ ]
+diff --git a/config/initializers/sentry.rb b/config/initializers/sentry.rb
+index 2706bc1..3d5e1d7 100644
+--- a/config/initializers/sentry.rb
++++ b/config/initializers/sentry.rb
+@@ -4,5 +4,11 @@ if Rails.env.production? && ENV["SKIP_TELEMETRY"].blank?
+     config.breadcrumbs_logger = [ :active_support_logger, :http_logger ]
+     config.send_default_pii = false
+     config.release = ENV["GIT_REVISION"]
++
++    # Bot codes are in request URLs, which Sentry reports.
++    config.before_send = ->(event, _hint) do
++      event.request.url = BotCodeFilter.filter(event.request.url) if event.request&.url
++      event
++    end
+   end
+ end
+diff --git a/config/locales/en.yml b/config/locales/en.yml
+index 60999e5..6974cf0 100644
+--- a/config/locales/en.yml
++++ b/config/locales/en.yml
+@@ -30,3 +30,7 @@
+ # available at https://guides.rubyonrails.org/i18n.html.
+ 
+ en:
++  activerecord:
++    attributes:
++      bot:
++        webhook_url: "Webhook URL"
+diff --git a/config/routes.rb b/config/routes.rb
+index 7d4fcac..bed7fa3 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -77,6 +77,17 @@ Rails.application.routes.draw do
+     end
+   end
+ 
++  resources :bots, except: :show do
++    scope module: "bots" do
++      resource :reactivation, only: :create
++    end
++  end
++
++  # Bots authenticate with their code in the path, instead of a session.
++  scope "rooms/:room_id/:bot_code", module: "bots", as: :bot do
++    resources :messages, only: :create
++  end
++
+   resources :searches, only: %i[ index create ] do
+     delete :clear, on: :collection
+   end
+diff --git a/db/migrate/20261123023838_create_bots.rb b/db/migrate/20261123023838_create_bots.rb
+new file mode 100644
+index 0000000..ad40f6a
+--- /dev/null
++++ b/db/migrate/20261123023838_create_bots.rb
+@@ -0,0 +1,12 @@
++class CreateBots < ActiveRecord::Migration[8.1]
++  def change
++    create_table :bots do |t|
++      t.references :user, null: false, foreign_key: true, index: { unique: true }
++      t.references :creator, null: false, foreign_key: { to_table: :users }
++      t.string :code, null: false
++      t.timestamps
++    end
++
++    add_index :bots, :code, unique: true
++  end
++end
+diff --git a/db/migrate/20261123030838_add_webhook_url_to_bots.rb b/db/migrate/20261123030838_add_webhook_url_to_bots.rb
+new file mode 100644
+index 0000000..480b1f2
+--- /dev/null
++++ b/db/migrate/20261123030838_add_webhook_url_to_bots.rb
+@@ -0,0 +1,5 @@
++class AddWebhookUrlToBots < ActiveRecord::Migration[8.1]
++  def change
++    add_column :bots, :webhook_url, :string
++  end
++end
+diff --git a/db/migrate/20261123040000_add_add_to_all_open_rooms_to_bots.rb b/db/migrate/20261123040000_add_add_to_all_open_rooms_to_bots.rb
+new file mode 100644
+index 0000000..6b02c56
+--- /dev/null
++++ b/db/migrate/20261123040000_add_add_to_all_open_rooms_to_bots.rb
+@@ -0,0 +1,5 @@
++class AddAddToAllOpenRoomsToBots < ActiveRecord::Migration[8.1]
++  def change
++    add_column :bots, :add_to_all_open_rooms, :boolean, default: false, null: false
++  end
++end
+diff --git a/db/migrate/20261123050000_create_bot_joined_rooms.rb b/db/migrate/20261123050000_create_bot_joined_rooms.rb
+new file mode 100644
+index 0000000..a4aa18d
+--- /dev/null
++++ b/db/migrate/20261123050000_create_bot_joined_rooms.rb
+@@ -0,0 +1,11 @@
++class CreateBotJoinedRooms < ActiveRecord::Migration[8.1]
++  def change
++    create_table :bot_joined_rooms do |t|
++      t.references :bot, null: false, foreign_key: true, index: false
++      t.references :room, null: false, foreign_key: true
++      t.timestamps
++    end
++
++    add_index :bot_joined_rooms, [ :bot_id, :room_id ], unique: true
++  end
++end
+diff --git a/db/migrate/20261124010000_add_suspension_to_bots.rb b/db/migrate/20261124010000_add_suspension_to_bots.rb
+new file mode 100644
+index 0000000..b7468f6
+--- /dev/null
++++ b/db/migrate/20261124010000_add_suspension_to_bots.rb
+@@ -0,0 +1,6 @@
++class AddSuspensionToBots < ActiveRecord::Migration[8.1]
++  def change
++    add_column :bots, :suspended_at, :datetime
++    add_column :bots, :suspension_reason, :string
++  end
++end
+diff --git a/db/migrate/20261124020000_add_flood_and_webhook_counters_to_bots.rb b/db/migrate/20261124020000_add_flood_and_webhook_counters_to_bots.rb
+new file mode 100644
+index 0000000..77b925e
+--- /dev/null
++++ b/db/migrate/20261124020000_add_flood_and_webhook_counters_to_bots.rb
+@@ -0,0 +1,7 @@
++class AddFloodAndWebhookCountersToBots < ActiveRecord::Migration[8.1]
++  def change
++    add_column :bots, :cooldown_until, :datetime
++    add_column :bots, :cooldown_attempts, :integer, default: 0, null: false
++    add_column :bots, :consecutive_webhook_failures, :integer, default: 0, null: false
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 72c822c..c2166a0 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.1].define(version: 2025_12_12_154340) do
++ActiveRecord::Schema[8.1].define(version: 2026_11_24_020000) do
+   create_table "accounts", force: :cascade do |t|
+     t.datetime "created_at", null: false
+     t.text "custom_styles"
+@@ -79,6 +79,33 @@ ActiveRecord::Schema[8.1].define(version: 2025_12_12_154340) do
+     t.index ["message_id"], name: "index_boosts_on_message_id"
+   end
+ 
++  create_table "bot_joined_rooms", force: :cascade do |t|
++    t.integer "bot_id", null: false
++    t.datetime "created_at", null: false
++    t.integer "room_id", null: false
++    t.datetime "updated_at", null: false
++    t.index ["bot_id", "room_id"], name: "index_bot_joined_rooms_on_bot_id_and_room_id", unique: true
++    t.index ["room_id"], name: "index_bot_joined_rooms_on_room_id"
++  end
++
++  create_table "bots", force: :cascade do |t|
++    t.boolean "add_to_all_open_rooms", default: false, null: false
++    t.string "code", null: false
++    t.integer "consecutive_webhook_failures", default: 0, null: false
++    t.integer "cooldown_attempts", default: 0, null: false
++    t.datetime "cooldown_until"
++    t.datetime "created_at", null: false
++    t.integer "creator_id", null: false
++    t.datetime "suspended_at"
++    t.string "suspension_reason"
++    t.datetime "updated_at", null: false
++    t.integer "user_id", null: false
++    t.string "webhook_url"
++    t.index ["code"], name: "index_bots_on_code", unique: true
++    t.index ["creator_id"], name: "index_bots_on_creator_id"
++    t.index ["user_id"], name: "index_bots_on_user_id", unique: true
++  end
++
+   create_table "memberships", force: :cascade do |t|
+     t.datetime "connected_at"
+     t.integer "connections", default: 0, null: false
+@@ -160,6 +187,10 @@ ActiveRecord::Schema[8.1].define(version: 2025_12_12_154340) do
+   add_foreign_key "active_storage_variant_records", "active_storage_blobs", column: "blob_id"
+   add_foreign_key "bans", "users"
+   add_foreign_key "boosts", "messages"
++  add_foreign_key "bot_joined_rooms", "bots"
++  add_foreign_key "bot_joined_rooms", "rooms"
++  add_foreign_key "bots", "users"
++  add_foreign_key "bots", "users", column: "creator_id"
+   add_foreign_key "messages", "rooms"
+   add_foreign_key "messages", "users", column: "creator_id"
+   add_foreign_key "push_subscriptions", "users"
+diff --git a/docs/bots.md b/docs/bots.md
+new file mode 100644
+index 0000000..4d990c0
+--- /dev/null
++++ b/docs/bots.md
+@@ -0,0 +1,358 @@
++# Chat bots
++
++Bots are chat members that post messages over HTTP. They're aimed at shell scripts and CI jobs:
++a deploy script can announce that it finished, a test run can post its summary.
++
++## Model
++
++- `Bot` (`bots` table) holds the bot's **code**, the credential that authenticates its requests, and its
++  **creator** (the person who set it up).
++- Each bot has its own `User` (`bots.user_id`, one-to-one). That user carries the bot's name and avatar and is what
++  messages, memberships and notifications point at. So a bot is an ordinary member as far as the rest of the app is
++  concerned: it's named and avatared like anyone, shows as the author of its messages, joins open rooms only when it's
++  set to (see [Open rooms](#open-rooms)), can be granted closed rooms like anyone, and triggers push notifications the
++  same way.
++- The bot's user has no email address and a random password nobody knows. Bots never sign in, but the users table
++  requires a password digest.
++- Deleting a bot (`User#deactivate`, which the bot's delete button and the account members list both use) deactivates
++  its user, the same as for people, and destroys the `Bot` row. That removes the code, so the bot can't post, but its
++  past messages stay attributed to it.
++- Bots are listed as members in the account's people list, the room member pickers and direct-message pickers, as
++  people are. Removing a bot from the people list deactivates it, the same as deleting it on `/bots`. Changing a bot's
++  role there has no effect, since bots never sign in.
++- A bot can be suspended for flooding or for failing webhooks. It keeps everything it has, but can't post or get
++  webhooks until an administrator reactivates it (see [Misbehaving bots](#misbehaving-bots)).
++
++Permissions reuse `User#can_administer?(record)`, which already lets a record's creator or an administrator manage it.
++Any member can create bots, up to the account's limit (see [Limits per member](#limits-per-member)). The list shows
++your own bots, or every bot for administrators.
++
++## Web UI
++
++- `/account/edit` has a bot icon link ("Set up chat bots") for every member, not only administrators.
++- `/bots` lists the bots (no pagination). Each item shows the name, the creator (for administrators), an edit link
++  ("Edit <name>"), and a read-only "Bot code" field with a copy button. The page is marked `turbo-cache-control: no-cache`
++  so Turbo doesn't keep codes in its page cache.
++- `/bots/new` and `/bots/:id/edit` share one form: avatar (optional), name ("Name the bot", required), webhook URL
++  (optional, "Webhook URL", see [Webhooks](#webhooks)), the "Add to all open rooms" switch (off by default, see
++  [Open rooms](#open-rooms)), "Save changes".
++  The edit page adds "Delete this chat bot", which asks for confirmation with Turbo's `data-turbo-confirm`
++  (the native `confirm()`).
++- A suspended bot shows "Suspended" and the reason, to everyone who can see it. Administrators also get a "Reactivate"
++  button, which asks for confirmation with the native `confirm()` (see [Reactivation](#reactivation)).
++- Forms that fail validation re-render with status 422.
++- An empty file field doesn't clear the current avatar. The controller drops blank `avatar` params.
++
++## Limits per member
++
++Administrators can cap how many bots each member can have. The **Bots per member** setting is on `/account/edit`, shown
++only to administrators. It's a whole number, zero or more, and starts at 5.
++
++- A member's count is the bots they created, the same list `/bots` shows them. Deleting a bot destroys its `Bot` row
++  (`User#deactivate`), so deleted bots don't count. Bots other people created don't count either.
++- Suspended bots still count, since they still exist (see [Misbehaving bots](#misbehaving-bots)).
++- Administrators aren't limited: `User#can_add_bots?` is always true for them.
++- At the limit, `/bots` leaves out "Add a chat bot" and says "You’ve reached the limit of N chat bots." `/bots/new`
++  and `POST /bots` redirect back to the list and create nothing.
++- The rule is also a validation on `Bot` (on create only), so every other way of creating a bot is refused too. If two
++  creations race past the controller check, the form re-renders with the same message, with status 422.
++- Lowering the limit never removes or changes existing bots. It only blocks new ones. Raising it again lets members add
++  bots once they're under it.
++- Zero is allowed: members can't create any bots, and administrators still can.
++
++Implementation notes:
++
++- The setting lives in the account's `settings` JSON, next to `restrict_room_creation_to_administrators`. The form posts
++  it as `account[bots_per_member]`, and `AccountsController` permits it at the top level so it always goes through its
++  validation. `settings` itself permits only the keys the form uses.
++- The settings cast would turn `"2.5"` into 2 and `"abc"` into 0, so `Account#bots_per_member=` keeps what was typed and
++  the numericality validation checks that. The typed value is dropped on save and on reload, so validation then sees the
++  stored value.
++- The count and the insert happen in one save transaction. SQLite runs write transactions one at a time
++  (`default_transaction_mode: immediate`), so two creations for the same member can't both see room under the limit.
++  Another database could let one race past it. Locking the creator's row would be the fix then.
++
++## Open rooms
++
++People always join open rooms. Bots don't, unless they're set to. The "Add to all open rooms" switch on the bot form
++(off by default) sets that:
++
++- When it's on, the bot is a member of every open room: the ones that exist when the switch is turned on, and every
++  open room created later. Turning a closed room into an open one counts as creating one.
++- Turning the switch off keeps the bot's current memberships. It only stops the bot joining rooms from then on.
++- The switch never gives a bot a closed room. Those are still granted by a person, in the room's member list, the same
++  as for people.
++- Saving a bot that's already in every open room adds nothing, and tells it nothing.
++- When a bot is added to a room, by the switch or by a person, its webhook gets a `joined` event (see
++  [Webhooks](#webhooks)). A bot is told once per room: one that's removed from a room and added back isn't told again.
++  Which rooms a bot has been told about is kept in `bot_joined_rooms`.
++- Direct conversations never produce a `joined` event, even though a bot can be in one.
++- A join that happens while the bot has no webhook isn't announced, and doesn't count as being told. A bot given its
++  webhook later doesn't hear about the rooms it's already in, but it is told the next time it joins one of them while
++  it has a webhook.
++
++## HTTP API
++
++```
++curl -d "Deploy of v1.2.3 finished ✅" \
++  https://chat.example.com/rooms/<room-id>/<bot-code>/messages
++```
++
++Route: `POST /rooms/:room_id/:bot_code/messages` (`bot_messages_path`), handled by `Bots::MessagesController`.
++
++| Situation                                                     | Status                       |
++|---------------------------------------------------------------|------------------------------|
++| Message created                                               | `201 Created`, `Location: /messages/:id` |
++| Unknown, deleted or banned bot code                           | `401 Unauthorized`           |
++| Suspended bot                                                 | `403 Forbidden`              |
++| Cooling down, or the message would go over the limit          | `429 Too Many Requests`, with `Retry-After` in seconds |
++| Room doesn't exist, or the bot isn't a member of it           | `404 Not Found`              |
++| Empty or whitespace-only body and no attachment               | `422 Unprocessable Content`  |
++
++Checks run in that order, so an unknown code gets 401 whatever the room is, and a suspended bot gets 403 whatever the
++room or body is. During a cooldown every attempt gets 429, whatever the room or body is, and each one counts towards
++suspension (see [Misbehaving bots](#misbehaving-bots)). A response never includes the code.
++
++Request bodies:
++
++- **Any content type is taken as plain text.** The raw body is the message, with no JSON envelope and no field names.
++  A body such as `100% done`, `a=b&c=d` or `{not json` is posted as written. Rails doesn't parse it (see below).
++- The text is trimmed, and line breaks (`\r\n` or `\n`) are kept as line breaks.
++- Invalid UTF-8 bytes are replaced with U+FFFD.
++- **Multipart** (`curl -F`) is the one exception: its `attachment` file becomes the message, the way a person's
++  file upload does. A message is either text or a file, as in the web app, so any text in a multipart request is ignored
++  and a multipart request without an attachment is a 422.
++
++Message content: the text is HTML-escaped before it's stored as rich text, so markup in it is shown literally, and
++URLs still autolink like anywhere else. Newlines are stored as `<br>` so they show up in the message.
++
++Once created, the message goes through the same path as a person's: it's broadcast to the room
++(`Message#broadcast_create`), marks the room unread for members, and enqueues `Room::PushMessageJob`.
++
++## Webhooks
++
++A bot can have a **webhook URL** (optional, "Webhook URL" on the bot form; leaving it blank removes the webhook). When a
++message mentions the bot, or the bot is added to a room, Campfire POSTs a JSON description to that URL: a `mention`
++event or a `joined` event. The bot can answer in the HTTP response, or later over the HTTP API.
++
++### When it's called
++
++- A message mentions the bot. The @-mention autocomplete inserts the mention, and that's what triggers the webhook.
++- The bot is active, isn't suspended, has a webhook, and is a member of the room the message was posted to. A bot that
++  has left the room isn't called, and a suspended bot is never called.
++- Messages written by bots never call webhooks. A bot's reply can mention another bot, and that would set off a loop.
++- A message that mentions a bot twice calls it once.
++- Only new messages call webhooks. Editing a message to add a mention doesn't, the same as push notifications.
++- Calls run in `Bot::WebhookJob`, after the message is saved, so the person posting never waits for them. A message
++  deleted before its job runs is dropped.
++- The bot is added to a room, by the open-rooms switch or by a person. Its webhook is called with a `joined` event, once
++  per room (see [Open rooms](#open-rooms)). Direct rooms never produce one. The bot must still be an active member of the
++  room when the call runs, or it isn't called. Calls run in `Bot::JoinedJob`, after the membership is committed.
++
++Each request is a `POST` with `Content-Type: application/json`:
++
++```json
++{
++  "event": "mention",
++  "author": { "id": 7, "name": "Alice" },
++  "room": { "id": 5, "name": "Ops", "reply_to": "/rooms/5/<bot-code>/messages" },
++  "message": {
++    "id": 118,
++    "body": { "text": "restart the build please", "html": "<div class=\"trix-content\">…</div>" },
++    "link": "/rooms/5/@118"
++  }
++}
++```
++
++- `event` is `mention` or `joined`. More event types may come later, so check it.
++- `room.name` is the room's name. Direct rooms have no name, so they're named after the people in them other than the
++  bot.
++- `message.body.text` is the message as plain text, with the bot's own mention removed. Other people's mentions stay as
++  `@Name`. Removing the mention doesn't tidy the whitespace around it, so "hey @Deploy Bot restart" reads "hey  restart".
++- `message.body.html` is the full rich-text body as the app renders it, sanitized. It still includes the bot's mention.
++- `room.reply_to` is the bot's own posting URL for the room. It's the same path as the HTTP API, so the bot can reply
++  later. **It contains the bot's code**, so whoever receives the payload holds the bot's credential.
++- `message.link` opens the room scrolled to the message.
++- Paths are relative. The bot knows its own Campfire origin.
++
++### The joined event
++
++When the bot is added to a room, its webhook gets:
++
++```json
++{
++  "event": "joined",
++  "room": { "id": 5, "name": "Ops", "reply_to": "/rooms/5/<bot-code>/messages" }
++}
++```
++
++- There's no message or author. The room is the one the bot joined, which is never a direct room.
++- `room.name` and `room.reply_to` mean the same as in a mention. `reply_to` contains the bot's code, the same as in a
++  mention.
++
++### Answering
++
++- **`200` with `Content-Type: text/plain`**: the body is posted into the room as the bot's message. It's escaped, and
++  line breaks are kept, the same as text sent over the HTTP API.
++- **`200` with `Content-Type: text/html`**: the body is posted as the bot's rich text. It's cleaned with the filters
++  messages are shown with. Attachments, mentions included, are dropped, so a bot can't ping people.
++- **`204`**: nothing is posted, and nothing is logged.
++- **Any other status, or any other content type on a `200`**: nothing is posted. The response is logged, without the
++  URL or the code.
++- **Empty, or made only of markup**: nothing is posted.
++
++A reply goes into the room the event is about, and only while the bot is still a member of it. A `joined` event can be
++answered the same way as a mention, so a bot can say hello when it joins.
++
++A reply is posted under the same limits as the bot API. It counts towards the message limit, and a reply that's refused
++(during a cooldown, or past the limit) is dropped without an error. See [Misbehaving bots](#misbehaving-bots).
++
++### Delivery rules
++
++- Timeouts: 5 seconds to connect, 10 seconds to write and to read. A bot that needs longer should answer `204` and post
++  later with `reply_to`.
++- The address is checked with `RestrictedHTTP::PrivateNetworkGuard`, the same as link unfurling. `SECURITY.md` treats
++  anything a non-administrator can reach through Campfire as in scope, and a member choosing the URL is exactly that.
++  So loopback, private, link-local and unresolvable addresses are refused.
++- The check happens when a webhook is called, not when the form is saved, since DNS can change. A bot running on
++  `localhost` therefore can't receive webhooks, even in development.
++- The connection goes to the address that was checked, so DNS can't change it in between.
++- Redirects aren't followed.
++- A reply is capped at 1 MB. The body is read in chunks, and an oversized reply is abandoned rather than buffered.
++- Only a `200` reply's body is read. Other responses' bodies aren't.
++- A reply's `charset` is honored. UTF-8 is assumed otherwise. Invalid bytes are replaced.
++- There are no retries. A failed call is logged and dropped. A failed call also counts towards suspending the bot, since
++  ten in a row suspend it (see [Misbehaving bots](#misbehaving-bots)).
++
++### Operating notes
++
++- Webhook jobs (mention and joined) run on the default queue, which push notifications use too. A slow bot holds a worker for up to about 10
++  seconds per call. If that becomes a problem, give webhook jobs their own queue and workers in
++  `config/resque-pool.yml`.
++- Payloads aren't signed, so a receiver can't yet check that a request came from Campfire. Signing (an HMAC over the body
++  with a per-bot secret, say) is the natural next step.
++- The webhook URL is stored as-is, like the code. It's shown only to the bot's creator and to administrators, on the
++  edit page, which is marked `turbo-cache-control: no-cache`. It can carry secrets in its query string, so treat it like
++  the code.
++
++## Misbehaving bots
++
++A bot that floods a room, or whose webhook keeps failing, is suspended automatically. A suspended bot can't post or get
++webhooks, and only an administrator can bring it back.
++
++### Flooding
++
++- A bot may post at most **10 messages in any 10 seconds**. Messages posted through the bot API and webhook replies
++  both count. Only messages that are actually posted count: a refused attempt isn't a message.
++- The window slides. A message counts for 10 seconds from when it was posted, so a bot that posts once a second is never
++  refused.
++- The message that goes over the limit is refused with `429 Too Many Requests` and `Retry-After`, the seconds left, and
++  starts a **30-second cooldown**. A webhook reply that goes over is dropped.
++- During the cooldown, every attempt to post gets 429, whatever the room or body. Webhook replies are dropped. The
++  cooldown doesn't extend, so `Retry-After` counts down to it.
++- **Five attempts during one cooldown suspend the bot.** The fifth attempt still gets 429. From then on the API answers
++  403. The count starts again with each new cooldown.
++
++### Failing webhooks
++
++- A delivery **succeeds on any `2xx`**. Anything else is a failed delivery: another status (a redirect counts, since
++  redirects aren't followed), a timeout, a connection error, or an address that's refused (a private address, or a host
++  that doesn't resolve). A `200` whose reply is too large, or isn't a reply type, is still a success, since the bot
++  answered.
++- A successful delivery resets the count. **Ten failed deliveries in a row suspend the bot.**
++- A delivery that's refused a reply still counts as delivered. Only the delivery itself is counted.
++
++### Suspension
++
++A suspended bot:
++
++- gets `403 Forbidden` from the bot API, before its room or body is checked;
++- gets no webhooks, of either kind, and joins it makes while suspended aren't announced (see
++  [Open rooms](#open-rooms));
++- keeps its rooms, memberships, messages and code, and still counts towards its owner's bot limit;
++- stays on `/bots`, marked "Suspended" with the reason: "Went over its limit of 10 messages in 10 seconds, then kept
++  trying during the 30-second cooldown." or "Its webhook failed 10 times in a row."
++
++The reason is shown to everyone who can see the bot: its creator, and administrators.
++
++### Reactivation
++
++Only administrators can reactivate a suspended bot, from `/bots`, with the "Reactivate" button. Its creator can't. The
++button uses `data-turbo-confirm`, so the browser's native `confirm()` asks first, and cancelling it changes nothing. The
++endpoint is `POST /bots/:bot_id/reactivation` (`Bots::ReactivationsController`).
++
++Reactivating clears the cooldown and both counts, so the bot starts from a clean state. It doesn't clear the message
++window, though. A flooding bot's messages from the last 10 seconds still count, so its next message after reactivation
++may be refused, starting a fresh cooldown. Waiting out the window avoids that. Reactivating a bot that isn't suspended
++does nothing.
++
++### Implementation notes
++
++- State lives on `bots`: `suspended_at` and `suspension_reason` (`Bot::Suspension`), `cooldown_until` and
++  `cooldown_attempts`, and `consecutive_webhook_failures`. The limits are constants in `Bot::Flooding` and
++  `Bot::Suspension`, not settings.
++- Recent messages are counted from the `messages` table, through its `creator_id` index, so there's no second record of
++  posting to keep in step.
++- The window check, the cooldown bookkeeping and the message insert run in one transaction under the bot's row lock
++  (`Bot#post_message`). An API call and a webhook reply can't both see room under the limit. SQLite runs write
++  transactions one at a time anyway. Attachments are processed after the commit, so image work doesn't hold the lock.
++- Refusals are raised after the transaction commits, since raising inside it would roll back the cooldown bookkeeping.
++  The controller turns `Bot::Suspended` into 403 and `Bot::RateLimited` into 429, with `Retry-After`.
++- The cooldown check runs before the room and body are checked (`Bot#refuse_during_cooldown!`, called from
++  `Bots::MessagesController`), so every attempt during a cooldown counts. The webhook path checks inside `post_message`.
++- `Retry-After` is rounded up to whole seconds, so a client that waits that long isn't refused again.
++- Suspended bots are left out of `Bot.with_active_webhook`, which the mention and joined paths both use.
++- A webhook call works on its own copy of the bot. If the bot is deleted while the call is in flight, its counts can't be
++  updated, so the delivery is dropped quietly (`Bot::Webhook#deliver`).
++- Log lines name the bot by id and say why, but never show its code or URL.
++- Tests that travel in time should use whole seconds. `travel_to` drops fractions unless `with_usec: true` is passed.
++
++### Open follow-ups
++
++- Nothing tells the creator that their bot was suspended. Bots don't send notifications yet.
++- Administrators can't see how close a bot is to a limit. A count of recent messages or failures on the bots page would
++  help diagnose a bot before it's suspended.
++
++## Security notes
++
++- **The code is a credential.** It's 24 random base58 characters (`has_secure_token`), unique, and stored as-is,
++  because the list has to show it. Anyone who holds it can post as the bot, so:
++  - It's only shown to the bot's creator and to administrators, on `/bots`. Edit and delete pages don't show it.
++  - It travels in the URL path, which is why it's masked everywhere a path or URL gets recorded:
++    - Request logs: `lib/rails_ext/request_filtered_path.rb` prepends to `ActionDispatch::Request#filtered_path`,
++      and `BotCodeFilter` masks `/rooms/:id/<code>/messages`. Parameter logs mask `code` (`filter_parameter_logging.rb`).
++    - Sentry: `config/initializers/sentry.rb` scrubs the request URL in `before_send`.
++  - Deactivating a user, or banning one, stops its bots from authenticating (`Bot.authenticate` only accepts active users).
++- The endpoint is outside the session and CSRF machinery: `allow_unauthenticated_access`, `skip_forgery_protection`.
++- Rails' parameter parsing is skipped for the body (`Bots::MessagesController#process_action`). Otherwise Rails parses
++  form bodies (`100% done` is an invalid form, so it gets a 400) and JSON bodies (malformed JSON gets a 400). Multipart
++  requests are still parsed, for the attachment.
++- Bot text is HTML-escaped before it's stored, so bots can't inject markup into other people's pages.
++- Webhook payloads carry the code in `room.reply_to`, which is how a bot replies, so a webhook's receiver holds the
++  credential. The webhook's own log lines name the bot by id, never its code or URL. SQL debug logs still show row values
++  (see below).
++- Webhook URLs must be `http` or `https`, and are subject to the same private-address check as link unfurling (see
++  [Webhooks](#webhooks)).
++
++## Known limits and follow-ups
++
++- The code isn't encrypted at rest. The app doesn't configure Active Record encryption keys, and the code has to be
++  shown on the list. Adding encryption would mean adding keys to deployments, and `find_by(code:)` would need
++  deterministic encryption.
++- There's no way to rotate a code yet. Deleting and recreating the bot is the workaround. A "Regenerate code" action
++  is the natural next step.
++- The limits are per bot, and fixed in code. A leaked code can post at the limit (ten messages in ten seconds) until its
++  bot is suspended or deleted.
++- SQL debug logs show the literal values SQLite queries use, including bot codes and session tokens, so don't run
++  production at `RAILS_LOG_LEVEL=debug`.
++- Bot-authored messages don't show a "bot" badge. The author name is the only marker.
++- Neither bot text nor attachments have a size limit, the same as people's messages. A very large body is read
++  into memory in full.
++- There's no `left` event. A bot isn't told when it's removed from a room, so a bot that's removed doesn't know it's
++  no longer in the room until it tries to post there. Like `joined`, it would fit alongside `mention`.
++- System tests need a chromedriver. They didn't run in the sandbox this was built in (it has no network to download
++  one). The UI was checked with controller tests, and by driving a running server in headless Chromium over the DevTools
++  protocol: the form, the composer's autocomplete, posting a mention, and the native `confirm()` on delete. The
++  open-rooms switch was checked the same way, along with a `joined` job running through the async queue adapter after a
++  closed room was created with the bot in it. The suspension flow was checked the same way: a flood over the HTTP API,
++  the bots page's "Suspended" state, and the "Reactivate" confirm, dismissed and then accepted.
+diff --git a/lib/bot_code_filter.rb b/lib/bot_code_filter.rb
+new file mode 100644
+index 0000000..8496363
+--- /dev/null
++++ b/lib/bot_code_filter.rb
+@@ -0,0 +1,10 @@
++# Bot codes are credentials carried in the path of every bot message (POST /rooms/:room_id/:bot_code/messages),
++# so anything that records request paths or URLs has to mask them.
++module BotCodeFilter
++  MASK = "[FILTERED]"
++  PATTERN = %r{(/rooms/[^/?#]+/)[^/?#]+(/messages\b)}
++
++  def self.filter(path_or_url)
++    path_or_url.to_s.gsub(PATTERN, "\\1#{MASK}\\2")
++  end
++end
+diff --git a/lib/rails_ext/request_filtered_path.rb b/lib/rails_ext/request_filtered_path.rb
+new file mode 100644
+index 0000000..c8aef85
+--- /dev/null
++++ b/lib/rails_ext/request_filtered_path.rb
+@@ -0,0 +1,8 @@
++# Rails logs request.filtered_path, which only masks query parameters. Bot codes sit in the path, so mask them here too.
++module BotCodeFilteredPath
++  def filtered_path
++    BotCodeFilter.filter(super)
++  end
++end
++
++ActionDispatch::Request.prepend BotCodeFilteredPath
+diff --git a/test/controllers/accounts_controller_test.rb b/test/controllers/accounts_controller_test.rb
+index 8292c6f..8e5126e 100644
+--- a/test/controllers/accounts_controller_test.rb
++++ b/test/controllers/accounts_controller_test.rb
+@@ -10,6 +10,16 @@ class AccountsControllerTest < ActionDispatch::IntegrationTest
+     assert_response :ok
+   end
+ 
++  test "edit links to chat bots for every member, not only administrators" do
++    sign_in :kevin
++    assert_not users(:kevin).administrator?
++
++    get edit_account_url
++
++    assert_response :ok
++    assert_select "a[href=?][aria-label=?]", bots_path, "Set up chat bots"
++  end
++
+   test "edit groups administrators separately from members with a divider" do
+     get edit_account_url
+ 
+@@ -42,6 +52,68 @@ class AccountsControllerTest < ActionDispatch::IntegrationTest
+     end
+   end
+ 
++  test "edit shows the bots per member setting to administrators, with the current limit" do
++    get edit_account_url
++
++    assert_response :ok
++    assert_select "label[for=?]", "account_bots_per_member", text: "Bots per member"
++    assert_select "input[type=number][name='account[bots_per_member]'][id=?][value='5']", "account_bots_per_member"
++  end
++
++  test "edit doesn't show the bots per member setting to members" do
++    sign_in :kevin
++
++    get edit_account_url
++
++    assert_response :ok
++    assert_select "input[name='account[bots_per_member]']", count: 0
++    assert_select "label", text: "Bots per member", count: 0
++  end
++
++  test "administrators can change the bots per member limit" do
++    put account_url, params: { account: { bots_per_member: "2" } }
++
++    assert_redirected_to edit_account_url
++    assert_equal 2, accounts(:signal).reload.bots_per_member
++  end
++
++  test "administrators can set the bots per member limit to zero" do
++    put account_url, params: { account: { bots_per_member: "0" } }
++
++    assert_redirected_to edit_account_url
++    assert_equal 0, accounts(:signal).reload.bots_per_member
++  end
++
++  test "a refused bots per member limit is explained and the current limit is kept" do
++    put account_url, params: { account: { bots_per_member: "-1" } }
++
++    assert_redirected_to edit_account_url
++    assert_equal "Bots per member must be greater than or equal to 0", flash[:alert]
++    assert_equal 5, accounts(:signal).reload.bots_per_member
++  end
++
++  test "a bots per member limit that isn't a whole number is refused" do
++    put account_url, params: { account: { bots_per_member: "2.5" } }
++
++    assert_redirected_to edit_account_url
++    assert_equal 5, accounts(:signal).reload.bots_per_member
++  end
++
++  test "members can't change the bots per member limit" do
++    sign_in :kevin
++
++    put account_url, params: { account: { bots_per_member: "100" } }
++
++    assert_response :forbidden
++    assert_equal 5, accounts(:signal).reload.bots_per_member
++  end
++
++  test "the bots per member limit can't be set through the settings hash" do
++    put account_url, params: { account: { settings: { bots_per_member: "abc" } } }
++
++    assert_equal 5, accounts(:signal).reload.bots_per_member
++  end
++
+   test "update" do
+     assert users(:david).administrator?
+ 
+diff --git a/test/controllers/autocompletable/users_controller_test.rb b/test/controllers/autocompletable/users_controller_test.rb
+index dbd1315..a0cb9eb 100644
+--- a/test/controllers/autocompletable/users_controller_test.rb
++++ b/test/controllers/autocompletable/users_controller_test.rb
+@@ -37,4 +37,26 @@ class Autocompletable::UsersControllerTest < ActionDispatch::IntegrationTest
+       get autocompletable_users_url(room_id: rooms(:watercooler).id, format: :json), params: { query: "da" }
+     end
+   end
++
++  test "bots appear in the mention autocomplete, like people do" do
++    bot = create_bot(name: "Deploy Bot", add_to_all_open_rooms: true)
++
++    get autocompletable_users_url(room_id: rooms(:hq).id, format: :json), params: { query: "deploy" }
++
++    assert_response :success
++    assert_equal [ bot.user.id ], response.parsed_body.map { |user| user["value"] }
++  end
++
++  test "bots in closed rooms are offered only to that room's members" do
++    bot = create_bot(name: "Deploy Bot")
++    rooms(:designers).users << bot.user
++
++    get autocompletable_users_url(room_id: rooms(:designers).id, format: :json), params: { query: "deploy" }
++
++    assert_equal [ bot.user.id ], response.parsed_body.map { |user| user["value"] }
++
++    get autocompletable_users_url(room_id: rooms(:watercooler).id, format: :json), params: { query: "deploy" }
++
++    assert_empty response.parsed_body
++  end
+ end
+diff --git a/test/controllers/bots/messages_controller_test.rb b/test/controllers/bots/messages_controller_test.rb
+new file mode 100644
+index 0000000..1761e8e
+--- /dev/null
++++ b/test/controllers/bots/messages_controller_test.rb
+@@ -0,0 +1,352 @@
++require "test_helper"
++
++class Bots::MessagesControllerTest < ActionDispatch::IntegrationTest
++  setup do
++    host! "once.campfire.test"
++
++    @bot = create_bot(add_to_all_open_rooms: true)
++    @room = rooms(:hq) # An open room, which the bot is a member of
++  end
++
++  test "the raw body becomes the message body, authored by the bot" do
++    assert_difference -> { @room.messages.count }, +1 do
++      post_raw "Deploy of v1.2.3 finished ✅"
++    end
++
++    assert_response :created
++    message = @room.messages.last
++    assert_equal "Deploy of v1.2.3 finished ✅", message.plain_text_body
++    assert_equal @bot.user, message.creator
++  end
++
++  test "created responds with a location for the message" do
++    post_raw "Deploy of v1.2.3 finished ✅"
++
++    assert_equal "/messages/#{@room.messages.last.id}", response.headers["Location"]
++  end
++
++  test "form-encoded bodies are taken literally rather than parsed as parameters" do
++    post_raw "100% done & checked=yes", content_type: "application/x-www-form-urlencoded"
++
++    assert_response :created
++    assert_equal "100% done & checked=yes", @room.messages.last.plain_text_body
++  end
++
++  test "JSON-looking bodies are taken literally too" do
++    post_raw "{not json", content_type: "application/json"
++
++    assert_response :created
++    assert_equal "{not json", @room.messages.last.plain_text_body
++  end
++
++  test "markup in the body is shown as written" do
++    post_raw "<b>bold</b> & <script>alert(1)</script>"
++
++    assert_response :created
++    message = @room.messages.last
++    assert_equal "<b>bold</b> & <script>alert(1)</script>", message.plain_text_body
++    assert_no_match %r{<b>|<script>}, message.body.body.to_html
++  end
++
++  test "line breaks are kept and surrounding whitespace is trimmed" do
++    post_raw "\n  first line\r\nsecond line\n\n"
++
++    assert_response :created
++    assert_equal "first line\nsecond line", @room.messages.last.plain_text_body
++  end
++
++  test "the response doesn't echo the bot code" do
++    post_raw "Hello"
++
++    assert_no_match @bot.code, response.body
++    assert_no_match @bot.code, response.headers.to_h.to_s
++  end
++
++  test "an invalid bot code is unauthorized and posts nothing" do
++    assert_no_difference -> { Message.count } do
++      post_raw "Hello", bot_code: "not-a-real-code"
++    end
++
++    assert_response :unauthorized
++  end
++
++  test "a deleted bot can no longer post" do
++    code = @bot.code
++    @bot.user.deactivate
++
++    assert_no_difference -> { Message.count } do
++      post_raw "Hello", bot_code: code
++    end
++
++    assert_response :unauthorized
++  end
++
++  test "a banned bot can no longer post" do
++    @bot.user.banned!
++
++    assert_no_difference -> { Message.count } do
++      post_raw "Hello"
++    end
++
++    assert_response :unauthorized
++  end
++
++  test "an unknown room is not found" do
++    assert_no_difference -> { Message.count } do
++      post_raw "Hello", room_id: 0
++    end
++
++    assert_response :not_found
++  end
++
++  test "a room the bot isn't a member of is not found" do
++    designers = rooms(:designers)
++    assert_not @bot.user.rooms.include?(designers)
++
++    assert_no_difference -> { Message.count } do
++      post_raw "Hello", room_id: designers.id
++    end
++
++    assert_response :not_found
++  end
++
++  test "posting needs no CSRF token, as bots aren't browsers" do
++    original = ActionController::Base.allow_forgery_protection
++    ActionController::Base.allow_forgery_protection = true
++
++    post_raw "Hello"
++
++    assert_response :created
++  ensure
++    ActionController::Base.allow_forgery_protection = original
++  end
++
++  test "a bot given access to a closed room can post there" do
++    designers = rooms(:designers)
++    designers.memberships.grant_to @bot.user
++
++    post_raw "Hello designers", room_id: designers.id
++
++    assert_response :created
++    assert_equal designers, Message.last.room
++  end
++
++  test "an empty body with no attachment is unprocessable" do
++    assert_no_difference -> { Message.count } do
++      post_raw ""
++    end
++
++    assert_response :unprocessable_content
++  end
++
++  test "a whitespace-only body with no attachment is unprocessable" do
++    assert_no_difference -> { Message.count } do
++      post_raw " \n\t "
++    end
++
++    assert_response :unprocessable_content
++  end
++
++  test "a multipart attachment is posted as the message's attachment" do
++    assert_difference -> { @room.messages.count }, +1 do
++      post bot_messages_url(room_id: @room.id, bot_code: @bot.code),
++        params: { attachment: fixture_file_upload("earth.png", "image/png") }
++    end
++
++    assert_response :created
++    message = @room.messages.last
++    assert message.attachment?
++    assert_equal @bot.user, message.creator
++  end
++
++  test "a multipart request's text is ignored, since a message is either text or a file" do
++    post bot_messages_url(room_id: @room.id, bot_code: @bot.code),
++      params: { attachment: fixture_file_upload("earth.png", "image/png"), body: "Screenshot from CI" }
++
++    assert_response :created
++    message = @room.messages.last
++    assert message.attachment?
++    assert_not message.body.present?
++    assert_equal "earth.png", message.plain_text_body
++  end
++
++  test "a multipart request without attachment or body is unprocessable" do
++    boundary = "CampfireBotBoundary"
++    multipart_body = "--#{boundary}\r\nContent-Disposition: form-data; name=\"body\"\r\n\r\n\r\n--#{boundary}--\r\n"
++
++    assert_no_difference -> { Message.count } do
++      post bot_messages_url(room_id: @room.id, bot_code: @bot.code), params: multipart_body,
++        headers: { "CONTENT_TYPE" => "multipart/form-data; boundary=#{boundary}" }
++    end
++
++    assert_response :unprocessable_content
++  end
++
++  test "posting broadcasts the message to the room, showing the bot as its author" do
++    post_raw "Deploy of v1.2.3 finished ✅"
++
++    assert_rendered_turbo_stream_broadcast @room, :messages, action: "append", target: [ @room, :messages ] do
++      assert_select ".message__author strong", text: @bot.name
++      assert_select ".message__body", text: /Deploy of v1.2.3 finished/
++    end
++  end
++
++  test "posting broadcasts unread rooms to each member of the room" do
++    @room.users.each do |member|
++      assert_broadcasts UnreadRoomsChannel.stream_name_for(member.id), 1 do
++        post_raw "Hello #{member.id}"
++      end
++    end
++  end
++
++  test "posting enqueues push notifications for the room, as a human message would" do
++    assert_enqueued_with job: Room::PushMessageJob do
++      post_raw "Deploy of v1.2.3 finished ✅"
++    end
++  end
++
++  test "the eleventh message in ten seconds is too many requests, with the cooldown as Retry-After" do
++    10.times { |i| post_raw "Message #{i}" }
++
++    assert_no_difference -> { Message.count } do
++      post_raw "Message 10"
++    end
++
++    assert_response :too_many_requests
++    assert_equal "30", response.headers["Retry-After"]
++  end
++
++  test "during the cooldown, the posting endpoint keeps answering too many requests, with the seconds left" do
++    travel_to Time.current do
++      10.times { |i| post_raw "Message #{i}" }
++      post_raw "Message 10"
++
++      travel 12.seconds
++      post_raw "Message 11"
++
++      assert_response :too_many_requests
++      assert_equal "18", response.headers["Retry-After"]
++      assert_no_match @bot.code, response.headers.to_h.to_s
++    end
++  end
++
++  test "the bot can post again once the cooldown has passed" do
++    travel_to Time.current do
++      10.times { |i| post_raw "Message #{i}" }
++      post_raw "Message 10"
++
++      travel 30.seconds
++      post_raw "Message 11"
++    end
++
++    assert_response :created
++  end
++
++  test "five attempts during one cooldown suspend the bot, which then gets forbidden" do
++    10.times { |i| post_raw "Message #{i}" }
++    post_raw "Message 10" # Starts the cooldown
++
++    5.times { post_raw "Still trying" }
++
++    assert_response :too_many_requests
++    assert_predicate @bot.reload, :flooding?
++
++    assert_no_difference -> { Message.count } do
++      post_raw "Message after suspension"
++    end
++    assert_response :forbidden
++  end
++
++  test "during a cooldown, every attempt is too many requests, even an unknown room or an empty body" do
++    10.times { |i| post_raw "Message #{i}" }
++    post_raw "Message 10" # Starts the cooldown
++
++    post_raw "Hello", room_id: 0
++    assert_response :too_many_requests
++
++    post_raw ""
++    assert_response :too_many_requests
++  end
++
++  test "attempts during a cooldown count towards suspension, even ones that would be unprocessable" do
++    10.times { |i| post_raw "Message #{i}" }
++    post_raw "Message 10" # Starts the cooldown
++
++    5.times { post_raw "", room_id: 0 }
++
++    assert_predicate @bot.reload, :flooding?
++  end
++
++  test "outside a cooldown, an unknown room is still not found and an empty body still unprocessable" do
++    post_raw "Hello", room_id: 0
++    assert_response :not_found
++
++    post_raw ""
++    assert_response :unprocessable_content
++  end
++
++  test "a suspended bot gets forbidden, and posts nothing" do
++    @bot.suspend!(:failing_webhook)
++
++    assert_no_difference -> { Message.count } do
++      post_raw "Hello"
++    end
++
++    assert_response :forbidden
++  end
++
++  test "a suspended bot is forbidden before its room or content are checked" do
++    @bot.suspend!(:failing_webhook)
++
++    post_raw "", room_id: 0
++
++    assert_response :forbidden
++  end
++
++  test "a suspended bot is forbidden, not unauthorized, even though its code is valid" do
++    @bot.suspend!(:flooding)
++
++    post_raw "Hello"
++
++    assert_response :forbidden
++  end
++
++  test "a suspended bot is forbidden even once it has left its rooms" do
++    @bot.suspend!(:flooding)
++    @bot.user.memberships.delete_all
++
++    post_raw "Hello"
++
++    assert_response :forbidden
++  end
++
++  test "a multipart attachment counts towards the limit" do
++    10.times { |i| post_raw "Message #{i}" }
++
++    assert_no_difference -> { Message.count } do
++      post bot_messages_url(room_id: @room.id, bot_code: @bot.code),
++        params: { attachment: fixture_file_upload("earth.png", "image/png") }
++    end
++
++    assert_response :too_many_requests
++  end
++
++  test "a multipart attachment is posted once the bot is under the limit again" do
++    travel_to Time.current do
++      10.times { |i| post_raw "Message #{i}" }
++      post_raw "Message 10"
++
++      travel 30.seconds
++      post bot_messages_url(room_id: @room.id, bot_code: @bot.code),
++        params: { attachment: fixture_file_upload("earth.png", "image/png") }
++    end
++
++    assert_response :created
++    assert @room.messages.last.attachment?
++  end
++
++  private
++    def post_raw(body, room_id: @room.id, bot_code: @bot.code, content_type: "text/plain")
++      post bot_messages_url(room_id: room_id, bot_code: bot_code), params: body, headers: { "CONTENT_TYPE" => content_type }
++    end
++end
+diff --git a/test/controllers/bots/reactivations_controller_test.rb b/test/controllers/bots/reactivations_controller_test.rb
+new file mode 100644
+index 0000000..0279d87
+--- /dev/null
++++ b/test/controllers/bots/reactivations_controller_test.rb
+@@ -0,0 +1,62 @@
++require "test_helper"
++
++class Bots::ReactivationsControllerTest < ActionDispatch::IntegrationTest
++  setup do
++    @bot = create_bot(name: "Deploy Bot", creator: users(:kevin), add_to_all_open_rooms: true)
++    @bot.suspend!(:failing_webhook)
++  end
++
++  test "an administrator reactivates a suspended bot, and returns to the list" do
++    sign_in :david
++
++    post bot_reactivation_url(@bot)
++
++    assert_redirected_to bots_url
++    assert_not @bot.reload.suspended?
++  end
++
++  test "an administrator can reactivate a bot someone else created" do
++    sign_in :david
++    other = create_bot(name: "Release Bot", creator: users(:jz))
++    other.suspend!(:flooding)
++
++    post bot_reactivation_url(other)
++
++    assert_not other.reload.suspended?
++  end
++
++  test "a reactivated bot can post again" do
++    sign_in :david
++    post bot_reactivation_url(@bot)
++
++    post bot_messages_url(room_id: rooms(:hq).id, bot_code: @bot.code), params: "Back online", headers: { "CONTENT_TYPE" => "text/plain" }
++
++    assert_response :created
++  end
++
++  test "the bot's creator can't reactivate it, since only administrators can" do
++    sign_in :kevin
++
++    post bot_reactivation_url(@bot)
++
++    assert_response :forbidden
++    assert_predicate @bot.reload, :suspended?
++  end
++
++  test "other members can't reactivate bots either" do
++    sign_in :jz
++
++    post bot_reactivation_url(@bot)
++
++    assert_response :forbidden
++    assert_predicate @bot.reload, :suspended?
++  end
++
++  test "reactivating a bot that doesn't exist is not found" do
++    sign_in :david
++
++    assert_raises ActiveRecord::RecordNotFound do
++      post bot_reactivation_url(bot_id: 0)
++    end
++  end
++end
+diff --git a/test/controllers/bots_controller_test.rb b/test/controllers/bots_controller_test.rb
+new file mode 100644
+index 0000000..340c6f8
+--- /dev/null
++++ b/test/controllers/bots_controller_test.rb
+@@ -0,0 +1,547 @@
++require "test_helper"
++
++class BotsControllerTest < ActionDispatch::IntegrationTest
++  setup do
++    sign_in :kevin
++  end
++
++  test "index lists the bots you created, with their codes in read-only fields" do
++    bot = create_bot(name: "Deploy Bot", creator: users(:kevin))
++
++    get bots_url
++
++    assert_response :success
++    assert_select "li#bot_#{bot.id}" do
++      assert_select "strong", text: "Deploy Bot"
++      assert_select "label[for=?]", dom_id(bot, :code), text: "Bot code"
++      assert_select "input##{dom_id(bot, :code)}[readonly][value=?]", bot.code
++    end
++  end
++
++  test "index doesn't list bots created by other people" do
++    other_bot = create_bot(name: "Someone Else's Bot", creator: users(:david))
++
++    get bots_url
++
++    assert_select "li#bot_#{other_bot.id}", count: 0
++    assert_no_match other_bot.code, response.body
++  end
++
++  test "index lists every bot for administrators" do
++    sign_in :david
++    other_bot = create_bot(name: "Kevin's Bot", creator: users(:kevin))
++
++    get bots_url
++
++    assert_select "li#bot_#{other_bot.id}" do
++      assert_select "input[value=?]", other_bot.code
++    end
++  end
++
++  test "index has no pagination" do
++    accounts(:signal).update!(bots_per_member: 12)
++    12.times { |i| create_bot(name: "Bot #{i}", creator: users(:kevin)) }
++
++    get bots_url
++
++    assert_select "li", count: 12
++    assert_select "a[href*=page]", count: 0
++  end
++
++  test "new renders the form" do
++    get new_bot_url
++
++    assert_response :success
++    assert_select "form[action=?]", bots_path do
++      assert_select "input[name='bot[name]'][required][placeholder='Name the bot']"
++      assert_select "input[type=file][name='bot[avatar]']"
++      assert_select "button[type=submit]", text: /Save changes/
++    end
++  end
++
++  test "create makes a bot created by the current user and returns to the list" do
++    assert_difference -> { Bot.count }, +1 do
++      assert_difference -> { User.count }, +1 do
++        post bots_url, params: { bot: { name: "Deploy Bot" } }
++      end
++    end
++
++    assert_redirected_to bots_url
++    bot = Bot.last
++    assert_equal "Deploy Bot", bot.name
++    assert_equal users(:kevin), bot.creator
++    assert_predicate bot.code, :present?
++  end
++
++  test "create doesn't make the bot a member of any open room unless the switch is on" do
++    post bots_url, params: { bot: { name: "Deploy Bot" } }
++
++    assert_empty Bot.last.user.memberships
++  end
++
++  test "create with the switch on makes the bot a member of every open room" do
++    post bots_url, params: { bot: { name: "Deploy Bot", add_to_all_open_rooms: "1" } }
++
++    assert_predicate Bot.last, :add_to_all_open_rooms?
++    assert_equal Rooms::Open.pluck(:id).sort, Bot.last.user.memberships.pluck(:room_id).sort
++  end
++
++  test "create with an avatar sets the bot's avatar" do
++    post bots_url, params: { bot: { name: "Deploy Bot", avatar: fixture_file_upload("earth.png", "image/png") } }
++
++    assert Bot.last.user.avatar.attached?
++  end
++
++  test "create without a name re-renders the form as unprocessable" do
++    assert_no_difference -> { Bot.count } do
++      post bots_url, params: { bot: { name: "" } }
++    end
++
++    assert_response :unprocessable_content
++    assert_select "p", text: /Name can't be blank/
++  end
++
++  test "index offers adding a bot while the member is under the limit" do
++    accounts(:signal).update!(bots_per_member: 2)
++    create_bot(name: "Deploy Bot", creator: users(:kevin))
++
++    get bots_url
++
++    assert_select "a[href=?]", new_bot_path, text: "Add a chat bot"
++    assert_no_match "reached the limit", response.body
++  end
++
++  test "index hides adding a bot and says the limit is reached when the member is at the limit" do
++    accounts(:signal).update!(bots_per_member: 1)
++    create_bot(name: "Deploy Bot", creator: users(:kevin))
++
++    get bots_url
++
++    assert_response :success
++    assert_select "a[href=?]", new_bot_path, count: 0
++    assert_no_match "Add a chat bot", response.body
++    assert_select "p", text: "You’ve reached the limit of 1 chat bot."
++    assert_select "li[id^=bot_]", count: 1
++  end
++
++  test "index says the limit is reached with no bots when the limit is zero" do
++    accounts(:signal).update!(bots_per_member: 0)
++
++    get bots_url
++
++    assert_select "a[href=?]", new_bot_path, count: 0
++    assert_select "p", text: "You’ve reached the limit of 0 chat bots."
++  end
++
++  test "index still offers adding a bot to administrators past the limit" do
++    accounts(:signal).update!(bots_per_member: 0)
++    sign_in :david
++
++    get bots_url
++
++    assert_select "a[href=?]", new_bot_path, text: "Add a chat bot"
++    assert_no_match "reached the limit", response.body
++  end
++
++  test "new sends a member at the limit back to the list" do
++    accounts(:signal).update!(bots_per_member: 1)
++    create_bot(name: "Deploy Bot", creator: users(:kevin))
++
++    get new_bot_url
++
++    assert_redirected_to bots_url
++  end
++
++  test "new renders for a member under the limit" do
++    accounts(:signal).update!(bots_per_member: 1)
++
++    get new_bot_url
++
++    assert_response :success
++  end
++
++  test "create at the limit is refused and makes nothing" do
++    accounts(:signal).update!(bots_per_member: 1)
++    create_bot(name: "Deploy Bot", creator: users(:kevin))
++
++    assert_no_difference -> { Bot.count } do
++      assert_no_difference -> { User.count } do
++        post bots_url, params: { bot: { name: "Second Bot" } }
++      end
++    end
++
++    assert_redirected_to bots_url
++  end
++
++  test "create under the limit makes the bot" do
++    accounts(:signal).update!(bots_per_member: 2)
++    create_bot(name: "Deploy Bot", creator: users(:kevin))
++
++    assert_difference -> { Bot.count }, +1 do
++      post bots_url, params: { bot: { name: "Second Bot" } }
++    end
++
++    assert_redirected_to bots_url
++  end
++
++  test "the limit only counts the member's own bots" do
++    accounts(:signal).update!(bots_per_member: 1)
++    create_bot(name: "David's Bot", creator: users(:david))
++
++    post bots_url, params: { bot: { name: "Kevin's Bot" } }
++
++    assert_redirected_to bots_url
++    assert_equal users(:kevin), Bot.last.creator
++  end
++
++  test "administrators aren't limited when creating bots" do
++    accounts(:signal).update!(bots_per_member: 0)
++    sign_in :david
++
++    get new_bot_url
++    assert_response :success
++
++    assert_difference -> { Bot.count }, +1 do
++      post bots_url, params: { bot: { name: "Admin's Bot" } }
++    end
++  end
++
++  test "lowering the limit keeps existing bots and only blocks new ones" do
++    3.times { |i| create_bot(name: "Bot #{i}", creator: users(:kevin)) }
++    accounts(:signal).update!(bots_per_member: 1)
++
++    get bots_url
++
++    assert_select "li[id^=bot_]", count: 3
++    assert_select "a[href=?]", new_bot_path, count: 0
++
++    assert_no_difference -> { Bot.count } do
++      post bots_url, params: { bot: { name: "Fourth Bot" } }
++    end
++  end
++
++  test "deleting a bot at the limit frees a place to add one" do
++    accounts(:signal).update!(bots_per_member: 1)
++    bot = create_bot(name: "Deploy Bot", creator: users(:kevin))
++
++    delete bot_url(bot)
++    get bots_url
++
++    assert_select "a[href=?]", new_bot_path, text: "Add a chat bot"
++    assert_no_match "reached the limit", response.body
++  end
++
++  test "a member at the limit can still edit and delete the bots they have" do
++    accounts(:signal).update!(bots_per_member: 1)
++    bot = create_bot(name: "Deploy Bot", creator: users(:kevin))
++
++    get edit_bot_url(bot)
++    assert_response :success
++
++    patch bot_url(bot), params: { bot: { name: "Release Bot" } }
++    assert_equal "Release Bot", bot.reload.name
++
++    assert_difference -> { Bot.count }, -1 do
++      delete bot_url(bot)
++    end
++  end
++
++  test "any member can create a bot" do
++    sign_in :jz
++    assert_not users(:jz).administrator?
++
++    post bots_url, params: { bot: { name: "JZ's Bot" } }
++
++    assert_equal users(:jz), Bot.last.creator
++  end
++
++  test "edit renders the form with the same fields and a delete button that asks for confirmation" do
++    bot = create_bot(name: "Deploy Bot", creator: users(:kevin))
++
++    get edit_bot_url(bot)
++
++    assert_response :success
++    assert_select "input[name='bot[name]'][value=?]", "Deploy Bot"
++    assert_select "input[type=file][name='bot[avatar]']"
++    assert_select "button[data-turbo-confirm]", text: "Delete this chat bot"
++    assert_select "input[value=?]", bot.code, count: 0
++  end
++
++  test "update changes the bot's name" do
++    bot = create_bot(name: "Deploy Bot", creator: users(:kevin))
++
++    patch bot_url(bot), params: { bot: { name: "Release Bot" } }
++
++    assert_redirected_to bots_url
++    assert_equal "Release Bot", bot.reload.name
++    assert_equal "Release Bot", bot.user.reload.name
++  end
++
++  test "update with no new avatar keeps the current avatar" do
++    bot = create_bot(name: "Deploy Bot", creator: users(:kevin), avatar: fixture_file_upload("earth.png", "image/png"))
++
++    patch bot_url(bot), params: { bot: { name: "Release Bot", avatar: "" } }
++
++    assert_redirected_to bots_url
++    assert bot.reload.user.avatar.attached?
++  end
++
++  test "update with a new avatar replaces it" do
++    bot = create_bot(name: "Deploy Bot", creator: users(:kevin))
++
++    patch bot_url(bot), params: { bot: { avatar: fixture_file_upload("moon.jpg", "image/jpeg") } }
++
++    assert_redirected_to bots_url
++    assert_equal "moon.jpg", bot.reload.user.avatar.filename.to_s
++  end
++
++  test "update with a blank name re-renders the form as unprocessable" do
++    bot = create_bot(name: "Deploy Bot", creator: users(:kevin))
++
++    patch bot_url(bot), params: { bot: { name: "" } }
++
++    assert_response :unprocessable_content
++    assert_equal "Deploy Bot", bot.reload.name
++  end
++
++  test "a bot's creator can update it" do
++    bot = create_bot(name: "Deploy Bot", creator: users(:kevin))
++
++    patch bot_url(bot), params: { bot: { name: "Release Bot" } }
++
++    assert_equal "Release Bot", bot.reload.name
++  end
++
++  test "non-administrators can't edit or delete bots created by someone else" do
++    bot = create_bot(name: "David's Bot", creator: users(:david))
++
++    get edit_bot_url(bot)
++    assert_response :forbidden
++
++    patch bot_url(bot), params: { bot: { name: "Hijacked" } }
++    assert_response :forbidden
++    assert_equal "David's Bot", bot.reload.name
++
++    assert_no_difference -> { Bot.count } do
++      delete bot_url(bot)
++    end
++    assert_response :forbidden
++  end
++
++  test "administrators can edit and delete any bot" do
++    sign_in :david
++    bot = create_bot(name: "Kevin's Bot", creator: users(:kevin))
++
++    patch bot_url(bot), params: { bot: { name: "Renamed" } }
++    assert_equal "Renamed", bot.reload.name
++
++    assert_difference -> { Bot.count }, -1 do
++      delete bot_url(bot)
++    end
++  end
++
++  test "destroy deactivates the bot's user and removes its code, leaving the list" do
++    bot = create_bot(name: "Deploy Bot", creator: users(:kevin))
++    user = bot.user
++    code = bot.code
++
++    assert_difference -> { Bot.count }, -1 do
++      delete bot_url(bot)
++    end
++
++    assert_redirected_to bots_url
++    assert user.reload.deactivated?
++    assert_nil Bot.find_by(code: code)
++    assert_empty user.memberships
++  end
++
++  test "bots aren't shown on the list after they're deleted" do
++    bot = create_bot(name: "Deploy Bot", creator: users(:kevin))
++    delete bot_url(bot)
++
++    get bots_url
++
++    assert_select "li#bot_#{bot.id}", count: 0
++  end
++
++  test "a suspended bot stays listed, marked Suspended with the reason" do
++    bot = create_bot(name: "Deploy Bot", creator: users(:kevin))
++    bot.suspend!(:failing_webhook)
++
++    get bots_url
++
++    assert_select "li#bot_#{bot.id}" do
++      assert_select "strong", text: "Suspended"
++      assert_select "span", text: /Its webhook failed 10 times in a row\./
++    end
++  end
++
++  test "a bot suspended for flooding says so, with the limit it went over" do
++    bot = create_bot(name: "Deploy Bot", creator: users(:kevin))
++    bot.suspend!(:flooding)
++
++    get bots_url
++
++    assert_select "li#bot_#{bot.id}" do
++      assert_select "strong", text: "Suspended"
++      assert_select "span", text: /Went over its limit of 10 messages in 10 seconds/
++    end
++  end
++
++  test "bots that aren't suspended aren't marked as suspended" do
++    create_bot(name: "Deploy Bot", creator: users(:kevin))
++
++    get bots_url
++
++    assert_select "strong", text: "Suspended", count: 0
++    assert_select "button", text: "Reactivate", count: 0
++  end
++
++  test "administrators get a Reactivate button for suspended bots, which asks for confirmation first" do
++    sign_in :david
++    bot = create_bot(name: "Kevin's Bot", creator: users(:kevin))
++    bot.suspend!(:flooding)
++
++    get bots_url
++
++    assert_select "li#bot_#{bot.id} form[action=?][method=post]", bot_reactivation_path(bot) do
++      assert_select "button[data-turbo-confirm]", text: /Reactivate/
++    end
++  end
++
++  test "the bot's creator sees that a bot is suspended, but not the Reactivate button" do
++    bot = create_bot(name: "Deploy Bot", creator: users(:kevin))
++    bot.suspend!(:flooding)
++
++    get bots_url
++
++    assert_select "li#bot_#{bot.id}" do
++      assert_select "strong", text: "Suspended"
++      assert_select "form[action=?]", bot_reactivation_path(bot), count: 0
++    end
++  end
++
++  test "new has an optional webhook URL field labelled Webhook URL" do
++    get new_bot_url
++
++    assert_select "label span.for-screen-reader", text: "Webhook URL"
++    assert_select "input[type=url][name=?][placeholder=?]:not([required])", "bot[webhook_url]", "Webhook URL"
++  end
++
++  test "create saves the webhook URL" do
++    post bots_url, params: { bot: { name: "Deploy Bot", webhook_url: "https://bot.example.com/hook" } }
++
++    assert_equal "https://bot.example.com/hook", Bot.last.webhook_url
++  end
++
++  test "create with a blank webhook URL saves the bot without a webhook" do
++    post bots_url, params: { bot: { name: "Deploy Bot", webhook_url: "" } }
++
++    assert_redirected_to bots_url
++    assert_nil Bot.last.webhook_url
++  end
++
++  test "create with a webhook URL that isn't http or https re-renders the form as unprocessable" do
++    assert_no_difference -> { Bot.count } do
++      post bots_url, params: { bot: { name: "Deploy Bot", webhook_url: "ftp://bot.example.com/hook" } }
++    end
++
++    assert_response :unprocessable_content
++    assert_select "p", text: "Webhook URL must be an http or https address"
++  end
++
++  test "edit shows the current webhook URL" do
++    bot = create_bot(name: "Deploy Bot", creator: users(:kevin), webhook_url: "https://bot.example.com/hook")
++
++    get edit_bot_url(bot)
++
++    assert_select "input[name=?][value=?]", "bot[webhook_url]", "https://bot.example.com/hook"
++  end
++
++  test "update with a blank webhook URL removes the webhook" do
++    bot = create_bot(name: "Deploy Bot", creator: users(:kevin), webhook_url: "https://bot.example.com/hook")
++
++    patch bot_url(bot), params: { bot: { name: "Deploy Bot", webhook_url: "" } }
++
++    assert_redirected_to bots_url
++    assert_nil bot.reload.webhook_url
++  end
++
++  test "update changes the webhook URL" do
++    bot = create_bot(name: "Deploy Bot", creator: users(:kevin), webhook_url: "https://bot.example.com/hook")
++
++    patch bot_url(bot), params: { bot: { webhook_url: "https://bot.example.com/v2/hook" } }
++
++    assert_equal "https://bot.example.com/v2/hook", bot.reload.webhook_url
++  end
++
++  test "a non-administrator can't change someone else's webhook" do
++    bot = create_bot(name: "David's Bot", creator: users(:david), webhook_url: "https://bot.example.com/hook")
++
++    patch bot_url(bot), params: { bot: { webhook_url: "" } }
++
++    assert_response :forbidden
++    assert_equal "https://bot.example.com/hook", bot.reload.webhook_url
++  end
++
++  test "edit keeps its page out of Turbo's cache, since it shows the webhook URL" do
++    bot = create_bot(name: "Deploy Bot", creator: users(:kevin))
++
++    get edit_bot_url(bot)
++
++    assert_select "meta[name=turbo-cache-control][content=no-cache]"
++  end
++
++  test "new has an 'Add to all open rooms' switch, off by default" do
++    get new_bot_url
++
++    assert_select "label", text: "Add to all open rooms" do
++      assert_select "input[type=checkbox][name='bot[add_to_all_open_rooms]'][value='1']"
++      assert_select "input[type=checkbox][name='bot[add_to_all_open_rooms]'][checked]", count: 0
++    end
++  end
++
++  test "edit shows the switch on for a bot that adds to all open rooms, and off otherwise" do
++    switched = create_bot(name: "Switched Bot", creator: users(:kevin), add_to_all_open_rooms: true)
++    plain = create_bot(name: "Plain Bot", creator: users(:kevin))
++
++    get edit_bot_url(switched)
++    assert_select "label", text: "Add to all open rooms" do
++      assert_select "input[type=checkbox][name='bot[add_to_all_open_rooms]'][checked]"
++    end
++
++    get edit_bot_url(plain)
++    assert_select "label", text: "Add to all open rooms" do
++      assert_select "input[type=checkbox][name='bot[add_to_all_open_rooms]'][checked]", count: 0
++    end
++  end
++
++  test "turning the switch on in edit makes the bot a member of every open room" do
++    bot = create_bot(name: "Deploy Bot", creator: users(:kevin))
++    assert_empty bot.user.memberships
++
++    patch bot_url(bot), params: { bot: { name: "Deploy Bot", add_to_all_open_rooms: "1" } }
++
++    assert_redirected_to bots_url
++    assert_equal Rooms::Open.pluck(:id).sort, bot.user.reload.memberships.pluck(:room_id).sort
++  end
++
++  test "turning the switch off in edit keeps the bot's memberships" do
++    bot = create_bot(name: "Deploy Bot", creator: users(:kevin), add_to_all_open_rooms: true)
++
++    patch bot_url(bot), params: { bot: { name: "Deploy Bot", add_to_all_open_rooms: "0" } }
++
++    assert_redirected_to bots_url
++    assert_not bot.reload.add_to_all_open_rooms?
++    assert_equal Rooms::Open.count, bot.user.memberships.count
++  end
++
++  test "a switch that's left alone in edit doesn't change the bot" do
++    bot = create_bot(name: "Deploy Bot", creator: users(:kevin))
++
++    patch bot_url(bot), params: { bot: { name: "Release Bot" } }
++
++    assert_not bot.reload.add_to_all_open_rooms?
++    assert_empty bot.user.memberships
++  end
++end
+diff --git a/test/controllers/rooms/closeds_controller_test.rb b/test/controllers/rooms/closeds_controller_test.rb
+index 504745d..a15e613 100644
+--- a/test/controllers/rooms/closeds_controller_test.rb
++++ b/test/controllers/rooms/closeds_controller_test.rb
+@@ -29,6 +29,36 @@ class Rooms::ClosedsControllerTest < ActionDispatch::IntegrationTest
+     assert_redirected_to room_url(Room.last)
+   end
+ 
++  test "bots can be given access to closed rooms, listed alongside people" do
++    bot = create_bot(name: "Deploy Bot")
++    room = rooms(:designers)
++
++    get edit_rooms_closed_url(room)
++
++    assert_response :success
++    assert_select "label", text: "Give Deploy Bot access to this room"
++    assert_select "input[name='user_ids[]'][value=?]", bot.user.id.to_s
++  end
++
++  test "giving a bot access to a closed room, when it's listed, tells the bot it has joined" do
++    bot = create_bot(name: "Deploy Bot", webhook_url: "https://bot.example.com/hook")
++    room = rooms(:designers)
++
++    assert_enqueued_with job: Bot::JoinedJob, args: [ bot, room ] do
++      put rooms_closed_url(room), params: { room: { name: "Designers" }, user_ids: [ users(:david).id, bot.user.id ] }
++    end
++  end
++
++  test "a bot already in a closed room is not told again when the room is saved" do
++    bot = create_bot(name: "Deploy Bot", webhook_url: "https://bot.example.com/hook")
++    room = rooms(:designers)
++    room.memberships.grant_to bot.user
++
++    assert_no_enqueued_jobs only: Bot::JoinedJob do
++      put rooms_closed_url(room), params: { room: { name: "Designers" }, user_ids: [ users(:david).id, bot.user.id ] }
++    end
++  end
++
+   test "create forbidden by non-admin when account restricts creation to admins" do
+     accounts(:signal).settings.restrict_room_creation_to_administrators = true
+     accounts(:signal).save!
+diff --git a/test/jobs/bot/joined_job_test.rb b/test/jobs/bot/joined_job_test.rb
+new file mode 100644
+index 0000000..6a888ff
+--- /dev/null
++++ b/test/jobs/bot/joined_job_test.rb
+@@ -0,0 +1,110 @@
++require "test_helper"
++
++class Bot::JoinedJobTest < ActiveJob::TestCase
++  WEBHOOK_URL = "https://bot.example.com/hook"
++
++  setup do
++    @bot = create_bot(name: "Deploy Bot", webhook_url: WEBHOOK_URL)
++    @room = rooms(:designers)
++    @room.memberships.grant_to @bot.user # The bot has joined, so its job is the one under test
++    clear_enqueued_jobs
++
++    RestrictedHTTP::PrivateNetworkGuard.stubs(:resolve).with("bot.example.com").returns("93.184.216.34")
++    stub_request(:post, WEBHOOK_URL).to_return(status: 204)
++  end
++
++  test "calls the webhook with a joined event describing the room" do
++    Bot::JoinedJob.perform_now(@bot, @room)
++
++    assert_requested :post, WEBHOOK_URL, headers: { "Content-Type" => "application/json" } do |request|
++      assert_equal({
++        "event" => "joined",
++        "room" => { "id" => @room.id, "name" => "Designers", "reply_to" => "/rooms/#{@room.id}/#{@bot.code}/messages" }
++      }, JSON.parse(request.body))
++    end
++  end
++
++  test "granting a bot membership of a room it hasn't been told about calls its webhook once the grant is committed" do
++    hq = rooms(:hq) # The bot has only been told about designers
++
++    perform_enqueued_jobs only: Bot::JoinedJob do
++      hq.memberships.grant_to @bot.user
++    end
++
++    assert_requested :post, WEBHOOK_URL, times: 1
++  end
++
++  test "doesn't call a suspended bot, so it isn't told it has joined" do
++    @bot.suspend!(:failing_webhook)
++
++    Bot::JoinedJob.perform_now(@bot, @room)
++
++    assert_not_requested :post, WEBHOOK_URL
++  end
++
++  test "a join made while the bot is suspended isn't recorded, so the bot is told when it next joins once reactivated" do
++    hq = rooms(:hq)
++    @bot.suspend!(:failing_webhook)
++    hq.memberships.grant_to @bot.user
++    @bot.reactivate!
++
++    hq.memberships.revoke_from @bot.user
++    assert_enqueued_with job: Bot::JoinedJob, args: [ @bot, hq ] do
++      hq.memberships.grant_to @bot.user
++    end
++  end
++
++  test "a 200 text reply is posted into the room as the bot's message" do
++    stub_request(:post, WEBHOOK_URL).to_return(status: 200, body: "Hello, designers!", headers: { "Content-Type" => "text/plain" })
++
++    assert_difference -> { @room.messages.count }, +1 do
++      Bot::JoinedJob.perform_now(@bot, @room)
++    end
++
++    message = @room.messages.find_by!(creator: @bot.user)
++    assert_equal "Hello, designers!", message.plain_text_body
++  end
++
++  test "a 200 text/html reply is posted into the room as rich text" do
++    stub_request(:post, WEBHOOK_URL).to_return(status: 200, body: "<div><b>Hi</b> designers</div>", headers: { "Content-Type" => "text/html" })
++
++    Bot::JoinedJob.perform_now(@bot, @room)
++
++    assert_equal "Hi designers", @room.messages.find_by!(creator: @bot.user).plain_text_body
++  end
++
++  test "a bot that left the room before the job ran isn't called" do
++    @room.memberships.where(user: @bot.user).delete_all
++
++    Bot::JoinedJob.perform_now(@bot, @room)
++
++    assert_not_requested :post, WEBHOOK_URL
++  end
++
++  test "a banned bot isn't called" do
++    @bot.user.banned!
++
++    Bot::JoinedJob.perform_now(@bot, @room)
++
++    assert_not_requested :post, WEBHOOK_URL
++  end
++
++  test "a bot whose webhook was removed since it joined isn't called" do
++    @bot.update! webhook_url: nil
++
++    Bot::JoinedJob.perform_now(@bot.reload, @room)
++
++    assert_not_requested :post, WEBHOOK_URL
++  end
++
++  test "a bot deleted before its job runs is discarded without error" do
++    Bot::JoinedJob.perform_later(@bot, @room)
++    @bot.user.deactivate
++
++    assert_nothing_raised do
++      perform_enqueued_jobs only: Bot::JoinedJob
++    end
++
++    assert_not_requested :post, WEBHOOK_URL
++  end
++end
+diff --git a/test/jobs/bot/webhook_job_test.rb b/test/jobs/bot/webhook_job_test.rb
+new file mode 100644
+index 0000000..c243bcb
+--- /dev/null
++++ b/test/jobs/bot/webhook_job_test.rb
+@@ -0,0 +1,98 @@
++require "test_helper"
++
++class Bot::WebhookJobTest < ActiveJob::TestCase
++  WEBHOOK_URL = "https://bot.example.com/hook"
++
++  setup do
++    @bot = create_bot(name: "Deploy Bot", webhook_url: WEBHOOK_URL, add_to_all_open_rooms: true) # So it's in HQ
++    @room = rooms(:hq)
++
++    RestrictedHTTP::PrivateNetworkGuard.stubs(:resolve).with("bot.example.com").returns("93.184.216.34")
++    stub_request(:post, WEBHOOK_URL).to_return(status: 204)
++  end
++
++  test "calls the webhook of a bot the message mentions" do
++    message = mention_message(@bot.user)
++
++    Bot::WebhookJob.perform_now(message)
++
++    assert_requested :post, WEBHOOK_URL
++  end
++
++  test "calls each mentioned bot's webhook once, even when a bot is mentioned twice" do
++    message = mention_message(@bot.user, "#{mention_attachment_for(@bot.user)} and again #{mention_attachment_for(@bot.user)}")
++    Bot::Webhook.expects(:new).with { |bot, payload| bot == @bot && payload.message == message }.once.returns(stub(deliver: nil))
++
++    Bot::WebhookJob.perform_now(message)
++  end
++
++  test "doesn't call bots without a webhook" do
++    @bot.update! webhook_url: nil
++
++    Bot::WebhookJob.perform_now(mention_message(@bot.user))
++
++    assert_not_requested :post, WEBHOOK_URL
++  end
++
++  test "doesn't call bots that aren't mentioned" do
++    other = create_bot(name: "Release Bot", webhook_url: "https://release.example.com/hook")
++    stub_request(:post, "https://release.example.com/hook").to_return(status: 204)
++
++    Bot::WebhookJob.perform_now(mention_message(users(:david)))
++
++    assert_not_requested :post, WEBHOOK_URL
++    assert_not_requested :post, "https://release.example.com/hook"
++  end
++
++  test "doesn't call a bot that isn't in the room the message was posted to" do
++    message = rooms(:designers).messages.create!(creator: users(:kevin), body: "<div>#{mention_attachment_for(@bot.user)} hi</div>")
++
++    Bot::WebhookJob.perform_now(message)
++
++    assert_not_requested :post, WEBHOOK_URL
++  end
++
++  test "doesn't call a suspended bot, even when it's mentioned" do
++    message = mention_message(@bot.user)
++    @bot.suspend!(:flooding)
++
++    Bot::WebhookJob.perform_now(message)
++
++    assert_not_requested :post, WEBHOOK_URL
++  end
++
++  test "doesn't call a bot whose user is banned" do
++    message = mention_message(@bot.user)
++    @bot.user.banned!
++
++    Bot::WebhookJob.perform_now(message)
++
++    assert_not_requested :post, WEBHOOK_URL
++  end
++
++  test "bots' own messages don't call webhooks, so two bots can't set each other off" do
++    other = create_bot(name: "Release Bot", creator: users(:kevin), webhook_url: "https://release.example.com/hook")
++    stub_request(:post, "https://release.example.com/hook").to_return(status: 204)
++
++    Bot::WebhookJob.perform_now(mention_message(@bot.user, creator: other.user))
++
++    assert_not_requested :post, WEBHOOK_URL
++  end
++
++  test "a message deleted before its job runs is discarded without error" do
++    message = mention_message(@bot.user)
++    Bot::WebhookJob.perform_later(message)
++    message.destroy
++
++    assert_nothing_raised do
++      perform_enqueued_jobs(only: Bot::WebhookJob)
++    end
++
++    assert_not_requested :post, WEBHOOK_URL
++  end
++
++  private
++    def mention_message(user, body = mention_attachment_for(user), creator: users(:kevin))
++      @room.messages.create!(creator: creator, body: "<div>#{body} restart the build please</div>")
++    end
++end
+diff --git a/test/lib/bot_code_filter_test.rb b/test/lib/bot_code_filter_test.rb
+new file mode 100644
+index 0000000..66d6b21
+--- /dev/null
++++ b/test/lib/bot_code_filter_test.rb
+@@ -0,0 +1,30 @@
++require "test_helper"
++
++class BotCodeFilterTest < ActiveSupport::TestCase
++  test "masks the bot code in a message path" do
++    assert_equal "/rooms/12/[FILTERED]/messages", BotCodeFilter.filter("/rooms/12/abc123XYZ/messages")
++  end
++
++  test "masks the bot code in a full URL, keeping the query string" do
++    assert_equal "https://chat.example.com/rooms/12/[FILTERED]/messages?x=1",
++      BotCodeFilter.filter("https://chat.example.com/rooms/12/abc123XYZ/messages?x=1")
++  end
++
++  test "leaves other paths alone" do
++    [ "/rooms/12/messages", "/rooms/12/messages/34", "/rooms/12/@34", "/bots/12/edit", "/messages/34" ].each do |path|
++      assert_equal path, BotCodeFilter.filter(path)
++    end
++  end
++
++  test "request paths logged by Rails mask the bot code" do
++    request = ActionDispatch::Request.new(Rack::MockRequest.env_for("/rooms/12/abc123XYZ/messages", method: "POST"))
++
++    assert_equal "/rooms/12/[FILTERED]/messages", request.filtered_path
++  end
++
++  test "bot codes are filtered from logged parameters" do
++    filter = ActiveSupport::ParameterFilter.new(Rails.application.config.filter_parameters)
++
++    assert_equal({ "room_id" => "12", "bot_code" => "[FILTERED]" }, filter.filter("room_id" => "12", "bot_code" => "abc123XYZ"))
++  end
++end
+diff --git a/test/models/account_test.rb b/test/models/account_test.rb
+index fe00564..471943d 100644
+--- a/test/models/account_test.rb
++++ b/test/models/account_test.rb
+@@ -16,6 +16,60 @@ class AccountTest < ActiveSupport::TestCase
+     assert_not accounts(:signal).reload.settings.restrict_room_creation_to_administrators?
+   end
+ 
++  test "bots_per_member is 5 by default" do
++    assert_equal 5, accounts(:signal).bots_per_member
++  end
++
++  test "bots_per_member is saved as a whole number, and zero is allowed" do
++    accounts(:signal).update!(bots_per_member: "0")
++    assert_equal 0, accounts(:signal).reload.bots_per_member
++
++    accounts(:signal).update!(bots_per_member: "12")
++    assert_equal 12, accounts(:signal).reload.bots_per_member
++    assert_equal 12, accounts(:signal)[:settings]["bots_per_member"]
++  end
++
++  test "bots_per_member refuses negative, fractional, blank and non-numeric values, keeping the current limit" do
++    [ "-1", "2.5", "", "abc" ].each do |value|
++      assert_not accounts(:signal).update(bots_per_member: value), "expected #{value.inspect} to be refused"
++    end
++
++    assert_equal 5, accounts(:signal).reload.bots_per_member
++  end
++
++  test "bots_per_member explains why a value is refused" do
++    account = accounts(:signal)
++
++    assert_not account.update(bots_per_member: "-1")
++    assert_includes account.errors.full_messages, "Bots per member must be greater than or equal to 0"
++  end
++
++  test "a refused bots per member limit doesn't stop the account being saved after a reload" do
++    account = accounts(:signal)
++
++    assert_not account.update(bots_per_member: "2.5")
++    account.reload
++
++    assert account.update(name: "Renamed")
++    assert_equal 5, account.reload.bots_per_member
++  end
++
++  test "a bots per member limit set directly on settings is still validated when the account is saved" do
++    account = accounts(:signal)
++    account.update!(bots_per_member: 3)
++
++    account.settings.bots_per_member = -1
++
++    assert_not account.save
++  end
++
++  test "restrict_room_creation_to_administrators leaves the bots per member limit alone" do
++    accounts(:signal).update!(bots_per_member: 3)
++    accounts(:signal).update!(settings: { "restrict_room_creation_to_administrators" => "true" })
++
++    assert_equal 3, accounts(:signal).reload.bots_per_member
++  end
++
+   test "logo_variant is a resized variant of a variable logo" do
+     accounts(:signal).logo.attach io: file_fixture("moon.jpg").open, filename: "moon.jpg", content_type: "image/jpeg"
+ 
+diff --git a/test/models/bot/flooding_test.rb b/test/models/bot/flooding_test.rb
+new file mode 100644
+index 0000000..22e5e71
+--- /dev/null
++++ b/test/models/bot/flooding_test.rb
+@@ -0,0 +1,183 @@
++require "test_helper"
++
++class Bot::FloodingTest < ActiveSupport::TestCase
++  setup do
++    @bot = create_bot(add_to_all_open_rooms: true) # So it's in HQ
++    @room = rooms(:hq)
++  end
++
++  test "a bot can post ten messages in ten seconds" do
++    assert_difference -> { @room.messages.count }, +10 do
++      10.times { post_as_bot }
++    end
++  end
++
++  test "the message that goes over ten in ten seconds is refused, and starts a 30-second cooldown" do
++    10.times { post_as_bot }
++
++    error = assert_raises(Bot::RateLimited) { post_as_bot }
++
++    assert_equal 30, error.retry_after
++    assert_equal 10, @bot.user.messages.count
++    assert_in_delta 30.seconds.from_now, @bot.reload.cooldown_until, 1
++  end
++
++  test "messages from other people in the room don't count towards the bot's limit" do
++    10.times { @room.messages.create!(creator: users(:kevin), body: "Hello") }
++
++    10.times { post_as_bot }
++
++    assert_equal 10, @bot.user.messages.count
++  end
++
++  test "each bot has its own limit" do
++    other = create_bot(name: "Release Bot", add_to_all_open_rooms: true)
++    10.times { post_as_bot }
++
++    assert_nothing_raised { other.post_message(@room, body: Bot.html_from_text("Hello")) }
++  end
++
++  test "the window slides: a bot that posts once a second is never refused" do
++    travel_to Time.current do
++      31.times do
++        post_as_bot
++        travel 1.second
++      end
++    end
++
++    assert_equal 31, @bot.user.messages.count
++    assert_nil @bot.reload.cooldown_until
++  end
++
++  test "the window is the last ten seconds, so older messages stop counting as the window moves on" do
++    start = Time.current.change(usec: 0)
++
++    travel_to start do
++      5.times { post_as_bot }
++    end
++
++    travel_to start + 5 do
++      5.times { post_as_bot } # Ten in the last ten seconds
++    end
++
++    travel_to start + 10 do
++      5.times { post_as_bot } # Only the five from start + 5 are still in the window
++      assert_raises(Bot::RateLimited) { post_as_bot }
++    end
++
++    assert_equal 15, @bot.user.messages.count
++  end
++
++  test "attempts during the cooldown are refused, with the seconds left as retry_after" do
++    travel_to Time.current do
++      10.times { post_as_bot }
++      assert_raises(Bot::RateLimited) { post_as_bot }
++
++      travel 10.seconds
++      error = assert_raises(Bot::RateLimited) { post_as_bot }
++
++      assert_equal 20, error.retry_after
++    end
++  end
++
++  test "retry_after rounds up, so waiting it out is always enough" do
++    travel_to Time.current do
++      10.times { post_as_bot }
++      assert_raises(Bot::RateLimited) { post_as_bot }
++
++      travel 10.5.seconds, with_usec: true
++      error = assert_raises(Bot::RateLimited) { post_as_bot }
++
++      assert_equal 20, error.retry_after
++    end
++  end
++
++  test "the cooldown is 30 seconds, after which the bot can post again" do
++    start = Time.current.change(usec: 0)
++
++    travel_to start do
++      10.times { post_as_bot }
++      assert_raises(Bot::RateLimited) { post_as_bot }
++    end
++
++    travel_to start + 29.9, with_usec: true do
++      assert_raises(Bot::RateLimited) { post_as_bot }
++    end
++
++    travel_to start + 30 do
++      assert_nothing_raised { post_as_bot }
++    end
++  end
++
++  test "refused attempts don't count as messages" do
++    10.times { post_as_bot }
++    5.times { assert_raises(Bot::RateLimited) { post_as_bot } }
++
++    assert_equal 10, @bot.user.messages.count
++  end
++
++  test "five attempts during one cooldown suspend the bot" do
++    10.times { post_as_bot }
++    assert_raises(Bot::RateLimited) { post_as_bot } # Starts the cooldown
++
++    4.times { assert_raises(Bot::RateLimited) { post_as_bot } }
++    assert_not @bot.reload.suspended?
++
++    assert_raises(Bot::RateLimited) { post_as_bot } # The fifth
++
++    assert_predicate @bot.reload, :suspended?
++    assert_predicate @bot, :flooding?
++  end
++
++  test "an attempt checked against the cooldown during it is refused, and counts" do
++    10.times { post_as_bot }
++    assert_raises(Bot::RateLimited) { post_as_bot } # Starts the cooldown
++
++    error = assert_raises(Bot::RateLimited) { @bot.refuse_during_cooldown! }
++
++    assert_equal 30, error.retry_after
++    assert_equal 1, @bot.reload.cooldown_attempts
++  end
++
++  test "an attempt checked against the cooldown outside it is let through" do
++    assert_nothing_raised { @bot.refuse_during_cooldown! }
++    assert_equal 0, @bot.reload.cooldown_attempts
++  end
++
++  test "a suspended bot checked against the cooldown is refused as suspended" do
++    @bot.suspend!(:flooding)
++
++    assert_raises(Bot::Suspended) { @bot.refuse_during_cooldown! }
++  end
++
++  test "a suspended bot is refused as suspended, and posts nothing" do
++    @bot.suspend!(:failing_webhook)
++
++    assert_no_difference -> { Message.count } do
++      assert_raises(Bot::Suspended) { post_as_bot }
++    end
++  end
++
++  test "attempts count only within one cooldown" do
++    start = Time.current.change(usec: 0)
++
++    travel_to start do
++      10.times { post_as_bot }
++      assert_raises(Bot::RateLimited) { post_as_bot }
++      4.times { assert_raises(Bot::RateLimited) { post_as_bot } }
++    end
++
++    travel_to start + 30 do
++      10.times { post_as_bot }
++      assert_raises(Bot::RateLimited) { post_as_bot } # A new cooldown
++      4.times { assert_raises(Bot::RateLimited) { post_as_bot } }
++    end
++
++    assert_not @bot.reload.suspended?
++  end
++
++  private
++    def post_as_bot
++      @bot.post_message(@room, body: Bot.html_from_text("Hello"))
++    end
++end
+diff --git a/test/models/bot/suspension_test.rb b/test/models/bot/suspension_test.rb
+new file mode 100644
+index 0000000..b71f1cd
+--- /dev/null
++++ b/test/models/bot/suspension_test.rb
+@@ -0,0 +1,146 @@
++require "test_helper"
++
++class Bot::SuspensionTest < ActiveSupport::TestCase
++  WEBHOOK_URL = "https://bot.example.com/hook"
++
++  setup do
++    @bot = create_bot(name: "Deploy Bot", webhook_url: WEBHOOK_URL, add_to_all_open_rooms: true) # So it's in HQ
++  end
++
++  test "a new bot isn't suspended" do
++    assert_not @bot.suspended?
++    assert_nil @bot.suspension_reason
++  end
++
++  test "suspending a bot records why" do
++    @bot.suspend!(:flooding)
++
++    @bot.reload
++    assert_predicate @bot, :suspended?
++    assert_predicate @bot, :flooding?
++    assert_not_nil @bot.suspended_at
++  end
++
++  test "a suspended bot keeps its rooms and messages" do
++    message = rooms(:hq).messages.create!(creator: @bot.user, body: "Still here")
++
++    @bot.suspend!(:failing_webhook)
++
++    assert_includes @bot.user.rooms, rooms(:hq)
++    assert_equal @bot.user, message.reload.creator
++  end
++
++  test "a suspended bot still counts towards its owner's bot limit" do
++    accounts(:signal).update!(bots_per_member: 1)
++    bot = create_bot(creator: users(:kevin))
++
++    bot.suspend!(:flooding)
++
++    assert_not users(:kevin).can_add_bots?
++  end
++
++  test "a suspended bot gets no webhooks, and isn't active for them" do
++    assert_predicate @bot, :webhook_active?
++
++    @bot.suspend!(:flooding)
++
++    assert_not @bot.reload.webhook_active?
++  end
++
++  test "suspended bots are left out of the bots with active webhooks" do
++    assert_includes Bot.with_active_webhook, @bot
++
++    @bot.suspend!(:flooding)
++
++    assert_not_includes Bot.with_active_webhook, @bot
++  end
++
++  test "suspending a bot that's already suspended keeps its first reason" do
++    @bot.suspend!(:flooding)
++
++    @bot.suspend!(:failing_webhook)
++
++    assert_predicate @bot.reload, :flooding?
++  end
++
++  test "reactivating a suspended bot lets it post and get webhooks again" do
++    @bot.suspend!(:failing_webhook)
++
++    @bot.reactivate!
++
++    @bot.reload
++    assert_not @bot.suspended?
++    assert_nil @bot.suspension_reason
++    assert_predicate @bot, :webhook_active?
++    assert_includes Bot.with_active_webhook, @bot
++  end
++
++  test "reactivating starts the bot's counts again" do
++    travel_to Time.current do
++      10.times { @bot.post_message(rooms(:hq), body: Bot.html_from_text("Hello")) }
++      assert_raises(Bot::RateLimited) { @bot.post_message(rooms(:hq), body: Bot.html_from_text("Hello")) }
++      9.times { @bot.webhook_failed }
++      @bot.suspend!(:flooding)
++
++      @bot.reactivate!
++
++      @bot.reload
++      assert_nil @bot.cooldown_until
++      assert_equal 0, @bot.cooldown_attempts
++      assert_equal 0, @bot.consecutive_webhook_failures
++    end
++  end
++
++  test "reactivating a bot that isn't suspended changes nothing" do
++    @bot.webhook_failed
++
++    @bot.reactivate!
++
++    assert_equal 1, @bot.reload.consecutive_webhook_failures
++  end
++
++  test "nine failed deliveries in a row don't suspend the bot" do
++    9.times { @bot.webhook_failed }
++
++    assert_not @bot.reload.suspended?
++    assert_equal 9, @bot.consecutive_webhook_failures
++  end
++
++  test "ten failed deliveries in a row suspend the bot for failing webhooks" do
++    10.times { @bot.webhook_failed }
++
++    @bot.reload
++    assert_predicate @bot, :suspended?
++    assert_predicate @bot, :failing_webhook?
++  end
++
++  test "a successful delivery resets the count of failed deliveries" do
++    9.times { @bot.webhook_failed }
++
++    @bot.webhook_delivered
++    9.times { @bot.webhook_failed }
++
++    assert_not @bot.reload.suspended?
++    assert_equal 9, @bot.consecutive_webhook_failures
++  end
++
++  test "a successful delivery with no failures to reset changes nothing" do
++    @bot.webhook_delivered
++
++    assert_equal 0, @bot.reload.consecutive_webhook_failures
++  end
++
++  test "a bot already suspended for flooding keeps that reason when a webhook fails too" do
++    @bot.suspend!(:flooding)
++
++    10.times { @bot.webhook_failed }
++
++    assert_predicate @bot.reload, :flooding?
++  end
++
++  test "a bot deleted by someone else while it was being counted raises not found" do
++    Bot.find(@bot.id).user.deactivate
++
++    assert_raises(ActiveRecord::RecordNotFound) { @bot.webhook_failed }
++  end
++end
+diff --git a/test/models/bot/webhook/joined_payload_test.rb b/test/models/bot/webhook/joined_payload_test.rb
+new file mode 100644
+index 0000000..7551edb
+--- /dev/null
++++ b/test/models/bot/webhook/joined_payload_test.rb
+@@ -0,0 +1,32 @@
++require "test_helper"
++
++class Bot::Webhook::JoinedPayloadTest < ActiveSupport::TestCase
++  setup do
++    @bot = create_bot(name: "Deploy Bot", webhook_url: "https://bot.example.com/hook")
++    @room = rooms(:designers)
++  end
++
++  test "describes the joined room in the documented format" do
++    payload = payload_for(@room)
++
++    assert_equal %w[ event room ], payload.keys
++    assert_equal "joined", payload["event"]
++    assert_equal({ "id" => @room.id, "name" => "Designers", "reply_to" => "/rooms/#{@room.id}/#{@bot.code}/messages" }, payload["room"])
++  end
++
++  test "reply_to is the bot's own posting URL for the room, as a path" do
++    reply_to = payload_for(@room).dig("room", "reply_to")
++
++    assert_equal({ controller: "bots/messages", action: "create", room_id: @room.id.to_s, bot_code: @bot.code },
++      Rails.application.routes.recognize_path(reply_to, method: :post))
++  end
++
++  test "the room's name is included for open rooms too" do
++    assert_equal "HQ", payload_for(rooms(:hq)).dig("room", "name")
++  end
++
++  private
++    def payload_for(room)
++      JSON.parse(Bot::Webhook::JoinedPayload.new(@bot, room).to_json)
++    end
++end
+diff --git a/test/models/bot/webhook/payload_test.rb b/test/models/bot/webhook/payload_test.rb
+new file mode 100644
+index 0000000..fa69af8
+--- /dev/null
++++ b/test/models/bot/webhook/payload_test.rb
+@@ -0,0 +1,102 @@
++require "test_helper"
++
++class Bot::Webhook::PayloadTest < ActiveSupport::TestCase
++  setup do
++    @bot = create_bot(name: "Deploy Bot", webhook_url: "https://bot.example.com/hook")
++    @room = rooms(:hq)
++  end
++
++  test "describes the mention in the documented format" do
++    message = mention_message("#{mention_attachment_for(@bot.user)} restart the build please", creator: users(:kevin))
++
++    payload = payload_for(message)
++
++    assert_equal %w[ event author room message ], payload.keys
++    assert_equal "mention", payload["event"]
++    assert_equal({ "id" => users(:kevin).id, "name" => "Kevin" }, payload["author"])
++    assert_equal({ "id" => @room.id, "name" => "HQ", "reply_to" => "/rooms/#{@room.id}/#{@bot.code}/messages" }, payload["room"])
++    assert_equal message.id, payload["message"]["id"]
++    assert_equal "restart the build please", payload["message"]["body"]["text"]
++    assert_includes payload["message"]["body"]["html"], "restart the build please"
++    assert_equal "/rooms/#{@room.id}/@#{message.id}", payload["message"]["link"]
++  end
++
++  test "reply_to is the bot's own posting URL for the room, as a path" do
++    message = mention_message("#{mention_attachment_for(@bot.user)} hello")
++
++    reply_to = payload_for(message).dig("room", "reply_to")
++
++    assert_equal "/rooms/#{@room.id}/#{@bot.code}/messages", reply_to
++    assert_equal({ controller: "bots/messages", action: "create", room_id: @room.id.to_s, bot_code: @bot.code },
++      Rails.application.routes.recognize_path(reply_to, method: :post))
++  end
++
++  test "link is a path that opens the room at the message" do
++    message = mention_message("#{mention_attachment_for(@bot.user)} hello")
++
++    link = payload_for(message).dig("message", "link")
++
++    assert_equal "/rooms/#{@room.id}/@#{message.id}", link
++    assert_equal({ controller: "rooms", action: "show", room_id: @room.id.to_s, message_id: message.id.to_s },
++      Rails.application.routes.recognize_path(link))
++  end
++
++  test "the text has the bot's own mention removed, so it reads as the command" do
++    message = mention_message("#{mention_attachment_for(@bot.user)} restart the build please")
++
++    assert_equal "restart the build please", payload_for(message).dig("message", "body", "text")
++  end
++
++  test "the bot's mention is removed wherever it is in the text" do
++    message = mention_message("please #{mention_attachment_for(@bot.user)} restart")
++
++    assert_equal "please  restart", payload_for(message).dig("message", "body", "text")
++  end
++
++  test "other people's mentions stay in the text as @names" do
++    message = mention_message("#{mention_attachment_for(@bot.user)} ask #{mention_attachment_for(:david)} to check")
++
++    assert_equal "ask @David to check", payload_for(message).dig("message", "body", "text")
++  end
++
++  test "the html is the whole rich-text body, including the bot's mention" do
++    message = mention_message("#{mention_attachment_for(@bot.user)} restart the build please")
++
++    html = payload_for(message).dig("message", "body", "html")
++
++    assert_includes html, "restart the build please"
++    assert_includes html, "Deploy Bot"
++  end
++
++  test "the html is sanitized" do
++    message = mention_message("#{mention_attachment_for(@bot.user)} <b>bold</b><script>alert(1)</script>")
++
++    html = payload_for(message).dig("message", "body", "html")
++
++    assert_includes html, "<b>bold</b>"
++    assert_no_match %r{<script>}, html
++  end
++
++  test "direct rooms are named after the people in them, other than the bot" do
++    direct = Rooms::Direct.create_for({ creator: users(:kevin) }, users: [ users(:kevin), @bot.user ])
++    message = direct.messages.create!(creator: users(:kevin), body: "<div>#{mention_attachment_for(@bot.user)} hello</div>")
++
++    assert_equal "Kevin", payload_for(message).dig("room", "name")
++    assert_equal "/rooms/#{direct.id}/#{@bot.code}/messages", payload_for(message).dig("room", "reply_to")
++  end
++
++  test "the bot's code appears only in reply_to" do
++    message = mention_message("#{mention_attachment_for(@bot.user)} hello")
++
++    assert_equal 1, Bot::Webhook::Payload.new(@bot, message).to_json.scan(@bot.code).size
++  end
++
++  private
++    def mention_message(body, creator: users(:kevin))
++      @room.messages.create!(creator: creator, body: "<div>#{body}</div>")
++    end
++
++    def payload_for(message)
++      JSON.parse(Bot::Webhook::Payload.new(@bot, message).to_json)
++    end
++end
+diff --git a/test/models/bot/webhook_test.rb b/test/models/bot/webhook_test.rb
+new file mode 100644
+index 0000000..49adc54
+--- /dev/null
++++ b/test/models/bot/webhook_test.rb
+@@ -0,0 +1,380 @@
++require "test_helper"
++
++class Bot::WebhookTest < ActiveSupport::TestCase
++  WEBHOOK_URL = "https://bot.example.com/hook"
++
++  setup do
++    @bot = create_bot(name: "Deploy Bot", webhook_url: WEBHOOK_URL, add_to_all_open_rooms: true) # So it's in HQ
++    @room = rooms(:hq)
++    @message = mention_message("#{mention_attachment_for(@bot.user)} restart the build please")
++
++    # Resolving hosts goes through real DNS, so the test pins the address the guard hands back.
++    RestrictedHTTP::PrivateNetworkGuard.stubs(:resolve).with("bot.example.com").returns("93.184.216.34")
++  end
++
++  test "posts the payload as JSON" do
++    stub_webhook status: 204
++
++    deliver
++
++    assert_requested :post, WEBHOOK_URL, headers: { "Content-Type" => "application/json" } do |request|
++      assert_equal "mention", JSON.parse(request.body)["event"]
++    end
++  end
++
++  test "connects to the address that was checked, so DNS can't change it in between" do
++    stub_webhook status: 204
++    Net::HTTP.any_instance.expects(:ipaddr=).with("93.184.216.34").at_least_once
++
++    deliver
++
++    assert_requested :post, WEBHOOK_URL
++  end
++
++  test "a 204 posts nothing" do
++    stub_webhook status: 204
++
++    assert_no_difference -> { Message.count } do
++      deliver
++    end
++  end
++
++  test "a 200 text/plain reply is posted into the room as the bot's message" do
++    stub_webhook body: "Deployed v1.2.3 <all green>\nrun 42", content_type: "text/plain"
++
++    assert_difference -> { @room.messages.count }, +1 do
++      deliver
++    end
++
++    message = @room.messages.last
++    assert_equal @bot.user, message.creator
++    assert_equal "Deployed v1.2.3 <all green>\nrun 42", message.plain_text_body
++  end
++
++  test "a text/plain reply's markup is shown as written" do
++    stub_webhook body: "<b>bold</b> & <script>alert(1)</script>", content_type: "text/plain"
++
++    deliver
++
++    message = @room.messages.last
++    assert_equal "<b>bold</b> & <script>alert(1)</script>", message.plain_text_body
++    assert_no_match %r{<b>|<script>}, message.body.body.to_html
++  end
++
++  test "a 200 text/html reply is posted as rich text, with unsafe markup removed" do
++    stub_webhook body: "<div><b>Deployed</b> ✅</div><script>alert(1)</script>", content_type: "text/html"
++
++    deliver
++
++    message = @room.messages.last
++    assert_equal @bot.user, message.creator
++    assert_equal "Deployed ✅", message.plain_text_body
++    assert_includes message.body.body.to_html, "<b>Deployed</b>"
++    assert_no_match %r{<script>}, message.body.body.to_html
++  end
++
++  test "a text/html reply can't mention people, since that would ping them" do
++    stub_webhook body: "<div>Hey #{mention_attachment_for(:david)}</div>", content_type: "text/html"
++
++    deliver
++
++    message = @room.messages.last
++    assert_empty message.body.body.attachables
++    assert_empty message.mentionees
++  end
++
++  test "a text/plain reply with a charset is decoded with it" do
++    stub_webhook body: "Déployé".encode(Encoding::ISO_8859_1), content_type: "text/plain; charset=ISO-8859-1"
++
++    deliver
++
++    assert_equal "Déployé", @room.messages.last.plain_text_body
++  end
++
++  test "bytes that aren't valid UTF-8 are replaced, and the reply still posts" do
++    stub_webhook body: "bad \xff bytes".b, content_type: "text/plain"
++
++    assert_nothing_raised { deliver }
++    assert_equal "bad \uFFFD bytes", @room.messages.last.plain_text_body
++  end
++
++  test "a 200 reply posts a message that is broadcast to the room" do
++    stub_webhook body: "Deployed", content_type: "text/plain"
++
++    Message.any_instance.expects(:broadcast_create).once
++
++    deliver
++  end
++
++  test "a 200 reply with no visible text posts nothing" do
++    stub_webhook body: " \n\t ", content_type: "text/plain"
++
++    assert_no_difference -> { Message.count } do
++      deliver
++    end
++  end
++
++  test "a 200 text/html reply made only of markup posts nothing" do
++    stub_webhook body: "<div></div>", content_type: "text/html"
++
++    assert_no_difference -> { Message.count } do
++      deliver
++    end
++  end
++
++  test "a 200 reply with another content type posts nothing" do
++    stub_webhook body: %({"text":"Deployed"}), content_type: "application/json"
++
++    assert_no_difference -> { Message.count } do
++      deliver
++    end
++  end
++
++  test "other statuses post nothing, whatever they say" do
++    [ 201, 400, 404, 500, 503 ].each do |status|
++      stub_webhook status: status, body: "Deployed", content_type: "text/plain"
++
++      assert_no_difference -> { Message.count } do
++        deliver
++      end
++    end
++  end
++
++test "a webhook that answers with an error is logged, without its URL or the bot's code" do
++  stub_webhook status: 500
++  Rails.logger.stubs(:info)
++  Rails.logger.expects(:info).with { |line| line.include?("answered 500") && !line.include?(WEBHOOK_URL) && !line.include?(@bot.code) }
++
++  deliver
++end
++
++  test "redirects aren't followed" do
++    stub_request(:post, WEBHOOK_URL).to_return(status: 302, headers: { location: "https://elsewhere.example.com/hook" })
++    stub_request(:post, "https://elsewhere.example.com/hook").to_return(status: 200, body: "Deployed", headers: { "Content-Type" => "text/plain" })
++
++    assert_no_difference -> { Message.count } do
++      deliver
++    end
++
++    assert_not_requested :post, "https://elsewhere.example.com/hook"
++  end
++
++  test "webhooks at private addresses are never called" do
++    RestrictedHTTP::PrivateNetworkGuard.stubs(:resolve).with("bot.example.com").raises(RestrictedHTTP::Violation, "private")
++
++    assert_no_difference -> { Message.count } do
++      deliver
++    end
++
++    assert_not_requested :post, WEBHOOK_URL
++  end
++
++  test "hosts that don't resolve are never called" do
++    RestrictedHTTP::PrivateNetworkGuard.stubs(:resolve).with("bot.example.com").raises(Surfguard::Unresolvable)
++
++    assert_nothing_raised { deliver }
++    assert_not_requested :post, WEBHOOK_URL
++  end
++
++  test "a webhook that times out posts nothing and doesn't raise" do
++    stub_request(:post, WEBHOOK_URL).to_timeout
++
++    assert_no_difference -> { Message.count } do
++      assert_nothing_raised { deliver }
++    end
++  end
++
++  test "a webhook that refuses the connection posts nothing and doesn't raise" do
++    stub_request(:post, WEBHOOK_URL).to_raise(Errno::ECONNREFUSED)
++
++    assert_no_difference -> { Message.count } do
++      assert_nothing_raised { deliver }
++    end
++  end
++
++  test "a reply that is too large posts nothing" do
++    stub_webhook body: "a" * (Bot::Webhook::MAX_REPLY_SIZE + 1), content_type: "text/plain"
++
++    assert_no_difference -> { Message.count } do
++      assert_nothing_raised { deliver }
++    end
++  end
++
++  test "a bot that has left the room can't post into it" do
++    @bot.user.memberships.where(room: @room).delete_all
++    stub_webhook body: "Deployed", content_type: "text/plain"
++
++    assert_no_difference -> { Message.count } do
++      deliver
++    end
++  end
++
++  test "a 2xx other than 200 is a delivery, and resets the count of failures" do
++    9.times { @bot.webhook_failed }
++    stub_webhook status: 201
++
++    deliver
++
++    assert_equal 0, @bot.reload.consecutive_webhook_failures
++    assert_not @bot.suspended?
++  end
++
++  test "a 200 whose reply is too large is still a delivery, so it resets the count of failures" do
++    9.times { @bot.webhook_failed }
++    stub_webhook body: "a" * (Bot::Webhook::MAX_REPLY_SIZE + 1), content_type: "text/plain"
++
++    deliver
++
++    assert_equal 0, @bot.reload.consecutive_webhook_failures
++  end
++
++  test "a 200 with a content type that isn't a reply is still a delivery" do
++    9.times { @bot.webhook_failed }
++    stub_webhook body: "{}", content_type: "application/json"
++
++    deliver
++
++    assert_equal 0, @bot.reload.consecutive_webhook_failures
++  end
++
++  test "other statuses are failed deliveries, whatever they say" do
++    [ 302, 400, 404, 500, 503 ].each do |status|
++      stub_webhook status: status, body: "Deployed", content_type: "text/plain"
++
++      deliver
++    end
++
++    assert_equal 5, @bot.reload.consecutive_webhook_failures
++  end
++
++  test "a timeout is a failed delivery" do
++    stub_request(:post, WEBHOOK_URL).to_timeout
++
++    deliver
++
++    assert_equal 1, @bot.reload.consecutive_webhook_failures
++  end
++
++  test "a connection error is a failed delivery" do
++    stub_request(:post, WEBHOOK_URL).to_raise(Errno::ECONNREFUSED)
++
++    deliver
++
++    assert_equal 1, @bot.reload.consecutive_webhook_failures
++  end
++
++  test "a webhook at a private address is a failed delivery, since it's never reached" do
++    RestrictedHTTP::PrivateNetworkGuard.stubs(:resolve).with("bot.example.com").raises(RestrictedHTTP::Violation, "private")
++
++    deliver
++
++    assert_equal 1, @bot.reload.consecutive_webhook_failures
++  end
++
++  test "ten failed deliveries in a row suspend the bot, which is then never called again" do
++    stub_webhook status: 500
++
++    10.times { deliver }
++
++    assert_predicate @bot.reload, :failing_webhook?
++    assert_requested :post, WEBHOOK_URL, times: 10
++
++    deliver
++
++    assert_requested :post, WEBHOOK_URL, times: 10
++  end
++
++  test "a successful delivery between failures keeps the bot from being suspended" do
++    9.times do
++      stub_webhook status: 500
++      deliver
++    end
++    stub_webhook status: 204
++    deliver
++
++    stub_webhook status: 500
++    deliver
++
++    assert_not @bot.reload.suspended?
++    assert_equal 1, @bot.consecutive_webhook_failures
++  end
++
++  test "a suspended bot isn't called" do
++    @bot.suspend!(:flooding)
++
++    deliver
++
++    assert_not_requested :post, WEBHOOK_URL
++  end
++
++  test "a bot suspended while its webhook is being called posts no reply" do
++    stub_webhook body: "Deployed", content_type: "text/plain"
++    Bot.find(@bot.id).suspend!(:flooding) # Suspended by another request, while this one holds the bot it was given
++
++    assert_no_difference -> { Message.count } do
++      assert_nothing_raised { deliver }
++    end
++    assert_requested :post, WEBHOOK_URL
++  end
++
++  test "a reply counts towards the bot's message limit" do
++    9.times { @bot.post_message(@room, body: Bot.html_from_text("Hello")) }
++    stub_webhook body: "Deployed", content_type: "text/plain"
++
++    assert_difference -> { @room.messages.count }, +1 do
++      deliver
++    end
++
++    assert_no_difference -> { Message.count } do
++      deliver # The eleventh message is over the limit, so this reply is refused
++    end
++    assert_equal 10, @bot.user.messages.count
++  end
++
++  test "a reply past the message limit isn't posted, and starts the cooldown" do
++    10.times { @bot.post_message(@room, body: Bot.html_from_text("Hello")) }
++    stub_webhook body: "Deployed", content_type: "text/plain"
++
++    assert_no_difference -> { Message.count } do
++      assert_nothing_raised { deliver }
++    end
++    assert_predicate @bot.reload.cooldown_until, :future?
++  end
++
++  test "a reply refused during a cooldown counts as an attempt, so five of them suspend the bot" do
++    10.times { @bot.post_message(@room, body: Bot.html_from_text("Hello")) }
++    stub_webhook body: "Deployed", content_type: "text/plain"
++
++    deliver # The eleventh starts the cooldown
++    4.times { deliver }
++    assert_not @bot.reload.suspended?
++
++    deliver
++
++    assert_predicate @bot.reload, :flooding?
++  end
++
++  test "a delivery that's refused a reply still counts as delivered" do
++    10.times { @bot.post_message(@room, body: Bot.html_from_text("Hello")) }
++    stub_webhook body: "Deployed", content_type: "text/plain"
++    9.times { @bot.webhook_failed }
++
++    deliver
++
++    assert_equal 0, @bot.reload.consecutive_webhook_failures
++  end
++
++  private
++    def deliver
++      Bot::Webhook.new(@bot, Bot::Webhook::Payload.new(@bot, @message)).deliver
++    end
++
++    def stub_webhook(status: 200, body: nil, content_type: nil)
++      headers = content_type ? { "Content-Type" => content_type } : {}
++      stub_request(:post, WEBHOOK_URL).to_return(status: status, body: body, headers: headers)
++    end
++
++    def mention_message(body)
++      @room.messages.create!(creator: users(:kevin), body: "<div>#{body}</div>")
++    end
++end
+diff --git a/test/models/bot_test.rb b/test/models/bot_test.rb
+new file mode 100644
+index 0000000..764ae51
+--- /dev/null
++++ b/test/models/bot_test.rb
+@@ -0,0 +1,245 @@
++require "test_helper"
++
++class BotTest < ActiveSupport::TestCase
++  test "a member can't create a bot past the account's limit" do
++    accounts(:signal).update!(bots_per_member: 1)
++    create_bot(creator: users(:kevin))
++
++    bot = Bot.new(name: "Second Bot", creator: users(:kevin))
++
++    assert_no_difference -> { Bot.count } do
++      assert_no_difference -> { User.count } do
++        assert_not bot.save
++      end
++    end
++    assert_includes bot.errors[:base], "You’ve reached the limit of 1 chat bot."
++  end
++
++  test "the limit message is plural past one bot" do
++    accounts(:signal).update!(bots_per_member: 2)
++    2.times { create_bot(creator: users(:kevin)) }
++
++    bot = Bot.new(name: "Third Bot", creator: users(:kevin))
++
++    assert_not bot.valid?
++    assert_includes bot.errors[:base], "You’ve reached the limit of 2 chat bots."
++  end
++
++  test "the limit is only checked when a bot is created" do
++    accounts(:signal).update!(bots_per_member: 1)
++    bot = create_bot(creator: users(:kevin))
++    accounts(:signal).update!(bots_per_member: 0)
++
++    bot.update!(name: "Renamed Bot")
++
++    assert_equal "Renamed Bot", bot.reload.name
++  end
++
++  test "administrators aren't limited when creating bots" do
++    accounts(:signal).update!(bots_per_member: 0)
++
++    assert_predicate create_bot(creator: users(:david)), :persisted?
++  end
++
++  test "creating a bot gives it a code of its own" do
++    first = create_bot
++    second = create_bot(name: "Second Bot")
++
++    assert_predicate first.code, :present?
++    assert_not_equal first.code, second.code
++  end
++
++  test "creating a bot creates a user for it, named like the bot" do
++    assert_difference -> { User.count }, +1 do
++      @bot = create_bot(name: "Deploy Bot")
++    end
++
++    assert_equal "Deploy Bot", @bot.user.name
++    assert_equal "Deploy Bot", @bot.name
++    assert_not @bot.user.administrator?
++  end
++
++  test "renaming a bot renames its user" do
++    bot = create_bot(name: "Deploy Bot")
++
++    bot.update! name: "Release Bot"
++
++    assert_equal "Release Bot", bot.user.reload.name
++  end
++
++  test "a bot needs a name" do
++    bot = Bot.new(creator: users(:david), name: "")
++
++    assert_not bot.valid?
++    assert_includes bot.errors[:name], "can't be blank"
++  end
++
++  test "the creator defaults to the current user" do
++    Current.set(user: users(:kevin)) do
++      assert_equal users(:kevin), Bot.create!(name: "Deploy Bot").creator
++    end
++  end
++
++  test "a bot's creator is the user who set it up" do
++    bot = create_bot(creator: users(:jz))
++
++    assert_includes users(:jz).bots, bot
++    assert_not_includes users(:david).bots, bot
++  end
++
++  test "authenticate finds the bot for its code" do
++    bot = create_bot
++
++    assert_equal bot, Bot.authenticate(bot.code)
++  end
++
++  test "authenticate rejects blank and unknown codes" do
++    create_bot
++
++    assert_nil Bot.authenticate(nil)
++    assert_nil Bot.authenticate("")
++    assert_nil Bot.authenticate("unknown")
++  end
++
++  test "authenticate rejects bots whose user has been banned" do
++    bot = create_bot
++    bot.user.banned!
++
++    assert_nil Bot.authenticate(bot.code)
++  end
++
++  test "deactivating a bot's user deletes the bot and its code" do
++    bot = create_bot
++    code = bot.code
++
++    bot.user.deactivate
++
++    assert_nil Bot.find_by(id: bot.id)
++    assert_nil Bot.authenticate(code)
++    assert_predicate bot.user.reload, :deactivated?
++  end
++
++  test "deactivating a bot's user keeps the bot's messages" do
++    bot = create_bot
++    message = rooms(:hq).messages.create!(creator: bot.user, body: "Still here")
++
++    bot.user.deactivate
++
++    assert_equal bot.user, message.reload.creator
++  end
++
++  test "a new bot joins no open rooms unless it's set to add to all of them" do
++    bot = create_bot
++
++    assert_not bot.add_to_all_open_rooms?
++    assert_empty bot.user.memberships
++  end
++
++  test "a bot set to add to all open rooms joins every open room when it's created" do
++    bot = create_bot(add_to_all_open_rooms: true)
++
++    assert_equal Rooms::Open.pluck(:id).sort, bot.user.memberships.pluck(:room_id).sort
++  end
++
++  test "turning the switch on joins every open room, and turning it off keeps the memberships" do
++    bot = create_bot
++    assert_empty bot.user.memberships
++
++    bot.update! add_to_all_open_rooms: true
++    assert_equal Rooms::Open.count, bot.user.memberships.count
++
++    bot.update! add_to_all_open_rooms: false
++    assert_equal Rooms::Open.count, bot.user.memberships.count
++  end
++
++  test "turning the switch off stops the bot joining open rooms created later" do
++    bot = create_bot(add_to_all_open_rooms: true)
++    bot.update! add_to_all_open_rooms: false
++
++    room = Rooms::Open.create!(name: "Later", creator: users(:david))
++
++    assert_not room.users.include?(bot.user)
++  end
++
++  test "the switch never gives a bot access to closed rooms" do
++    bot = create_bot
++
++    bot.update! add_to_all_open_rooms: true
++
++    assert_empty bot.user.memberships.joins(:room).where.not(rooms: { type: "Rooms::Open" })
++  end
++
++  test "saving a bot that's already in every open room adds nothing" do
++    bot = create_bot(add_to_all_open_rooms: true)
++
++    assert_no_difference -> { Membership.count } do
++      bot.update! name: "Renamed Bot"
++    end
++  end
++
++  test "a bot set to add to all open rooms joins open rooms created later" do
++    bot = create_bot(add_to_all_open_rooms: true)
++
++    room = Rooms::Open.create!(name: "Later", creator: users(:david))
++
++    assert room.users.include?(bot.user)
++  end
++
++  test "a bot not set to add to all open rooms doesn't join open rooms created later" do
++    bot = create_bot
++
++    room = Rooms::Open.create!(name: "Later", creator: users(:david))
++
++    assert_not room.users.include?(bot.user)
++    assert room.users.include?(users(:david))
++  end
++
++  test "a bot set to add to all open rooms joins open rooms that become open later" do
++    bot = create_bot(add_to_all_open_rooms: true)
++    room = rooms(:designers).becomes!(Rooms::Open)
++
++    room.save!
++
++    assert room.reload.users.include?(bot.user)
++  end
++
++  test "a webhook URL is optional" do
++    assert_nil create_bot.webhook_url
++  end
++
++  test "a blank webhook URL means the bot has no webhook" do
++    bot = create_bot(webhook_url: "  ")
++
++    assert_nil bot.reload.webhook_url
++  end
++
++  test "surrounding whitespace is dropped from the webhook URL" do
++    bot = create_bot(webhook_url: " https://bot.example.com/hook \n")
++
++    assert_equal "https://bot.example.com/hook", bot.reload.webhook_url
++  end
++
++  test "webhook URLs can be http or https" do
++    assert_predicate Bot.new(name: "Deploy Bot", creator: users(:david), webhook_url: "http://bot.example.com/hook"), :valid?
++    assert_predicate Bot.new(name: "Deploy Bot", creator: users(:david), webhook_url: "https://bot.example.com:8443/hook?x=1"), :valid?
++  end
++
++  test "webhook URLs must be http or https addresses with a host" do
++    [ "ftp://bot.example.com/hook", "javascript:alert(1)", "bot.example.com/hook", "https://", "not a url" ].each do |url|
++      bot = Bot.new(name: "Deploy Bot", creator: users(:david), webhook_url: url)
++
++      assert_not bot.valid?, "expected #{url.inspect} to be refused"
++      assert_includes bot.errors[:webhook_url], "must be an http or https address"
++    end
++  end
++
++  test "a bot can be given a webhook URL after it is created, and then have it removed" do
++    bot = create_bot
++
++    bot.update! webhook_url: "https://bot.example.com/hook"
++    assert_equal "https://bot.example.com/hook", bot.reload.webhook_url
++
++    bot.update! webhook_url: ""
++    assert_nil bot.reload.webhook_url
++  end
++end
+diff --git a/test/models/message_test.rb b/test/models/message_test.rb
+index 3cd12c1..2ff8587 100644
+--- a/test/models/message_test.rb
++++ b/test/models/message_test.rb
+@@ -9,6 +9,30 @@ class MessageTest < ActiveSupport::TestCase
+     end
+   end
+ 
++  test "a message that mentions a bot enqueues the bot webhook job to run later" do
++    bot = create_bot
++
++    assert_enqueued_with job: Bot::WebhookJob do
++      rooms(:hq).messages.create!(creator: users(:kevin), body: "<div>#{mention_attachment_for(bot.user)} hi</div>")
++    end
++  end
++
++  test "a message without any mention enqueues no webhook job" do
++    assert_no_enqueued_jobs only: Bot::WebhookJob do
++      rooms(:hq).messages.create!(creator: users(:kevin), body: "<div>Hello</div>")
++    end
++  end
++
++  test "posting a message never calls the mentioned bot's webhook itself" do
++    bot = create_bot
++    stub_request(:post, "https://bot.example.com/hook").to_return(status: 204)
++    bot.update! webhook_url: "https://bot.example.com/hook"
++
++    rooms(:hq).messages.create!(creator: users(:kevin), body: "<div>#{mention_attachment_for(bot.user)} hi</div>")
++
++    assert_not_requested :post, "https://bot.example.com/hook"
++  end
++
+   test "all emoji" do
+     assert Message.new(body: "😄🤘").plain_text_body.all_emoji?
+     assert_not Message.new(body: "Haha! 😄🤘").plain_text_body.all_emoji?
+diff --git a/test/models/room/bot_joined_test.rb b/test/models/room/bot_joined_test.rb
+new file mode 100644
+index 0000000..06c609a
+--- /dev/null
++++ b/test/models/room/bot_joined_test.rb
+@@ -0,0 +1,167 @@
++require "test_helper"
++
++class Room::BotJoinedTest < ActiveSupport::TestCase
++  WEBHOOK_URL = "https://bot.example.com/hook"
++
++  setup do
++    @bot = create_bot(name: "Deploy Bot", webhook_url: WEBHOOK_URL)
++    @room = rooms(:designers)
++  end
++
++  test "a bot granted membership of a room is told it has joined, once, through its webhook" do
++    assert_enqueued_with job: Bot::JoinedJob, args: [ @bot, @room ] do
++      @room.memberships.grant_to @bot.user
++    end
++  end
++
++  test "granting a membership the bot already has tells it nothing more" do
++    @room.memberships.grant_to @bot.user
++
++    assert_no_enqueued_jobs only: Bot::JoinedJob do
++      @room.memberships.grant_to @bot.user
++    end
++  end
++
++  test "a bot removed from a room and added back is told only the first time" do
++    @room.memberships.grant_to @bot.user
++    @room.memberships.revoke_from @bot.user
++
++    assert_no_enqueued_jobs only: Bot::JoinedJob do
++      @room.memberships.grant_to @bot.user
++    end
++    assert_equal 1, Bot::JoinedRoom.where(bot: @bot, room: @room).count
++  end
++
++  test "a bot that's suspended isn't told it has joined, and the join isn't recorded as telling it" do
++    @bot.suspend!(:flooding)
++
++    assert_no_enqueued_jobs only: Bot::JoinedJob do
++      @room.memberships.grant_to @bot.user
++    end
++    assert_empty Bot::JoinedRoom.where(bot: @bot)
++  end
++
++  test "a join made while the bot has no webhook isn't recorded, so the bot is told when it next joins with one" do
++    plain = create_bot(name: "Plain Bot")
++    @room.memberships.grant_to plain.user
++    assert_empty Bot::JoinedRoom.where(bot: plain)
++
++    plain.update! webhook_url: WEBHOOK_URL
++    @room.memberships.revoke_from plain.user
++
++    assert_enqueued_with job: Bot::JoinedJob, args: [ plain, @room ] do
++      @room.memberships.grant_to plain.user
++    end
++  end
++
++  test "a bot listed twice in one grant is told once" do
++    assert_enqueued_jobs 1, only: Bot::JoinedJob do
++      @room.memberships.grant_to [ @bot.user, @bot.user ]
++    end
++  end
++
++  test "a person adding a bot to a closed room tells the bot" do
++    assert_enqueued_with job: Bot::JoinedJob, args: [ @bot, @room ] do
++      @room.memberships.revise(granted: [ @bot.user ])
++    end
++  end
++
++  test "creating a closed room with a bot in it tells the bot" do
++    room = Rooms::Closed.create_for({ name: "Bots only", creator: users(:david) }, users: [ @bot.user ])
++
++    assert_enqueued_with job: Bot::JoinedJob, args: [ @bot, room ]
++  end
++
++  test "a bot that joins every open room, when a new open room is created, is told it has joined that room" do
++    switched = create_bot(name: "Switched Bot", webhook_url: WEBHOOK_URL, add_to_all_open_rooms: true)
++
++    room = Rooms::Open.create!(name: "Later", creator: users(:david))
++
++    assert_enqueued_with job: Bot::JoinedJob, args: [ switched, room ]
++  end
++
++  test "turning the switch on tells the bot it has joined each open room" do
++    switched = create_bot(name: "Switched Bot", webhook_url: WEBHOOK_URL)
++
++    assert_enqueued_jobs Rooms::Open.count, only: Bot::JoinedJob do
++      switched.update! add_to_all_open_rooms: true
++    end
++  end
++
++  test "a bot created with the switch on is told it has joined each open room" do
++    assert_enqueued_jobs Rooms::Open.count, only: Bot::JoinedJob do
++      create_bot(name: "Switched Bot", webhook_url: WEBHOOK_URL, add_to_all_open_rooms: true)
++    end
++  end
++
++  test "joins made while a bot has no webhook aren't announced once it gets one" do
++    plain = create_bot(name: "Plain Bot", add_to_all_open_rooms: true)
++    assert_equal Rooms::Open.count, plain.user.memberships.count
++
++    assert_no_enqueued_jobs only: Bot::JoinedJob do
++      plain.update! webhook_url: WEBHOOK_URL
++    end
++  end
++
++  test "saving a bot that's already in every open room tells it nothing" do
++    switched = create_bot(name: "Switched Bot", webhook_url: WEBHOOK_URL, add_to_all_open_rooms: true)
++
++    assert_no_enqueued_jobs only: Bot::JoinedJob do
++      switched.update! name: "Renamed Bot"
++    end
++  end
++
++  test "direct rooms never tell a bot it has joined" do
++    Current.set(user: users(:david)) do
++      assert_no_enqueued_jobs only: Bot::JoinedJob do
++        Rooms::Direct.find_or_create_for(users(:kevin, :david).push(@bot.user))
++      end
++    end
++  end
++
++  test "bots without a webhook aren't told" do
++    @bot.update! webhook_url: nil
++
++    assert_no_enqueued_jobs only: Bot::JoinedJob do
++      @room.memberships.grant_to @bot.user
++    end
++  end
++
++  test "banned bots aren't told" do
++    @bot.user.banned!
++
++    assert_no_enqueued_jobs only: Bot::JoinedJob do
++      @room.memberships.grant_to @bot.user
++    end
++  end
++
++  test "people are never told, since only bots have webhooks" do
++    assert_no_enqueued_jobs only: Bot::JoinedJob do
++      @room.memberships.grant_to users(:kevin)
++    end
++  end
++
++  test "a grant that's rolled back tells no one, and records nothing" do
++    assert_no_difference -> { Bot::JoinedRoom.count } do
++      assert_no_enqueued_jobs only: Bot::JoinedJob do
++        Room.transaction do
++          @room.memberships.grant_to @bot.user
++          raise ActiveRecord::Rollback
++        end
++      end
++    end
++  end
++
++  test "deleting a room or a bot forgets its joins, without failing" do
++    @room.memberships.grant_to @bot.user
++    assert_equal 1, Bot::JoinedRoom.where(room: @room).count
++
++    assert_nothing_raised { @room.destroy! }
++    assert_empty Bot::JoinedRoom.where(bot: @bot)
++
++    other = rooms(:hq)
++    other.memberships.grant_to @bot.user
++    assert_nothing_raised { @bot.user.deactivate }
++    assert_empty Bot::JoinedRoom.where(room: other)
++  end
++end
+diff --git a/test/models/rooms/open_test.rb b/test/models/rooms/open_test.rb
+index 87d9a8f..53d00dc 100644
+--- a/test/models/rooms/open_test.rb
++++ b/test/models/rooms/open_test.rb
+@@ -11,4 +11,26 @@ class Rooms::OpenTest < ActiveSupport::TestCase
+     room.save!
+     assert_equal User.count, room.users.count
+   end
++
++  test "grants access to people, but not to bots unless they add to all open rooms, after creation" do
++    plain_bot = create_bot(name: "Plain Bot")
++    switched_bot = create_bot(name: "Switched Bot", add_to_all_open_rooms: true)
++
++    room = Rooms::Open.create!(name: "Later", creator: users(:david))
++
++    assert_includes room.users, switched_bot.user
++    assert_not_includes room.users, plain_bot.user
++    assert_equal User.active.joining_open_rooms.count, room.users.count
++  end
++
++  test "grants access to bots that add to all open rooms after becoming open, but not other bots" do
++    plain_bot = create_bot(name: "Plain Bot")
++    switched_bot = create_bot(name: "Switched Bot", add_to_all_open_rooms: true)
++
++    room = rooms(:watercooler).becomes!(Rooms::Open)
++    room.save!
++
++    assert_includes room.users, switched_bot.user
++    assert_not_includes room.users, plain_bot.user
++  end
+ end
+diff --git a/test/models/user_test.rb b/test/models/user_test.rb
+index efeda3c..71c71ce 100644
+--- a/test/models/user_test.rb
++++ b/test/models/user_test.rb
+@@ -12,6 +12,60 @@ class UserTest < ActiveSupport::TestCase
+     end
+   end
+ 
++  test "creating a bot's user doesn't grant membership to the open rooms" do
++    assert_no_difference -> { Membership.count } do
++      create_bot
++    end
++  end
++
++  test "joining_open_rooms leaves out bots that don't add to all open rooms, and keeps people and bots that do" do
++    plain_bot = create_bot(name: "Plain Bot")
++    switched_bot = create_bot(name: "Switched Bot", add_to_all_open_rooms: true)
++
++    joining = User.joining_open_rooms
++
++    assert_includes joining, users(:kevin)
++    assert_includes joining, switched_bot.user
++    assert_not_includes joining, plain_bot.user
++  end
++
++  test "members can add bots up to the account's limit" do
++    accounts(:signal).update!(bots_per_member: 2)
++
++    assert users(:kevin).can_add_bots?
++    create_bot(creator: users(:kevin))
++    assert users(:kevin).can_add_bots?
++    create_bot(creator: users(:kevin))
++    assert_not users(:kevin).can_add_bots?
++  end
++
++  test "administrators can always add bots" do
++    accounts(:signal).update!(bots_per_member: 0)
++    create_bot(creator: users(:david))
++
++    assert users(:david).can_add_bots?
++    assert users(:jason).can_add_bots?
++    assert_not users(:kevin).can_add_bots?
++  end
++
++  test "bots that other people created don't count toward a member's limit" do
++    accounts(:signal).update!(bots_per_member: 1)
++    create_bot(creator: users(:david))
++    create_bot(creator: users(:jason))
++
++    assert users(:kevin).can_add_bots?
++  end
++
++  test "deleted bots don't count toward a member's limit" do
++    accounts(:signal).update!(bots_per_member: 1)
++    bot = create_bot(creator: users(:kevin))
++    assert_not users(:kevin).can_add_bots?
++
++    bot.user.deactivate
++
++    assert users(:kevin).can_add_bots?
++  end
++
+   test "deactivating a user deletes push subscriptions, searches, memberships for non-direct rooms, and changes their email address" do
+     assert_difference -> { Membership.count }, -users(:david).memberships.without_direct_rooms.count do
+     assert_difference -> { Push::Subscription.count }, -users(:david).push_subscriptions.count do
+diff --git a/test/test_helper.rb b/test/test_helper.rb
+index deb2830..b98a7f1 100644
+--- a/test/test_helper.rb
++++ b/test/test_helper.rb
+@@ -16,7 +16,7 @@ class ActiveSupport::TestCase
+   # Setup all fixtures in test/fixtures/*.yml for all tests in alphabetical order.
+   fixtures :all
+ 
+-  include SessionTestHelper, MentionTestHelper, TurboTestHelper, NetworkTestHelper
++  include BotTestHelper, SessionTestHelper, MentionTestHelper, TurboTestHelper, NetworkTestHelper
+ 
+   setup do
+     ActionCable.server.pubsub.clear
+diff --git a/test/test_helpers/bot_test_helper.rb b/test/test_helpers/bot_test_helper.rb
+new file mode 100644
+index 0000000..2839481
+--- /dev/null
++++ b/test/test_helpers/bot_test_helper.rb
+@@ -0,0 +1,5 @@
++module BotTestHelper
++  def create_bot(name: "Deploy Bot", creator: users(:david), **attributes)
++    Bot.create!(name: name, creator: creator, **attributes)
++  end
++end
+diff --git a/test/test_helpers/mention_test_helper.rb b/test/test_helpers/mention_test_helper.rb
+index 81337c3..3bf1dc4 100644
+--- a/test/test_helpers/mention_test_helper.rb
++++ b/test/test_helpers/mention_test_helper.rb
+@@ -1,6 +1,6 @@
+ module MentionTestHelper
+   def mention_attachment_for(name)
+-    user = users(name)
++    user = name.is_a?(User) ? name : users(name)
+     attachment_body = ApplicationController.render partial: "users/mention", locals: { user: user }
+     "<action-text-attachment sgid=\"#{user.attachable_sgid}\" content-type=\"application/vnd.campfire.mention\" content=\"#{attachment_body.gsub('"', '&quot;')}\"></action-text-attachment>"
+   end

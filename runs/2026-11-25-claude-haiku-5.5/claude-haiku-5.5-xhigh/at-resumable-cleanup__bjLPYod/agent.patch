@@ -1,0 +1,191 @@
+diff --git a/app/jobs/title_cleanup_job.rb b/app/jobs/title_cleanup_job.rb
+index 13721ed..da34f1f 100644
+--- a/app/jobs/title_cleanup_job.rb
++++ b/app/jobs/title_cleanup_job.rb
+@@ -1,11 +1,29 @@
+ class TitleCleanupJob < ApplicationJob
++  # Strips the quotes the legacy exporter wrapped around each leaf title, in id order.
++  #
++  # Progress is recorded in TitleCleanupCursor in the same transaction as each title update,
++  # so an interrupted run resumes at the leaf it was on instead of cleaning titles again.
+   def perform
+-    Leaf.find_each(order: :asc) do |leaf|
+-      leaf.update!(title: cleaned(leaf.title))
++    Leaf.where("id > ?", TitleCleanupCursor.current.leaf_id).find_each(order: :asc) do |leaf|
++      clean(leaf)
+     end
+   end
+ 
+   private
++    def clean(leaf)
++      # Always its own transaction or savepoint, so a failure rolls back this title along with
++      # its progress, even when called inside a caller's transaction.
++      Leaf.transaction(requires_new: true) do
++        cursor = TitleCleanupCursor.current
++
++        # Checked inside the transaction: an overlapping run may already have cleaned this leaf.
++        if leaf.id > cursor.leaf_id
++          leaf.update!(title: cleaned(leaf.title))
++          cursor.update!(leaf_id: leaf.id)
++        end
++      end
++    end
++
+     def cleaned(title)
+       title.delete_prefix('"').delete_suffix('"')
+     end
+diff --git a/app/models/title_cleanup_cursor.rb b/app/models/title_cleanup_cursor.rb
+new file mode 100644
+index 0000000..48378c4
+--- /dev/null
++++ b/app/models/title_cleanup_cursor.rb
+@@ -0,0 +1,6 @@
++# Progress of TitleCleanupJob. Every leaf with an id up to and including leaf_id has been cleaned.
++class TitleCleanupCursor < ApplicationRecord
++  def self.current
++    first_or_create!
++  end
++end
+diff --git a/db/migrate/20261123152200_create_title_cleanup_cursors.rb b/db/migrate/20261123152200_create_title_cleanup_cursors.rb
+new file mode 100644
+index 0000000..a4c8a6d
+--- /dev/null
++++ b/db/migrate/20261123152200_create_title_cleanup_cursors.rb
+@@ -0,0 +1,7 @@
++class CreateTitleCleanupCursors < ActiveRecord::Migration[8.0]
++  def change
++    create_table :title_cleanup_cursors do |t|
++      t.integer :leaf_id, null: false, default: 0
++    end
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index e033199..dfb019e 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.0].define(version: 2024_09_28_005927) do
++ActiveRecord::Schema[8.0].define(version: 2026_11_23_152200) do
+   create_table "accesses", force: :cascade do |t|
+     t.integer "user_id", null: false
+     t.integer "book_id", null: false
+@@ -137,6 +137,10 @@ ActiveRecord::Schema[8.0].define(version: 2024_09_28_005927) do
+     t.index ["user_id"], name: "index_sessions_on_user_id"
+   end
+ 
++  create_table "title_cleanup_cursors", force: :cascade do |t|
++    t.integer "leaf_id", default: 0, null: false
++  end
++
+   create_table "users", force: :cascade do |t|
+     t.string "name", null: false
+     t.string "email_address", null: false
+diff --git a/test/jobs/title_cleanup_job_test.rb b/test/jobs/title_cleanup_job_test.rb
+new file mode 100644
+index 0000000..9d46eb9
+--- /dev/null
++++ b/test/jobs/title_cleanup_job_test.rb
+@@ -0,0 +1,100 @@
++require "test_helper"
++
++class TitleCleanupJobTest < ActiveSupport::TestCase
++  class Interrupted < StandardError; end
++
++  setup do
++    @originals = {}
++    Leaf.order(:id).each_with_index do |leaf, index|
++      # Titles that legitimately open with a quoted phrase, wrapped the way the legacy exporter did.
++      @originals[leaf.id] = %("Quoted" phrase #{index + 1})
++      leaf.update!(title: %("#{@originals[leaf.id]}"))
++    end
++    @wrapped = @originals.transform_values { |original| %("#{original}") }
++  end
++
++  test "strips the exporter's wrapper once and keeps inner quotes" do
++    TitleCleanupJob.perform_now
++
++    assert_equal @originals, titles
++  end
++
++  test "running again after completion changes nothing" do
++    TitleCleanupJob.perform_now
++    TitleCleanupJob.perform_now
++
++    assert_equal @originals, titles
++  end
++
++  test "an interrupted run resumes at the leaf it was on" do
++    ids = Leaf.order(:id).pluck(:id)
++
++    cleaned = []
++    assert_raises(Interrupted) { job_recording(cleaned, interrupt_after: 2).perform_now }
++    assert_equal ids.first(2), cleaned
++
++    resumed = []
++    job_recording(resumed).perform_now
++    assert_equal ids.drop(2), resumed
++    assert_equal @originals, titles
++  end
++
++  test "a title is only saved together with its progress" do
++    ids = Leaf.order(:id).pluck(:id)
++
++    # The second leaf's title is written, then saving its progress fails: a crash at that point.
++    # This happens inside a caller's transaction, which must not keep the title on its own.
++    Leaf.transaction do
++      with_progress_save_failing_for(ids.second) do
++        assert_raises(ActiveRecord::StatementInvalid) { TitleCleanupJob.perform_now }
++      end
++    end
++    assert_equal @wrapped.merge(ids.first => @originals[ids.first]), titles
++
++    TitleCleanupJob.perform_now
++    assert_equal @originals, titles
++  end
++
++  test "an overlapping run never cleans a leaf the cursor has already passed" do
++    ids = Leaf.order(:id).pluck(:id)
++    job = TitleCleanupJob.new
++    job.define_singleton_method(:clean) do |leaf|
++      # Another run finishes the whole collection after this run has loaded its batch.
++      TitleCleanupCursor.current.update!(leaf_id: ids.last)
++      super(leaf)
++    end
++
++    job.perform_now
++
++    assert_equal @wrapped, titles
++    assert_equal ids.last, TitleCleanupCursor.current.leaf_id
++  end
++
++  private
++    def titles
++      Leaf.pluck(:id, :title).to_h
++    end
++
++    # A job that records each leaf it cleans, and raises Interrupted before cleaning the next
++    # leaf once `interrupt_after` leaves have been cleaned.
++    def job_recording(cleaned, interrupt_after: nil)
++      TitleCleanupJob.new.tap do |job|
++        job.define_singleton_method(:clean) do |leaf|
++          raise Interrupted if cleaned.size == interrupt_after
++          cleaned << leaf.id
++          super(leaf)
++        end
++      end
++    end
++
++    def with_progress_save_failing_for(leaf_id)
++      ActiveRecord::Base.connection.execute <<~SQL
++        CREATE TRIGGER fail_title_cleanup_progress BEFORE UPDATE ON title_cleanup_cursors
++        WHEN NEW.leaf_id = #{Integer(leaf_id)}
++        BEGIN SELECT RAISE(ABORT, 'interrupted'); END
++      SQL
++      yield
++    ensure
++      ActiveRecord::Base.connection.execute "DROP TRIGGER IF EXISTS fail_title_cleanup_progress"
++    end
++end

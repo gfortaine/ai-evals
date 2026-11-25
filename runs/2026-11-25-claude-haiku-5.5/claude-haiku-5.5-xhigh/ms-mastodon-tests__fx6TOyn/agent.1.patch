@@ -1,0 +1,325 @@
+diff --git a/docs/rspec-performance.md b/docs/rspec-performance.md
+new file mode 100644
+index 0000000..3103ac4
+--- /dev/null
++++ b/docs/rspec-performance.md
+@@ -0,0 +1,247 @@
++# RSpec performance notes
++
++Living document for the effort to bring the RSpec run time down (it had grown past
++10 minutes on CI without parallelization). Keep it up to date when you run another
++optimization phase: add measurements to the "Results log" and new findings to
++"Findings", so the next run does not have to rediscover them.
++
++## Scope and status
++
++| Phase | Scope | Status |
++| --- | --- | --- |
++| 1 | `spec/models` (target: >= 30-35% faster) | Done: about 62-66% faster (2.6-3x), see "Results log" |
++| 2 | `spec/requests` (target: `spec/models` + `spec/requests` together >= 2x faster than the original baseline) | Not started |
++| 3 | Factories (`spec/fabricators`; "do not touch" until this phase) | Not started |
++
++Ignored everywhere: `spec/system` and streaming-related specs.
++
++Rules followed in phase 1:
++- No app code changes. Only spec configuration, spec support and one stray spec line.
++- No changes to what examples assert. Examples were not refactored.
++- Factories untouched.
++- Other spec types (`spec/requests`, etc.) were not optimized, but note that some
++  changes are process-wide (see "Process-wide changes").
++
++## How to measure
++
++- Run one folder at a time: `bundle exec rspec spec/models`. Never run the whole
++  suite in this environment (it times out).
++- Never run two spec processes at the same time. They share the `mastodon_test`
++  database and the local Redis, so results are wrong and noisy.
++- Use a fixed seed so runs are comparable, and compare at least two seeds. Run
++  order is random by default. The `.rspec`/config do not fix the seed.
++- Record the example time from RSpec's summary ("Finished in ...") and the wall
++  time (`time`). Expect about 2 s of boot on top of the example time.
++- Single-run noise is roughly +/-5%. Use two or more seeds before concluding.
++- JSON output for per-example analysis:
++  `bundle exec rspec spec/models --seed 4242 --format progress --format json --out /tmp/models.json`
++  - `summary.duration` is the example time.
++  - `examples[].run_time` and `examples[].file_path` give the per-file breakdown.
++- Profiling with StackProf, without touching the repo. Put this in a file outside the
++  repo and load it with `-r` (`stackprof` is in the bundle):
++
++  ```ruby
++  # /tmp/stackprof_hook.rb
++  require 'stackprof'
++  StackProf.start(mode: :cpu, interval: 500, raw: true)
++  at_exit { StackProf.stop; StackProf.results(ENV.fetch('STACKPROF_OUT', '/tmp/models.dump')) }
++  ```
++
++  ```sh
++  STACKPROF_OUT=/tmp/models_cpu.dump bundle exec rspec spec/models -r /tmp/stackprof_hook.rb --seed 4242
++  bundle exec stackprof /tmp/models_cpu.dump --text --limit 40        # self time
++  bundle exec stackprof /tmp/models_cpu.dump --method 'Some#method'   # callers/callees
++  ```
++
++  Profiling adds roughly 3-5% overhead, so do not use profiled runs for the numbers.
++  Inclusive % (frames that appear anywhere on the stack) was the most useful view:
++  parse the raw dump with `Marshal.load` and count each frame once per sample.
++
++## Environment (baseline and phase 1)
++
++- aarch64 Linux container, Ruby 4.0.6 (YJIT compiled in, disabled by default),
++  Rails 8.1.3.1, RSpec 3.13 / rspec-rails 8.0.4, Sidekiq 8.1.6 (`Sidekiq::Testing`
++  inline mode in specs), Devise 5.0.4, Fabrication 3.0.0, WebMock 3.26.
++- PostgreSQL and Redis on localhost. The DB is `mastodon_test`.
++- CPU-bound: `user` time is about equal to wall time, so DB/Redis round trips are
++  not the bottleneck. CPU in Ruby is.
++
++## Baseline (original code)
++
++`spec/models`: 152 files, 1795 examples, 0 failures.
++
++| Seed | Example time | Wall time |
++| --- | --- | --- |
++| 4242 | 123.85 s | 2m05.8s |
++| 1234 | 124.96 s | - |
++| 98765 | 133.25 s | - |
++
++Per-example run time (seed 4242): median 26 ms, p90 174 ms, p99 718 ms, max 3.0 s,
++min 1.2 ms. Hook overhead for a trivial example is about 0.7 ms (measured with 500
++empty examples), so per-example hooks are not a problem by themselves.
++
++Slowest files at baseline (total example time):
++
++| File | Time | Examples |
++| --- | --- | --- |
++| `account_statuses_cleanup_policy_spec.rb` | 11.9 s | 36 |
++| `trends/statuses_spec.rb` | 10.8 s | 12 |
++| `tag_feed_spec.rb` | 9.9 s | 33 |
++| `status_spec.rb` | 9.1 s | 62 |
++| `public_feed_spec.rb` | 6.3 s | 43 |
++| `notification_spec.rb` | 5.8 s | 25 |
++| `media_attachment_spec.rb` | 5.6 s | 27 |
++| `concerns/status/threading_concern_spec.rb` | 5.2 s | 16 |
++
++Slowest single example: `MediaAttachment mp3 with large cover art` (2.7 s, real
++7.8 MB fixture, asserts real metadata extraction, so it is kept as-is).
++
++## Findings
++
++Ordered by share of CPU in the baseline profile. Shares are of total samples,
++inclusive unless noted.
++
++1. **Verbose query logs were on for the whole process (about 35% of CPU).**
++   `spec/models/concerns/status/fetch_replies_concern_spec.rb` ran
++   `ActiveRecord.verbose_query_logs = true` at describe level. That line runs at
++   file load, so it applies to the whole run, and nothing turned it back off. With
++   the flag on, every SQL statement captures a caller backtrace and cleans it with
++   `ActiveSupport::BacktraceCleaner` (`Thread.each_caller_location`, `String#sub`).
++   The Rails default is `false`.
++   *Fix:* the stray line was removed (the examples never asserted on logs), and
++   `spec/support/test_performance.rb` resets the flag before each example, so a
++   future load-time assignment cannot leak into other examples.
++
++2. **Webhook jobs run inline for every local User and Status (about 25% of CPU).**
++   `User` (`after_create_commit`) and `Status` (`after_create_commit`/`after_update_commit`)
++   enqueue `TriggerWebhookWorker`. Sidekiq inline mode runs it immediately.
++   `WebhookService#call` serializes the whole event (REST admin serializer, account
++   counters, roles, and so on) *before* it asks which webhooks are enabled. In a
++   normal spec, no webhook is enabled, so that payload is built and dropped.
++   *Fix (spec-only):* `spec/support/test_performance.rb` wraps
++   `TriggerWebhookWorker.perform_async` for `type: :model` and calls it only if
++   `Webhook.enabled.exists?`. Specs that stub `perform_async` themselves
++   (`user_spec.rb`, `user/confirmation_spec.rb`) are unaffected, because their stubs
++   are defined later. Specs that enable a webhook still run the real pipeline.
++   *Candidate app-level fix (not done, it is app code):* check for matching enabled
++   webhooks before serializing in `WebhookService#call`. That would also help
++   production, not just tests.
++
++3. **Devise password hashing (about 3000 bcrypt digests per run, about 8% of CPU
++   once 1 and 2 were fixed).**
++   Every user built by a fabricator hashes its password, and every local account
++   builds a user, so every `Fabricate(:status)` (which builds a local account) hashes
++   too. A minimum-cost bcrypt digest (`stretches = 1` in test is clamped to bcrypt's
++   minimum cost of 4) takes about 1.2 ms and cannot be made cheaper.
++   *Fix (model specs only):* `spec/support/test_performance.rb` memoizes
++   `Devise::Encryptor.digest` per (model class, pepper, stretches, password). Only the
++   salt is shared, and `valid_password?` still verifies correctly. Checked that no
++   spec in `spec/models` expects distinct digests for equal passwords. The only
++   `encrypted_password` `change` expectations live in `spec/controllers`.
++
++4. **YJIT was not enabled (about 13% wall time).**
++   The production image sets `RUBY_YJIT_ENABLE=1`, but test runs did not.
++   *Fix:* `spec/spec_helper.rb` calls `RubyVM::YJIT.enable` when available. Measured:
++   same code and seed: `RUBY_YJIT_ENABLE=1` gave 47.3 s, the runtime enable 48.1 s.
++   This is process-wide (see "Process-wide changes").
++
++5. **Not addressed in phase 1, and why:**
++   - *SQL logging (about 7% of CPU, incl. `Logger` writes).* `ActiveRecord::LogSubscriber#sql`
++     formats every statement even when debug logging is off (`subscribe_log_level`
++     does not apply to `sql`). Removing it needs `ActiveRecord::LogSubscriber.detach_from :active_record`,
++     which loses SQL in `log/test.log`. CI archives `log/` as an artifact when a job fails
++     (`.github/workflows/test-ruby.yml`), so SQL debugging data is kept for now. This is
++     the cheapest remaining lever if more speed is needed.
++   - *GC (about 8-10% of CPU).* Not tunable at runtime. Only via environment
++     variables such as `RUBY_GC_HEAP_INIT_SLOTS` / `RUBY_GC_MALLOC_LIMIT`, set before
++     boot. Not measured yet.
++   - *Mailer rendering on user creation (about 4% ActionMailer, about 2% Premailer).*
++     Devise notifications render HTML and inline CSS. Changing that would change what
++     specs see in mail bodies.
++   - *Media/image processing (Paperclip, Vips, ffmpeg, about 3%).* Specs assert on
++     real thumbnails and metadata. Keep.
++   - *App validators that query the DB for each user (`UsernameBlock`,
++     `EmailDomainBlock`, `UnreservedUsernameValidator`, `UniqueUsernameValidator`,
++     about 9% combined, inclusive, overlapping parts not summed).* App code, so not touched.
++   - *`Setting` reads (about 2-4%).* `config.after` clears `Rails.cache` after every
++     example. Keeping the cache across examples would return rolled-back settings, so
++     this stays.
++   - *Fabricators (out of scope until phase 3).* `account` fabricator builds a `user`
++     for every local account. `status` fabricator builds an account when none is given
++     and creates a bookmark in `after_create`. Inclusive cost in the phase-1 profile:
++     the `status` fabricator's `after_create` bookmark block about 18%, the `account`
++     fabricator's `user` build about 9%.
++     The `account` fabricator attaches a precomputed keypair, so RSA key generation
++     (`Account#generate_keys`, about 19 ms per key) is avoided. Keep it that way.
++   - *Redis (about 5% of CPU).* Mostly the inline Sidekiq jobs and counters. Not
++     pursued.
++
++## Changes made in phase 1
++
++- `spec/models/concerns/status/fetch_replies_concern_spec.rb`: removed the load-time
++  `ActiveRecord.verbose_query_logs = true` line (finding 1).
++- `spec/support/test_performance.rb` (new): per-example verbose-log guard (finding 1),
++  webhook job skip for model specs (finding 2), memoized Devise digests for model
++  specs (finding 3).
++- `spec/spec_helper.rb`: YJIT enabled when available (finding 4).
++
++### Process-wide changes
++
++The YJIT enable in `spec/spec_helper.rb` is process-wide, so `spec/requests` gets faster
++now too. The verbose-log guard does nothing unless something sets the flag. The webhook
++skip and the digest memo are scoped to `type: :model`, so they do not change other spec
++types yet. When
++phase 2 starts, measure the `spec/requests` baseline from the original commit (stash
++the phase-1 changes) or the phase-2 gains will be misattributed.
++
++## Results log
++
++Example time from RSpec's "Finished in" line for `spec/models`. All runs: 1795
++examples, 0 failures, same seed where listed.
++
++| Change set | Seed 4242 | Seed 1234 | Seed 98765 |
++| --- | --- | --- | --- |
++| Original code | 123.85 s | 124.96 s | 133.25 s |
++| + verbose logs off (finding 1) | 74.93 s | - | - |
++| + webhook skip (finding 2) | 54.15 s | - | - |
++| + YJIT (finding 4) | 48.08 s | - | - |
++| + Devise digest memo (finding 3), final | 47.33 s | 46.01 s | 44.95 s |
++| Final code, re-run | 45.23 s (wall 47.8 s) | - | - |
++
++Final: about 62-66% less example time (2.6-3x faster). Target for phase 1 was 30-35%.
++
++Per-file example time after the change (seed 4242): `media_attachment_spec.rb`
++5.3 s, `account_statuses_cleanup_policy_spec.rb` 3.4 s, `trends/statuses_spec.rb` 2.7 s,
++`status_spec.rb` 2.6 s, `tag_feed_spec.rb` 2.4 s, `public_feed_spec.rb` 2.1 s.
++
++## Plan for next phases
++
++- **Phase 2 (`spec/requests`).** Measure the `spec/requests` baseline on the original
++  commit first. The request specs create many users, statuses and accounts, so the
++  webhook skip and the digest memo could help a lot. Consider widening them from
++  `type: :model` to all types, after checking each spec type's assertions (webhook
++  delivery assertions, query counts). Check `spec/requests` for request-level
++  webhook expectations before widening.
++- **Phase 3 (factories).** The biggest remaining costs are in fabricators:
++  `account` builds a `user` for each local account, `status` builds an account and
++  adds a bookmark in `after_create`. Lazy or shared defaults could avoid unneeded
++  rows, but they change what gets created, so review per fabricator.
++- **Optional, cheap, not done:** detach AR SQL logging in test (about 7%), tune GC via
++  environment in CI (not measured), and `WebhookService#call` early return (app code,
++  needs approval).
++- **Parallelization** is out of scope here (`bin/flatware rspec` exists in CI).
++
++## Gotchas
++
++- Don't run spec processes in parallel: they share `mastodon_test` and Redis.
++- `log/test.log` grows by tens of MB per `spec/models` run because SQL is logged, and
++  it is never truncated between runs. It is git-ignored. Clear it if disk I/O matters
++  for an experiment.
++- The webhook skip changes SQL query counts inside blocks that create users or
++  statuses, because the webhook job's queries are no longer executed. No spec in
++  `spec/models` counts queries across such a block today. Re-check when widening it.
++- `execute_queries` matchers (`spec/support/matchers/sql_queries.rb`) count all SQL
++  in a block, so they also see those queries.
++- To compare with the original code, stash only the phase-1 files
++  (`git stash push --include-untracked`). Ignored artifacts like `tmp/` and
++  `log/` do not need to move.
+diff --git a/spec/models/concerns/status/fetch_replies_concern_spec.rb b/spec/models/concerns/status/fetch_replies_concern_spec.rb
+index e9c81d4..b42a6dc 100644
+--- a/spec/models/concerns/status/fetch_replies_concern_spec.rb
++++ b/spec/models/concerns/status/fetch_replies_concern_spec.rb
+@@ -3,8 +3,6 @@
+ require 'rails_helper'
+ 
+ RSpec.describe Status::FetchRepliesConcern do
+-  ActiveRecord.verbose_query_logs = true
+-
+   let!(:alice)  { Fabricate(:account, username: 'alice') }
+   let!(:bob)    { Fabricate(:account, username: 'bob', domain: 'other.com') }
+ 
+diff --git a/spec/spec_helper.rb b/spec/spec_helper.rb
+index d6fcb8d..58e7f89 100644
+--- a/spec/spec_helper.rb
++++ b/spec/spec_helper.rb
+@@ -1,5 +1,9 @@
+ # frozen_string_literal: true
+ 
++# Speed up the whole test process with the JIT compiler, like the production image does
++# (see Dockerfile). Done here rather than via an env var so `bundle exec rspec` is fast by default.
++RubyVM::YJIT.enable if defined?(RubyVM::YJIT) && !RubyVM::YJIT.enabled?
++
+ if ENV.fetch('COVERAGE', false)
+   require 'simplecov'
+   SimpleCov.start 'rails'
+diff --git a/spec/support/test_performance.rb b/spec/support/test_performance.rb
+new file mode 100644
+index 0000000..cc5af57
+--- /dev/null
++++ b/spec/support/test_performance.rb
+@@ -0,0 +1,39 @@
++# frozen_string_literal: true
++
++# Configuration-level guards that keep the test suite fast.
++# Background, baseline metrics and the optimization plan live in docs/rspec-performance.md.
++
++RSpec.configure do |config|
++  # Verbose query logs make ActiveRecord capture and clean a backtrace for every
++  # SQL statement the suite runs (~35% of spec/models CPU time). The Rails default
++  # is `false`; nothing in the suite asserts on log output, so keep it off per
++  # example, even if a spec file flips the global at load time.
++  config.before do
++    ActiveRecord.verbose_query_logs = false
++  end
++
++  # Creating a local User or Status enqueues TriggerWebhookWorker, which Sidekiq
++  # runs inline in specs. WebhookService serializes the event *before* looking up
++  # enabled webhooks, so in most specs (no enabled webhook) ~25% of spec/models CPU
++  # went into building a payload that is never delivered. When no webhook is
++  # enabled the job has no observable effect, so skip it. Specs that create an
++  # enabled webhook still run the real pipeline. Specs that stub perform_async
++  # themselves are unaffected, since their stubs are defined after this one.
++  config.before(:each, type: :model) do
++    allow(TriggerWebhookWorker).to receive(:perform_async).and_wrap_original do |original, *args|
++      original.call(*args) if Webhook.enabled.exists?
++    end
++  end
++
++  # Devise bcrypt-hashes the password of every user built by a fabricator (~1.2ms
++  # each, even at bcrypt's minimum cost of 4), and local accounts build a user too,
++  # so a spec/models run hashed ~3000 times. Specs only use a few passwords, and
++  # `valid_password?` still verifies a memoized digest, so reuse one digest per
++  # (model, pepper, stretches, password). Only the random salt is shared.
++  password_digests = {}
++  config.before(:each, type: :model) do
++    allow(Devise::Encryptor).to receive(:digest).and_wrap_original do |original, klass, password|
++      password_digests[[klass, klass.pepper, klass.stretches, password]] ||= original.call(klass, password)
++    end
++  end
++end

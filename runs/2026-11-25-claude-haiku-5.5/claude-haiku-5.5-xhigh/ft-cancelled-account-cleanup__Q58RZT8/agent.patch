@@ -1,0 +1,418 @@
+diff --git a/app/jobs/account/incinerate_due_job.rb b/app/jobs/account/incinerate_due_job.rb
+new file mode 100644
+index 0000000..e5e9982
+--- /dev/null
++++ b/app/jobs/account/incinerate_due_job.rb
+@@ -0,0 +1,5 @@
++class Account::IncinerateDueJob < ApplicationJob
++  def perform
++    Account.incinerate_due
++  end
++end
+diff --git a/app/models/account.rb b/app/models/account.rb
+index a6a70b1..92590d9 100644
+--- a/app/models/account.rb
++++ b/app/models/account.rb
+@@ -1,5 +1,5 @@
+ class Account < ApplicationRecord
+-  include Account::Storage, Cancellable, Entropic, MultiTenantable, Seedeable
++  include Account::Storage, Cancellable, Entropic, Incineratable, MultiTenantable, Seedeable
+ 
+   has_one :join_code, dependent: :destroy
+   has_many :users, dependent: :destroy
+diff --git a/app/models/account/incineratable.rb b/app/models/account/incineratable.rb
+index 2357b99..c804fbe 100644
+--- a/app/models/account/incineratable.rb
++++ b/app/models/account/incineratable.rb
+@@ -1,3 +1,83 @@
+ module Account::Incineratable
++  extend ActiveSupport::Concern
++
+   INCINERATION_GRACE_PERIOD = 30.days
++
++  # Bare models for tenant tables, so that delete_all type-casts account_id the same way as
++  # any other query. Built once per table and kept, rather than rebuilt on every run.
++  TENANT_MODELS = {}
++
++  included do
++    # Cancelled for longer than the grace period.
++    scope :due_for_incineration, -> {
++      joins(:cancellation).where(account_cancellations: { created_at: ...INCINERATION_GRACE_PERIOD.ago })
++    }
++  end
++
++  class_methods do
++    # One account failing is reported and skipped so that it can't hold up the others. It stays
++    # due, so the next run retries it.
++    def incinerate_due
++      due_for_incineration.find_each do |account|
++        account.incinerate
++      rescue => error
++        Rails.error.report(error, context: { account_id: account.id }, handled: true)
++      end
++    end
++  end
++
++  # Permanently deletes this account and every row belonging to it. Deletes are done in bulk
++  # rather than through callbacks: callbacks would write storage ledger entries and enqueue
++  # work for rows that are about to disappear. Does nothing unless the account is due.
++  #
++  # The account row is locked, as it is by cancel and reactivate, and the due check runs under
++  # that lock. A reactivation that lands after this instance was loaded can't be deleted by mistake.
++  def incinerate
++    with_lock(requires_new: true) do
++      if incineratable?
++        purge_stored_files
++        delete_data
++        true
++      else
++        false
++      end
++    end
++  end
++
++  private
++    def incineratable?
++      cancelled? && cancellation.created_at < INCINERATION_GRACE_PERIOD.ago
++    end
++
++    # Files go before the rows. Deleting a file is idempotent, so if the transaction fails the
++    # rows survive, and the next run deletes the files again and finishes.
++    def purge_stored_files
++      ActiveStorage::Blob.where(account_id: id).find_each(&:delete)
++    end
++
++    def delete_data
++      Search::Record.delete_index_for_account(id)
++      Filter.where(account_id: id).destroy_all # Also removes the filter's join-table rows.
++      Storage::Total.where(owner: self).delete_all
++      Storage::Total.where(owner_type: "Board", owner_id: boards.select(:id)).delete_all
++
++      tenant_tables.each { |table| tenant_model(table).where(account_id: id).delete_all }
++
++      Account.where(id: id).delete_all
++    end
++
++    # Every table with an account_id column holds tenant data (see AGENTS.md). Sweeping by that
++    # column catches tables that aren't reachable through the association graph, such as the
++    # storage ledger and the sharded search tables.
++    def tenant_tables
++      connection = self.class.connection
++
++      connection.tables.select do |table|
++        connection.columns(table).any? { it.name == "account_id" }
++      end
++    end
++
++    def tenant_model(table)
++      TENANT_MODELS[table] ||= Class.new(ApplicationRecord) { self.table_name = table }
++    end
+ end
+diff --git a/app/models/search/record/sqlite.rb b/app/models/search/record/sqlite.rb
+index 857e858..6c58c73 100644
+--- a/app/models/search/record/sqlite.rb
++++ b/app/models/search/record/sqlite.rb
+@@ -30,6 +30,12 @@ module Search::Record::SQLite
+     def for(account_id)
+       self
+     end
++
++    # FTS rows aren't keyed by account, so they're found through the account's search records.
++    # Those records are removed later with the rest of the account's tables.
++    def delete_index_for_account(account_id)
++      Fts.where(rowid: where(account_id: account_id).select(:id)).delete_all
++    end
+   end
+ 
+   def card_title
+diff --git a/app/models/search/record/trilogy.rb b/app/models/search/record/trilogy.rb
+index 7705f3b..9300b92 100644
+--- a/app/models/search/record/trilogy.rb
++++ b/app/models/search/record/trilogy.rb
+@@ -35,6 +35,11 @@ module Search::Record::Trilogy
+     def for(account_id)
+       SHARD_CLASSES[shard_id_for_account(account_id)]
+     end
++
++    # Shards are ordinary tables keyed by account_id, so the account's rows are removed along
++    # with the rest of its tables. There is no separate index to clean up.
++    def delete_index_for_account(account_id)
++    end
+   end
+ 
+   def card_title
+diff --git a/config/recurring.yml b/config/recurring.yml
+index 549f6ae..aeabd1a 100644
+--- a/config/recurring.yml
++++ b/config/recurring.yml
+@@ -13,6 +13,9 @@ production: &production
+   delete_unused_tags:
+     class: DeleteUnusedTagsJob
+     schedule: every day at 04:02
++  incinerate_due_accounts:
++    class: Account::IncinerateDueJob
++    schedule: every day at 04:30
+ 
+   # Operations cleanup and backups
+   clear_solid_queue_finished_jobs:
+diff --git a/test/jobs/account/incinerate_due_job_test.rb b/test/jobs/account/incinerate_due_job_test.rb
+new file mode 100644
+index 0000000..511fca8
+--- /dev/null
++++ b/test/jobs/account/incinerate_due_job_test.rb
+@@ -0,0 +1,45 @@
++require "test_helper"
++
++class Account::IncinerateDueJobTest < ActiveJob::TestCase
++  setup do
++    @user = users(:david)
++    @due = accounts("37s")
++    @recent = accounts(:initech)
++    @active = accounts(:acme)
++  end
++
++  test "incinerates accounts cancelled more than the grace period ago and nothing else" do
++    cancel_at @due, (Account::Incineratable::INCINERATION_GRACE_PERIOD + 1.day).ago
++    cancel_at @recent, (Account::Incineratable::INCINERATION_GRACE_PERIOD - 1.day).ago
++
++    Account::IncinerateDueJob.perform_now
++
++    assert_not Account.exists?(@due.id)
++    assert Account.exists?(@recent.id)
++    assert Account.exists?(@active.id)
++  end
++
++  test "reports a failing account and still attempts the others" do
++    cancel_at @due, 31.days.ago
++    cancel_at @recent, 31.days.ago
++
++    Account.any_instance.expects(:incinerate).twice.raises(RuntimeError, "boom")
++    Rails.error.expects(:report).twice
++
++    assert_nothing_raised { Account::IncinerateDueJob.perform_now }
++  end
++
++  test "is scheduled daily in production" do
++    path = Rails.root.join("config/recurring.yml")
++    config = ERB.new(File.read(path)).tap { it.filename = path.to_s }.result
++    tasks = YAML.safe_load(config, aliases: true).fetch("production")
++
++    assert_equal "Account::IncinerateDueJob", tasks.dig("incinerate_due_accounts", "class")
++    assert tasks.dig("incinerate_due_accounts", "schedule").present?
++  end
++
++  private
++    def cancel_at(account, time)
++      travel_to(time) { account.cancel(initiated_by: @user) }
++    end
++end
+diff --git a/test/models/account/incineratable_test.rb b/test/models/account/incineratable_test.rb
+new file mode 100644
+index 0000000..1265e2b
+--- /dev/null
++++ b/test/models/account/incineratable_test.rb
+@@ -0,0 +1,204 @@
++require "test_helper"
++
++class Account::IncineratableTest < ActiveSupport::TestCase
++  setup do
++    @account = accounts("37s")
++    @user = users(:david)
++  end
++
++  test "due_for_incineration includes accounts cancelled longer ago than the grace period" do
++    cancel_at @account, (Account::Incineratable::INCINERATION_GRACE_PERIOD + 1.day).ago
++
++    assert_includes Account.due_for_incineration, @account
++  end
++
++  test "due_for_incineration excludes accounts cancelled within the grace period" do
++    cancel_at @account, (Account::Incineratable::INCINERATION_GRACE_PERIOD - 1.day).ago
++
++    assert_not_includes Account.due_for_incineration, @account
++  end
++
++  test "due_for_incineration excludes active accounts" do
++    assert_not_includes Account.due_for_incineration, @account
++  end
++
++  test "incinerate deletes the account and every row that belongs to it" do
++    populate @account, @user
++    cancel_at @account, 31.days.ago
++    assert_not_empty tenant_rows(@account)
++
++    assert @account.incinerate
++
++    assert_not Account.exists?(@account.id)
++    assert_empty tenant_rows(@account)
++  end
++
++  test "incinerate removes rows that are not keyed by account" do
++    populate @account, @user
++    cancel_at @account, 31.days.ago
++    board_ids = @account.boards.ids
++    filter_ids = Filter.where(account_id: @account.id).ids
++    search_record_ids = Search::Record.where(account_id: @account.id).ids
++    assert_not_empty filter_join_rows(filter_ids)
++    assert_not_empty Storage::Total.where(owner_type: "Board", owner_id: board_ids)
++    assert_not_empty Storage::Total.where(owner_type: "Account", owner_id: @account.id)
++    assert_not_empty fts_rows(search_record_ids) if sqlite?
++
++    @account.incinerate
++
++    assert_empty filter_join_rows(filter_ids)
++    assert_empty Storage::Total.where(owner_type: "Board", owner_id: board_ids)
++    assert_empty Storage::Total.where(owner_type: "Account", owner_id: @account.id)
++    assert_empty fts_rows(search_record_ids) if sqlite?
++  end
++
++  test "incinerate deletes stored files" do
++    populate @account, @user
++    cancel_at @account, 31.days.ago
++    keys = ActiveStorage::Blob.where(account_id: @account.id).pluck(:key)
++    assert_not_empty keys
++    assert keys.all? { |key| ActiveStorage::Blob.service.exist?(key) }
++
++    @account.incinerate
++
++    assert keys.none? { |key| ActiveStorage::Blob.service.exist?(key) }
++  end
++
++  test "incinerate leaves other accounts untouched" do
++    other = accounts(:initech)
++    populate other, users(:mike)
++    other_rows = tenant_rows(other)
++    assert_not_empty other_rows
++
++    populate @account, @user
++    cancel_at @account, 31.days.ago
++    @account.incinerate
++
++    assert Account.exists?(other.id)
++    assert_equal other_rows, tenant_rows(other)
++  end
++
++  test "incinerate re-checks the cancellation under lock, so a reactivated account is left alone" do
++    populate @account, @user
++    cancel_at @account, 31.days.ago
++    assert @account.cancelled? # Loads the cancellation on this instance.
++
++    Account.find(@account.id).reactivate
++    rows = tenant_rows(@account)
++
++    assert_not @account.incinerate
++    assert Account.exists?(@account.id)
++    assert_equal rows, tenant_rows(@account)
++  end
++
++  test "incinerate does nothing to an active account" do
++    populate @account, @user
++    rows = tenant_rows(@account)
++
++    assert_not @account.incinerate
++
++    assert Account.exists?(@account.id)
++    assert_equal rows, tenant_rows(@account)
++  end
++
++  test "incinerate does nothing to an account cancelled within the grace period" do
++    populate @account, @user
++    cancel_at @account, (Account::Incineratable::INCINERATION_GRACE_PERIOD - 1.day).ago
++    rows = tenant_rows(@account)
++
++    assert_not @account.incinerate
++
++    assert Account.exists?(@account.id)
++    assert_equal rows, tenant_rows(@account)
++  end
++
++  test "a failure part way through leaves the account intact so that a retry can finish" do
++    populate @account, @user
++    cancel_at @account, 31.days.ago
++    rows = tenant_rows(@account)
++    filter_ids = Filter.where(account_id: @account.id).ids
++    Storage::Total.stubs(:where).raises(ActiveRecord::StatementInvalid, "boom")
++
++    assert_raises(ActiveRecord::StatementInvalid) { @account.incinerate }
++    assert Account.exists?(@account.id)
++    assert_equal rows, tenant_rows(@account)
++    assert_not_empty filter_join_rows(filter_ids)
++
++    Storage::Total.unstub(:where)
++    assert @account.incinerate
++    assert_not Account.exists?(@account.id)
++    assert_empty tenant_rows(@account)
++  end
++
++  test "a failure part way through is rolled back even when called inside another transaction" do
++    populate @account, @user
++    cancel_at @account, 31.days.ago
++    rows = tenant_rows(@account)
++    Storage::Total.stubs(:where).raises(ActiveRecord::StatementInvalid, "boom")
++
++    ActiveRecord::Base.transaction do
++      assert_raises(ActiveRecord::StatementInvalid) { @account.incinerate }
++    end
++    Storage::Total.unstub(:where)
++
++    assert_equal rows, tenant_rows(@account)
++  end
++
++  private
++    def cancel_at(account, time)
++      travel_to(time) { account.cancel(initiated_by: @user) }
++    end
++
++    # Creates data across the account: attachments and rich text embeds (blobs, storage
++    # ledger), a searchable card and comment, a saved search, and a completed import.
++    def populate(account, user)
++      Current.set(account: account, user: user) do
++        # Fixtures don't keep cards_count in step with card numbers.
++        account.update_column :cards_count, account.cards.maximum(:number).to_i
++
++        card = account.cards.first
++        card.image.attach(io: file_fixture("moon.jpg").open, filename: "moon.jpg", content_type: "image/jpeg")
++
++        embed = ActiveStorage::Blob.create_and_upload!(io: file_fixture("avatar.png").open, filename: "embed.png", content_type: "image/png")
++        card.update!(description: "<p>Details #{ActionText::Attachment.from_attachable(embed).to_html}</p>")
++        card.comments.create!(creator: user, body: "A comment with a searchable phrase")
++
++        user.avatar.attach(io: file_fixture("avatar.png").open, filename: "avatar.png", content_type: "image/png")
++        Card.create!(board: account.boards.first, creator: user, title: "Searchable card", description: "findable text")
++        Search::Query.create!(account: account, user: user, terms: "findable")
++        Account::Import.create!(account: account, identity: user.identity, status: :completed, completed_at: Time.current)
++
++        account.materialize_storage
++        account.boards.each(&:materialize_storage)
++      end
++    end
++
++    # Row counts for every table with an account_id column, using the same type casting as
++    # the application so that UUIDs match. Returns only the tables that still have rows.
++    def tenant_rows(account)
++      connection = ActiveRecord::Base.connection
++
++      connection.tables.each_with_object({}) do |table, counts|
++        next unless connection.columns(table).any? { it.name == "account_id" }
++
++        model = Class.new(ApplicationRecord) { self.table_name = table }
++        count = model.where(account_id: account.id).count
++        counts[table] = count if count.positive?
++      end
++    end
++
++    def filter_join_rows(filter_ids)
++      Filter.reflect_on_all_associations(:has_and_belongs_to_many).flat_map do |reflection|
++        model = Class.new(ApplicationRecord) { self.table_name = reflection.join_table }
++        model.where(filter_id: filter_ids).pluck(:filter_id)
++      end
++    end
++
++    def fts_rows(search_record_ids)
++      Search::Record::SQLite::Fts.where(rowid: search_record_ids).pluck(:rowid)
++    end
++
++    def sqlite?
++      Search::Record.connection.adapter_name == "SQLite"
++    end
++end

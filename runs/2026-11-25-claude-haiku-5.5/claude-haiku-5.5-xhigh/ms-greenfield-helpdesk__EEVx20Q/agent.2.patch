@@ -1,0 +1,1748 @@
+diff --git a/README.md b/README.md
+index 8c21505..d9a5e9c 100644
+--- a/README.md
++++ b/README.md
+@@ -58,6 +58,16 @@ adapter before going live.
+ | POST | `/api/v1/password_resets` | header | `{"password_reset":{"email"}}` |
+ | POST | `/api/v1/password_resets/confirm` | none | `{"password_reset":{"token","password"}}` |
+ | GET | `/api/v1/portal` | header | — |
++| POST | `/api/v1/registrations` | header | `{"user":{"name","email","password"}}` |
++| GET | `/api/v1/requests` | bearer | — (paginated) |
++| POST | `/api/v1/requests` | bearer | `{"request":{"subject","comment":{"body"}}}` |
++| GET | `/api/v1/requests/:id` | bearer | — |
++| PATCH | `/api/v1/requests/:id` | bearer | `{"request":{"comment":{"body"},"status":"solved"}}` |
++| GET | `/api/v1/requests/:id/comments` | bearer | — (paginated) |
++| GET | `/api/v1/tickets` | bearer, staff | — (paginated) |
++| GET | `/api/v1/tickets/:id` | bearer, staff | — |
++| PATCH | `/api/v1/tickets/:id` | bearer, staff | `{"ticket":{"comment":{"body","public"},"status":"open\|pending\|solved"}}` |
++| GET | `/api/v1/tickets/:id/comments` | bearer, staff | — (paginated) |
+ | GET | `/api/v1/account` | bearer | — |
+ | POST | `/api/v1/account/cancel` | bearer, owner | — |
+ | POST | `/api/v1/account/reactivate` | bearer, owner | — |
+@@ -70,8 +80,40 @@ Emailed links point at the frontend:
+ Lifetimes: verification links last 3 days, reset links 1 hour. Requesting a new link
+ replaces the previous one.
+ 
++## Requests and tickets
++
++Customers work with **requests**, at `/api/v1/requests`. Staff work with the same records as
++**tickets**, at `/api/v1/tickets`. Customers can only see their own requests. Staff can see
++every request in their business. Another business's records always look missing (`404`).
++
++- A new request is `open`. Its first comment comes with the request.
++- Responses return records under `request` or `ticket`, and lists under the plural name
++  (`requests`, `tickets`, `comments`). A request has `id`, `subject`, `status`,
++  `requester_id`, `created_at` and `updated_at`. A ticket also has the requester as
++  `{id, name, email}`.
++- A comment has `id`, `body`, `public`, `author` (`{id, name}`) and `created_at`.
++  Customers only see public comments. Comments are listed oldest first.
++- **Customer replies** `PATCH /requests/:id` with an optional `comment` and an optional
++  `status`. A customer can only set `status` to `solved`. A reply reopens a `pending` or
++  `solved` request, unless the same update marks it solved. Sending neither a comment nor a
++  status is a `422`.
++- **Staff replies** `PATCH /tickets/:id` with an optional `comment` and an optional `status`
++  (`open`, `pending` or `solved`). A reply on its own does not change the status. A comment
++  can set `public: false` to make a private note, which customers never see.
++- Replies do not send email yet.
++
++Lists are paginated with `page` (default 1) and `per_page` (default 25, at most 100). They
++return `count`, `page`, `per_page`, `next_page` and `previous_page` next to the records. A
++`page` or `per_page` that is not a whole number of 1 or more returns `400 invalid_pagination`.
++Lists are ordered by recent activity, so the request or ticket with the newest reply or
++status change comes first.
++
+ ## Accounts and roles
+ 
++- Roles are `admin` (the owner), `agent` and `customer`. Staff are the owner and agents.
++- Customers register through `POST /api/v1/registrations` with the business header. They
++  always get the `customer` role, and use the same verification, sign-in, profile and
++  password flows as everyone else. Registration is refused for a cancelled business.
+ - The admin who registers a business is its **owner**. Only an admin can cancel or
+   reactivate the account.
+ - Owners must verify their email before they can sign in.
+diff --git a/app/controllers/api/v1/registrations_controller.rb b/app/controllers/api/v1/registrations_controller.rb
+new file mode 100644
+index 0000000..4108070
+--- /dev/null
++++ b/app/controllers/api/v1/registrations_controller.rb
+@@ -0,0 +1,30 @@
++module Api
++  module V1
++    # Customers sign themselves up for a business's portal. They verify their email, then
++    # use the same sign-in, profile and password flows as everyone else.
++    class RegistrationsController < ApplicationController
++      before_action :load_account_from_header!
++      before_action :require_active_account!
++
++      # POST /api/v1/registrations
++      # { user: { name, email, password } } with X-Helpdesk-Account
++      def create
++        # Only these fields are accepted. Everyone who registers here is a customer.
++        user = @account.users.new(require_envelope(:user).permit(:name, :email, :password).merge(role: User::CUSTOMER))
++
++        token = nil
++        User.transaction do
++          user.save!
++          token = UserToken.issue!(user, :email_verification)
++        end
++        # Send only after commit, so the link never points at a rolled-back user.
++        UserMailer.email_verification(user, token).deliver_later
++
++        render json: { user: user.as_api_json }, status: :created
++      rescue ActiveRecord::RecordNotUnique
++        # Lost a race with another registration for the same email.
++        render_error(422, "validation_failed", "That email is already registered with this business.")
++      end
++    end
++  end
++end
+diff --git a/app/controllers/api/v1/requests_controller.rb b/app/controllers/api/v1/requests_controller.rb
+new file mode 100644
+index 0000000..2d5f704
+--- /dev/null
++++ b/app/controllers/api/v1/requests_controller.rb
+@@ -0,0 +1,71 @@
++module Api
++  module V1
++    # A customer's own requests. Staff handle the same records through TicketsController.
++    class RequestsController < ApplicationController
++      include Pagination
++
++      before_action :authenticate_session!
++      before_action :require_active_account!
++      before_action :load_own_request, only: %i[show update comments]
++
++      # GET /api/v1/requests
++      def index
++        records, paging = paginate(own_requests.recently_active)
++        render json: { requests: records.map(&:as_api_json), **paging }
++      end
++
++      # POST /api/v1/requests
++      # { request: { subject, comment: { body } } }
++      def create
++        attrs = require_envelope(:request)
++        comment = require_envelope(:comment, attrs).permit(:body)
++
++        request = Request.submit!(
++          requester: @current_user,
++          subject: attrs.permit(:subject)[:subject],
++          body: comment[:body]
++        )
++        render json: { request: request.as_api_json }, status: :created
++      end
++
++      # GET /api/v1/requests/:id
++      def show
++        render json: { request: @request.as_api_json }
++      end
++
++      # PATCH /api/v1/requests/:id
++      # { request: { comment: { body }, status: "solved" } }
++      def update
++        attrs = require_envelope(:request)
++
++        reply = {}
++        if attrs.key?(:comment)
++          reply[:body] = require_envelope(:comment, attrs).permit(:body)[:body].to_s
++        end
++        reply[:status] = attrs.permit(:status)[:status].to_s if attrs.key?(:status)
++
++        @request.requester_reply!(author: @current_user, **reply)
++        render json: { request: @request.as_api_json }
++      end
++
++      # GET /api/v1/requests/:id/comments
++      # Customers see public comments only, oldest first.
++      def comments
++        records, paging = paginate(@request.comments.public_only.includes(:author))
++        render json: { comments: records.map(&:as_api_json), **paging }
++      end
++
++      private
++
++      def own_requests
++        @account.requests.where(requester: @current_user)
++      end
++
++      # Another customer's request is reported as missing, not forbidden, so IDs don't leak.
++      def load_own_request
++        @request = own_requests.find_by(id: params[:id])
++        render_error(404, "not_found", "No request has that ID.") unless @request
++      end
++    end
++  end
++end
+diff --git a/app/controllers/api/v1/tickets_controller.rb b/app/controllers/api/v1/tickets_controller.rb
+new file mode 100644
+index 0000000..5377062
+--- /dev/null
++++ b/app/controllers/api/v1/tickets_controller.rb
+@@ -0,0 +1,56 @@
++module Api
++  module V1
++    # Staff view of every request in the business, as tickets.
++    class TicketsController < ApplicationController
++      include Pagination
++
++      before_action :authenticate_session!
++      before_action :require_active_account!
++      before_action :require_staff!
++      before_action :load_ticket, only: %i[show update comments]
++
++      # GET /api/v1/tickets
++      def index
++        records, paging = paginate(@account.requests.includes(:requester).recently_active)
++        render json: { tickets: records.map(&:as_ticket_api_json), **paging }
++      end
++
++      # GET /api/v1/tickets/:id
++      def show
++        render json: { ticket: @ticket.as_ticket_api_json }
++      end
++
++      # PATCH /api/v1/tickets/:id
++      # { ticket: { comment: { body, public }, status: "open" | "pending" | "solved" } }
++      def update
++        attrs = require_envelope(:ticket)
++
++        reply = {}
++        if attrs.key?(:comment)
++          comment = require_envelope(:comment, attrs).permit(:body, :public)
++          reply[:body] = comment[:body].to_s
++          # Replies are public unless staff mark them as private notes.
++          reply[:public] = comment[:public] if comment.key?(:public)
++        end
++        reply[:status] = attrs.permit(:status)[:status].to_s if attrs.key?(:status)
++
++        @ticket.staff_reply!(author: @current_user, **reply)
++        render json: { ticket: @ticket.as_ticket_api_json }
++      end
++
++      # GET /api/v1/tickets/:id/comments
++      # Staff see every comment, including private notes, oldest first.
++      def comments
++        records, paging = paginate(@ticket.comments.includes(:author))
++        render json: { comments: records.map(&:as_api_json), **paging }
++      end
++
++      private
++
++      def load_ticket
++        @ticket = @account.requests.includes(:requester).find_by(id: params[:id])
++        render_error(404, "not_found", "No ticket has that ID.") unless @ticket
++      end
++    end
++  end
++end
+diff --git a/app/controllers/application_controller.rb b/app/controllers/application_controller.rb
+index 8569530..063ee6b 100644
+--- a/app/controllers/application_controller.rb
++++ b/app/controllers/application_controller.rb
+@@ -9,9 +9,10 @@ class ApplicationController < ActionController::API
+   private
+ 
+   # The "envelope" object for a request, e.g. params[:session] in {"session": {...}}.
+-  # A missing or non-object value is a 400, not a server error.
+-  def require_envelope(key)
+-    value = params.require(key)
++  # A missing or non-object value is a 400, not a server error. Pass `parent` for an
++  # object nested in another envelope, e.g. the comment in {"ticket": {"comment": {...}}}.
++  def require_envelope(key, parent = params)
++    value = parent.require(key)
+     raise ActionController::ParameterMissing, key unless value.is_a?(ActionController::Parameters)
+ 
+     value
+diff --git a/app/controllers/concerns/pagination.rb b/app/controllers/concerns/pagination.rb
+new file mode 100644
+index 0000000..ee86f5d
+--- /dev/null
++++ b/app/controllers/concerns/pagination.rb
+@@ -0,0 +1,51 @@
++# Offset pagination for list endpoints: ?page=1&per_page=25.
++#
++# A page or per_page that is not a whole number of 1 or more is a 400. A per_page above
++# MAX_PER_PAGE is capped, and the response shows the value actually used.
++module Pagination
++  extend ActiveSupport::Concern
++
++  DEFAULT_PER_PAGE = 25
++  MAX_PER_PAGE = 100
++
++  class InvalidPage < StandardError; end
++
++  included do
++    rescue_from InvalidPage do |error|
++      render_error(400, "invalid_pagination", error.message)
++    end
++  end
++
++  private
++
++  # Returns [records, paging] for one page of the scope. `paging` is the set of fields
++  # that go next to the records in the response.
++  def paginate(scope)
++    page = page_number(:page, default: 1)
++    per_page = [page_number(:per_page, default: DEFAULT_PER_PAGE), MAX_PER_PAGE].min
++
++    count = scope.count
++    offset = (page - 1) * per_page
++    # Skip the query for pages past the end. This also keeps huge page numbers out of SQL.
++    records = offset < count ? scope.offset(offset).limit(per_page).to_a : []
++
++    paging = {
++      count: count,
++      page: page,
++      per_page: per_page,
++      next_page: page * per_page < count ? page + 1 : nil,
++      previous_page: page > 1 ? page - 1 : nil
++    }
++    [records, paging]
++  end
++
++  def page_number(name, default:)
++    raw = params[name]
++    return default if raw.blank?
++
++    value = Integer(raw.to_s, 10, exception: false)
++    raise InvalidPage, "#{name} must be a whole number, 1 or more." if value.nil? || value < 1
++
++    value
++  end
++end
+diff --git a/app/controllers/concerns/session_authentication.rb b/app/controllers/concerns/session_authentication.rb
+index aea84b3..bf5ec40 100644
+--- a/app/controllers/concerns/session_authentication.rb
++++ b/app/controllers/concerns/session_authentication.rb
+@@ -30,4 +30,11 @@ module SessionAuthentication
+ 
+     render_error(403, "forbidden", "Only the account owner can do that.")
+   end
++
++  # Staff are the owner and agents. Customers use the portal's request endpoints instead.
++  def require_staff!
++    return if @current_user.staff?
++
++    render_error(403, "forbidden", "Only staff can do that.")
++  end
+ end
+diff --git a/app/models/account.rb b/app/models/account.rb
+index 32496a7..77a2a4e 100644
+--- a/app/models/account.rb
++++ b/app/models/account.rb
+@@ -15,6 +15,7 @@ class Account < ApplicationRecord
+   end
+ 
+   has_many :users, dependent: :destroy
++  has_many :requests, dependent: :destroy
+ 
+   normalizes :subdomain, with: ->(value) { value.strip.downcase }
+ 
+diff --git a/app/models/comment.rb b/app/models/comment.rb
+new file mode 100644
+index 0000000..c004d07
+--- /dev/null
++++ b/app/models/comment.rb
+@@ -0,0 +1,33 @@
++# A message on a request. Customers' comments are always public. Staff can add private
++# notes, which only staff see.
++class Comment < ApplicationRecord
++  BODY_MAX_LENGTH = 10_000
++
++  belongs_to :request, inverse_of: :comments, touch: true
++  belongs_to :author, class_name: "User", inverse_of: :comments
++
++  validates :body, presence: true, length: { maximum: BODY_MAX_LENGTH }
++  validates :public, inclusion: { in: [true, false] }
++  validate :author_belongs_to_request_account
++
++  scope :public_only, -> { where(public: true) }
++  scope :oldest_first, -> { order(created_at: :asc, id: :asc) }
++
++  def as_api_json
++    {
++      id: id,
++      body: body,
++      public: public?,
++      author: { id: author.id, name: author.name },
++      created_at: created_at
++    }
++  end
++
++  private
++
++  def author_belongs_to_request_account
++    return if author.nil? || request.nil?
++
++    errors.add(:author, "must belong to the same business") unless author.account_id == request.account_id
++  end
++end
+diff --git a/app/models/request.rb b/app/models/request.rb
+new file mode 100644
+index 0000000..f34e71c
+--- /dev/null
++++ b/app/models/request.rb
+@@ -0,0 +1,94 @@
++# A customer's request for help. Customers see it as a request; staff see the same
++# record as a ticket.
++class Request < ApplicationRecord
++  OPEN = "open".freeze
++  PENDING = "pending".freeze
++  SOLVED = "solved".freeze
++  STATUSES = [OPEN, PENDING, SOLVED].freeze
++  SUBJECT_MAX_LENGTH = 255
++
++  belongs_to :account
++  belongs_to :requester, class_name: "User", inverse_of: :requests
++  has_many :comments, -> { oldest_first }, dependent: :destroy, inverse_of: :request
++
++  validates :subject, presence: true, length: { maximum: SUBJECT_MAX_LENGTH }
++  validates :status, inclusion: { in: STATUSES }
++  validate :requester_belongs_to_account
++
++  # Replies and status changes touch the request, so this orders by the latest activity.
++  scope :recently_active, -> { order(updated_at: :desc, id: :desc) }
++
++  # Opens a request with its first comment, from the requester. Both or neither are saved.
++  def self.submit!(requester:, subject:, body:)
++    transaction do
++      request = create!(account: requester.account, requester: requester, subject: subject, status: OPEN)
++      request.comments.create!(author: requester, body: body, public: true)
++      request
++    end
++  end
++
++  # A reply from the requester: an optional comment and an optional status.
++  #
++  # Requesters can only mark a request solved. A comment reopens a pending or solved
++  # request, unless the same update marks it solved.
++  def requester_reply!(author:, body: nil, status: nil)
++    invalid!(:base, "Send a comment, a status, or both.") if body.nil? && status.nil?
++    invalid!(:status, "can only be set to solved by the requester") if status && status != SOLVED
++
++    with_lock do
++      comments.create!(author: author, body: body, public: true) unless body.nil?
++
++      # `status` here is the argument, so the current value is read through self.
++      if status == SOLVED
++        self.status = SOLVED
++      elsif body && self.status != OPEN
++        self.status = OPEN
++      end
++      save!
++    end
++  end
++
++  # A reply from staff: an optional comment and an optional status. A reply on its own
++  # does not change the status.
++  def staff_reply!(author:, body: nil, public: true, status: nil)
++    invalid!(:base, "Send a comment, a status, or both.") if body.nil? && status.nil?
++
++    with_lock do
++      comments.create!(author: author, body: body, public: public) unless body.nil?
++      self.status = status unless status.nil?
++      save!
++    end
++  end
++
++  # The customer's view of a request.
++  def as_api_json
++    {
++      id: id,
++      subject: subject,
++      status: status,
++      requester_id: requester_id,
++      created_at: created_at,
++      updated_at: updated_at
++    }
++  end
++
++  # The staff view of a request: the same fields, with the requester's details.
++  def as_ticket_api_json
++    as_api_json.merge(
++      requester: { id: requester.id, name: requester.name, email: requester.email }
++    )
++  end
++
++  private
++
++  def invalid!(attribute, message)
++    errors.add(attribute, message)
++    raise ActiveRecord::RecordInvalid, self
++  end
++
++  def requester_belongs_to_account
++    return if requester.nil?
++
++    errors.add(:requester, "must belong to the same business") unless requester.account_id == account_id
++  end
++end
+diff --git a/app/models/user.rb b/app/models/user.rb
+index 299f129..bd0b853 100644
+--- a/app/models/user.rb
++++ b/app/models/user.rb
+@@ -1,12 +1,18 @@
+ class User < ApplicationRecord
+   ADMIN = "admin".freeze
+-  ROLES = [ADMIN, "agent"].freeze
++  AGENT = "agent".freeze
++  CUSTOMER = "customer".freeze
++  ROLES = [ADMIN, AGENT, CUSTOMER].freeze
++  # Staff work the helpdesk. Customers only see their own requests.
++  STAFF_ROLES = [ADMIN, AGENT].freeze
+   MIN_PASSWORD_LENGTH = 8
+ 
+   belongs_to :account
+   has_secure_password
+   has_many :sessions, dependent: :delete_all
+   has_many :user_tokens, dependent: :delete_all
++  has_many :requests, foreign_key: :requester_id, inverse_of: :requester, dependent: :destroy
++  has_many :comments, foreign_key: :author_id, inverse_of: :author, dependent: :destroy
+ 
+   normalizes :email, with: ->(value) { value.strip.downcase }
+ 
+@@ -31,6 +37,14 @@ class User < ApplicationRecord
+     role == ADMIN
+   end
+ 
++  def staff?
++    STAFF_ROLES.include?(role)
++  end
++
++  def customer?
++    role == CUSTOMER
++  end
++
+   def verified?
+     verified_at.present?
+   end
+diff --git a/config/routes.rb b/config/routes.rb
+index 3537773..4fcf5ae 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -24,6 +24,21 @@ Rails.application.routes.draw do
+ 
+       get "portal", to: "portals#show"
+ 
++      post "registrations", to: "registrations#create"
++
++      # A customer's own requests.
++      get "requests", to: "requests#index"
++      post "requests", to: "requests#create"
++      get "requests/:id", to: "requests#show"
++      patch "requests/:id", to: "requests#update"
++      get "requests/:id/comments", to: "requests#comments"
++
++      # Staff view of the same records.
++      get "tickets", to: "tickets#index"
++      get "tickets/:id", to: "tickets#show"
++      patch "tickets/:id", to: "tickets#update"
++      get "tickets/:id/comments", to: "tickets#comments"
++
+       match "*path", to: "not_found#show", via: :all
+     end
+   end
+diff --git a/db/migrate/20261123050001_create_requests.rb b/db/migrate/20261123050001_create_requests.rb
+new file mode 100644
+index 0000000..02d8d82
+--- /dev/null
++++ b/db/migrate/20261123050001_create_requests.rb
+@@ -0,0 +1,19 @@
++class CreateRequests < ActiveRecord::Migration[8.1]
++  def change
++    create_table :requests do |t|
++      # Deleting an account or a requester removes their requests at the database level too.
++      t.references :account, null: false, foreign_key: { on_delete: :cascade }, index: false
++      t.references :requester, null: false, foreign_key: { to_table: :users, on_delete: :cascade }, index: false
++      t.string :subject, null: false
++      t.string :status, null: false, default: "open"
++
++      t.timestamps
++    end
++
++    # Lists are ordered by recent activity, per business and per requester.
++    add_index :requests, [:account_id, :updated_at]
++    add_index :requests, [:requester_id, :updated_at]
++
++    add_check_constraint :requests, "status IN ('open', 'pending', 'solved')", name: "requests_status_known"
++  end
++end
+diff --git a/db/migrate/20261123050002_create_comments.rb b/db/migrate/20261123050002_create_comments.rb
+new file mode 100644
+index 0000000..0f20cec
+--- /dev/null
++++ b/db/migrate/20261123050002_create_comments.rb
+@@ -0,0 +1,16 @@
++class CreateComments < ActiveRecord::Migration[8.1]
++  def change
++    create_table :comments do |t|
++      t.references :request, null: false, foreign_key: { on_delete: :cascade }, index: false
++      t.references :author, null: false, foreign_key: { to_table: :users, on_delete: :cascade }
++      t.text :body, null: false
++      # Customers only ever see public comments. Staff can add private notes.
++      t.boolean :public, null: false, default: true
++
++      t.timestamps
++    end
++
++    # Comments are read oldest first within a request.
++    add_index :comments, [:request_id, :created_at]
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 5ea49a4..0833fe8 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.1].define(version: 2026_11_23_045004) do
++ActiveRecord::Schema[8.1].define(version: 2026_11_23_050002) do
+   # These are extensions that must be enabled in order to support this database
+   enable_extension "pg_catalog.plpgsql"
+ 
+@@ -24,6 +24,29 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_23_045004) do
+     t.index ["subdomain"], name: "index_accounts_on_subdomain", unique: true
+   end
+ 
++  create_table "comments", force: :cascade do |t|
++    t.bigint "request_id", null: false
++    t.bigint "author_id", null: false
++    t.text "body", null: false
++    t.boolean "public", default: true, null: false
++    t.datetime "created_at", null: false
++    t.datetime "updated_at", null: false
++    t.index ["author_id"], name: "index_comments_on_author_id"
++    t.index ["request_id", "created_at"], name: "index_comments_on_request_id_and_created_at"
++  end
++
++  create_table "requests", force: :cascade do |t|
++    t.bigint "account_id", null: false
++    t.bigint "requester_id", null: false
++    t.string "subject", null: false
++    t.string "status", default: "open", null: false
++    t.datetime "created_at", null: false
++    t.datetime "updated_at", null: false
++    t.index ["account_id", "updated_at"], name: "index_requests_on_account_id_and_updated_at"
++    t.index ["requester_id", "updated_at"], name: "index_requests_on_requester_id_and_updated_at"
++    t.check_constraint "status::text = ANY (ARRAY['open'::character varying, 'pending'::character varying, 'solved'::character varying]::text[])", name: "requests_status_known"
++  end
++
+   create_table "sessions", force: :cascade do |t|
+     t.bigint "user_id", null: false
+     t.string "token_digest", null: false
+@@ -58,6 +81,10 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_23_045004) do
+     t.index ["account_id"], name: "index_users_on_account_id"
+   end
+ 
++  add_foreign_key "comments", "requests", on_delete: :cascade
++  add_foreign_key "comments", "users", column: "author_id", on_delete: :cascade
++  add_foreign_key "requests", "accounts", on_delete: :cascade
++  add_foreign_key "requests", "users", column: "requester_id", on_delete: :cascade
+   add_foreign_key "sessions", "users", on_delete: :cascade
+   add_foreign_key "user_tokens", "users", on_delete: :cascade
+   add_foreign_key "users", "accounts", on_delete: :cascade
+diff --git a/test/integration/pagination_test.rb b/test/integration/pagination_test.rb
+new file mode 100644
+index 0000000..0c6f64a
+--- /dev/null
++++ b/test/integration/pagination_test.rb
+@@ -0,0 +1,121 @@
++require "test_helper"
++
++class PaginationTest < ActionDispatch::IntegrationTest
++  setup do
++    owner_session
++    @customer = customer_session
++    @token = @customer.dig("session", "token")
++    @requester = User.find(@customer.dig("user", "id"))
++  end
++
++  def seed_requests(count)
++    count.times { |i| Request.submit!(requester: @requester, subject: "Issue #{i}", body: "Details #{i}") }
++  end
++
++  def list(params = {})
++    get "/api/v1/requests", params: params, headers: bearer(@token)
++    assert_response :ok, response.body
++    json
++  end
++
++  test "defaults to page 1 with 25 per page, and reports the paging fields" do
++    seed_requests(30)
++
++    body = list
++
++    assert_equal 25, body.fetch("requests").size
++    assert_equal({ "count" => 30, "page" => 1, "per_page" => 25, "next_page" => 2, "previous_page" => nil },
++                 body.slice("count", "page", "per_page", "next_page", "previous_page"))
++  end
++
++  test "walks through the pages using next_page and previous_page" do
++    seed_requests(30)
++
++    second = list(page: 2)
++    assert_equal 5, second.fetch("requests").size
++    assert_equal 1, second["previous_page"]
++    assert_nil second["next_page"]
++
++    back = list(page: second["previous_page"])
++    assert_equal 25, back.fetch("requests").size
++  end
++
++  test "pages cover every record once, with the requested page size" do
++    seed_requests(7)
++
++    first = list(per_page: 3, page: 1)
++    middle = list(per_page: 3, page: 2)
++    last = list(per_page: 3, page: 3)
++
++    assert_equal [3, 3, 1], [first, middle, last].map { |body| body["requests"].size }
++    assert_equal [2, 3, nil], [first, middle, last].map { |body| body["next_page"] }
++    assert_equal [nil, 1, 2], [first, middle, last].map { |body| body["previous_page"] }
++    ids = (first["requests"] + middle["requests"] + last["requests"]).map { |r| r["id"] }
++    assert_equal 7, ids.uniq.size
++  end
++
++  test "per_page above 100 is capped and the response shows the cap" do
++    seed_requests(3)
++
++    body = list(per_page: 500)
++
++    assert_equal 100, body["per_page"]
++    assert_equal 3, body.fetch("requests").size
++  end
++
++  test "a page past the end is empty and keeps the count" do
++    seed_requests(3)
++
++    body = list(page: 50)
++
++    assert_equal [], body.fetch("requests")
++    assert_equal 3, body["count"]
++    assert_equal 49, body["previous_page"]
++    assert_nil body["next_page"]
++  end
++
++  test "a huge page number is an empty page, not a server error" do
++    seed_requests(1)
++
++    body = list(page: "99999999999999999999999999")
++
++    assert_equal [], body.fetch("requests")
++  end
++
++  test "blank paging values use the defaults" do
++    seed_requests(1)
++
++    body = list(page: "", per_page: "")
++
++    assert_equal 1, body["page"]
++    assert_equal 25, body["per_page"]
++  end
++
++  test "invalid paging values are a 400 naming the parameter" do
++    seed_requests(1)
++
++    { page: %w[0 -1 abc 1.5], per_page: %w[0 -5 many] }.each do |name, values|
++      values.each do |value|
++        get "/api/v1/requests", params: { name => value }, headers: bearer(@token)
++        assert_response :bad_request, "expected #{name}=#{value} to be rejected"
++        assert_equal "invalid_pagination", json.dig("error", "code")
++        assert_includes json.dig("error", "message"), name.to_s
++      end
++    end
++  end
++
++  test "comment lists are paginated too" do
++    opened = open_request!(@token)
++    request_id = opened["id"]
++    request = Request.find(request_id)
++    3.times { |i| request.comments.create!(author: @requester, body: "Follow-up #{i}", public: true) }
++
++    get "/api/v1/requests/#{request_id}/comments", params: { per_page: 2 }, headers: bearer(@token)
++
++    assert_response :ok
++    assert_equal 2, json.fetch("comments").size
++    assert_equal 4, json["count"]
++    assert_equal 2, json["next_page"]
++    assert_nil json["previous_page"]
++  end
++end
+diff --git a/test/integration/registrations_test.rb b/test/integration/registrations_test.rb
+new file mode 100644
+index 0000000..f9e091d
+--- /dev/null
++++ b/test/integration/registrations_test.rb
+@@ -0,0 +1,151 @@
++require "test_helper"
++
++class RegistrationsTest < ActionDispatch::IntegrationTest
++  setup do
++    owner_session
++  end
++
++  test "registers a customer who is unverified and is emailed a verification link" do
++    post "/api/v1/registrations", params: registration_params, headers: in_account("acme"), as: :json
++
++    assert_response :created
++    user = json.fetch("user")
++    assert_equal "Avery", user["name"]
++    assert_equal "avery@example.test", user["email"]
++    assert_equal "customer", user["role"]
++    assert_equal false, user["verified"]
++    assert_kind_of Integer, user["account_id"]
++    refute_includes response.body, CUSTOMER_PASSWORD
++
++    assert_match(/\A[A-Za-z0-9_-]{43}\z/, link_token(to: "avery@example.test", path: "/verify-email"))
++  end
++
++  test "a registrant cannot choose their role or business" do
++    params = registration_params
++    params[:user].merge!(role: "admin", account_id: 999)
++
++    post "/api/v1/registrations", params: params, headers: in_account("acme"), as: :json
++
++    assert_response :created
++    assert_equal "customer", json.dig("user", "role")
++    assert_equal Account.find_by!(subdomain: "acme").id, json.dig("user", "account_id")
++  end
++
++  test "the same email cannot register twice in one business" do
++    register!
++
++    post "/api/v1/registrations", params: registration_params(name: "Other"), headers: in_account("acme"), as: :json
++
++    assert_response :unprocessable_content
++    assert_equal "validation_failed", json.dig("error", "code")
++    assert json.dig("error", "details", "email").present?
++  end
++
++  test "the same email can register with a different business" do
++    signup!(subdomain: "globex", name: "Globex", email: "jo@globex.test")
++    register!(subdomain: "acme")
++
++    register!(subdomain: "globex")
++
++    assert_equal 2, User.where(email: "avery@example.test", role: "customer").count
++  end
++
++  test "registration needs the business header, and an unknown business is a 404" do
++    post "/api/v1/registrations", params: registration_params, as: :json
++    assert_response :bad_request
++    assert_equal "account_required", json.dig("error", "code")
++
++    post "/api/v1/registrations", params: registration_params, headers: in_account("missing"), as: :json
++    assert_response :not_found
++    assert_equal "account_not_found", json.dig("error", "code")
++  end
++
++  test "a cancelled business does not take new registrations" do
++    token = sign_in!.dig("session", "token")
++    post "/api/v1/account/cancel", headers: bearer(token)
++
++    assert_no_difference -> { User.where(role: "customer").count } do
++      post "/api/v1/registrations", params: registration_params, headers: in_account("acme"), as: :json
++    end
++
++    assert_response :forbidden
++    assert_equal "account_cancelled", json.dig("error", "code")
++  end
++
++  test "a short password is rejected and nothing is saved" do
++    assert_no_difference -> { User.count } do
++      post "/api/v1/registrations",
++           params: registration_params(password: "short"),
++           headers: in_account("acme"),
++           as: :json
++    end
++
++    assert_response :unprocessable_content
++    assert json.dig("error", "details", "password").present?
++  end
++
++  test "a non-object user envelope is a 400" do
++    post "/api/v1/registrations", params: { user: "avery" }, headers: in_account("acme"), as: :json
++
++    assert_response :bad_request
++    assert_equal "parameter_missing", json.dig("error", "code")
++  end
++
++  test "a customer signs in only after verifying, then uses the profile endpoints" do
++    register!
++    sign_in(email: "avery@example.test", password: CUSTOMER_PASSWORD, subdomain: "acme")
++    assert_response :forbidden
++    assert_equal "email_not_verified", json.dig("error", "code")
++
++    verify_email!(email: "avery@example.test")
++    token = sign_in!(email: "avery@example.test", password: CUSTOMER_PASSWORD).dig("session", "token")
++
++    get "/api/v1/me", headers: bearer(token)
++    assert_response :ok
++    assert_equal "customer", json.dig("user", "role")
++
++    patch "/api/v1/me", params: { user: { name: "Avery Stone" } }, headers: bearer(token), as: :json
++    assert_response :ok
++    assert_equal "Avery Stone", json.dig("user", "name")
++
++    put "/api/v1/me/password",
++        params: { password_change: { current_password: CUSTOMER_PASSWORD, password: "my-new-password" } },
++        headers: bearer(token),
++        as: :json
++    assert_response :ok
++    sign_in!(email: "avery@example.test", password: "my-new-password")
++  end
++
++  test "a customer recovers a forgotten password through the reset flow" do
++    customer_session
++
++    post "/api/v1/password_resets",
++         params: { password_reset: { email: "avery@example.test" } },
++         headers: in_account("acme"),
++         as: :json
++    assert_response :accepted
++
++    token = link_token(to: "avery@example.test", path: "/reset-password")
++    post "/api/v1/password_resets/confirm",
++         params: { password_reset: { token: token, password: "my-reset-password" } },
++         as: :json
++    assert_response :ok
++
++    sign_in(email: "avery@example.test", password: CUSTOMER_PASSWORD)
++    assert_response :unauthorized
++    sign_in!(email: "avery@example.test", password: "my-reset-password")
++  end
++
++  test "a customer can ask for a new verification link" do
++    register!
++
++    post "/api/v1/email_verifications",
++         params: { email_verification: { email: "avery@example.test" } },
++         headers: in_account("acme"),
++         as: :json
++
++    assert_response :accepted
++    verify_email!(email: "avery@example.test")
++    sign_in!(email: "avery@example.test", password: CUSTOMER_PASSWORD)
++  end
++end
+diff --git a/test/integration/requests_test.rb b/test/integration/requests_test.rb
+new file mode 100644
+index 0000000..9dc29f2
+--- /dev/null
++++ b/test/integration/requests_test.rb
+@@ -0,0 +1,352 @@
++require "test_helper"
++
++class RequestsTest < ActionDispatch::IntegrationTest
++  setup do
++    owner_session
++    add_staff!(email: "sam@acme.test")
++    @avery = customer_session
++    @avery_token = @avery.dig("session", "token")
++    @avery_id = @avery.dig("user", "id")
++    @ben = customer_session(email: "ben@example.test", name: "Ben")
++    @ben_token = @ben.dig("session", "token")
++    @staff_token = sign_in!(email: "sam@acme.test").dig("session", "token")
++  end
++
++  def request_ids(scope = nil)
++    json.fetch("requests").map { |r| r["id"] }
++  end
++
++  def customer_patch(token, id, request_body)
++    patch "/api/v1/requests/#{id}", params: { request: request_body }, headers: bearer(token), as: :json
++  end
++
++  # Moves a request to pending through the staff route.
++  def staff_set_status(id, status)
++    patch "/api/v1/tickets/#{id}", params: { ticket: { status: status } }, headers: bearer(@staff_token), as: :json
++    assert_response :ok, response.body
++  end
++
++  # --- Opening a request --------------------------------------------------------
++
++  test "opening a request returns it as open, with its first comment" do
++    post "/api/v1/requests",
++         params: { request: { subject: "Cannot download my receipt", comment: { body: "The download button does nothing." } } },
++         headers: bearer(@avery_token),
++         as: :json
++
++    assert_response :created
++    request = json.fetch("request")
++    assert_equal %w[created_at id requester_id status subject updated_at], request.keys.sort
++    assert_equal "Cannot download my receipt", request["subject"]
++    assert_equal "open", request["status"]
++    assert_equal @avery_id, request["requester_id"]
++    assert request["created_at"].present?
++    assert request["updated_at"].present?
++
++    saved = Request.find(request["id"])
++    assert_equal [["The download button does nothing.", true]], saved.comments.map { |c| [c.body, c.public?] }
++    assert_equal @avery_id, saved.comments.first.author_id
++  end
++
++  test "opening a request needs a subject and a comment body" do
++    assert_no_difference -> { Request.count } do
++      post "/api/v1/requests", params: { request: { subject: "", comment: { body: "Help" } } }, headers: bearer(@avery_token), as: :json
++    end
++    assert_response :unprocessable_content
++    assert json.dig("error", "details", "subject").present?
++
++    assert_no_difference -> { Request.count } do
++      post "/api/v1/requests", params: { request: { subject: "Help", comment: { body: "  " } } }, headers: bearer(@avery_token), as: :json
++    end
++    assert_response :unprocessable_content
++    assert json.dig("error", "details", "body").present?
++  end
++
++  test "a request without a comment envelope is a 400" do
++    post "/api/v1/requests", params: { request: { subject: "Help" } }, headers: bearer(@avery_token), as: :json
++
++    assert_response :bad_request
++    assert_equal "parameter_missing", json.dig("error", "code")
++  end
++
++  test "a customer cannot set status, requester or business when opening a request" do
++    post "/api/v1/requests",
++         params: { request: { subject: "Help", status: "solved", requester_id: @ben.dig("user", "id"),
++                              comment: { body: "Please help." } } },
++         headers: bearer(@avery_token),
++         as: :json
++
++    assert_response :created
++    assert_equal "open", json.dig("request", "status")
++    assert_equal @avery_id, json.dig("request", "requester_id")
++  end
++
++  # --- Listing and showing ------------------------------------------------------
++
++  test "lists only the customer's own requests, most recently active first" do
++    first = open_request!(@avery_token, subject: "First")
++    open_request!(@ben_token, subject: "Ben's")
++    second = open_request!(@avery_token, subject: "Second")
++
++    # A new reply makes the first request the most recently active one.
++    customer_patch(@avery_token, first["id"], comment: { body: "Still broken." })
++
++    get "/api/v1/requests", headers: bearer(@avery_token)
++
++    assert_response :ok
++    assert_equal [first["id"], second["id"]], request_ids
++    assert_equal 2, json["count"]
++    assert_equal 1, json["page"]
++    assert_equal 25, json["per_page"]
++    assert_nil json["next_page"]
++    assert_nil json["previous_page"]
++  end
++
++  test "a customer can open their own request" do
++    opened = open_request!(@avery_token)
++
++    get "/api/v1/requests/#{opened['id']}", headers: bearer(@avery_token)
++
++    assert_response :ok
++    assert_equal opened["id"], json.dig("request", "id")
++    assert_equal "open", json.dig("request", "status")
++  end
++
++  test "another customer's request looks missing" do
++    opened = open_request!(@ben_token)
++
++    get "/api/v1/requests/#{opened['id']}", headers: bearer(@avery_token)
++
++    assert_response :not_found
++    assert_equal "not_found", json.dig("error", "code")
++    customer_patch(@avery_token, opened["id"], comment: { body: "Hello?" })
++    assert_response :not_found
++    get "/api/v1/requests/#{opened['id']}/comments", headers: bearer(@avery_token)
++    assert_response :not_found
++  end
++
++  test "a request id from another business is not found" do
++    signup!(subdomain: "globex", name: "Globex", email: "jo@globex.test")
++    customer_session(subdomain: "globex", email: "ivy@globex.test", name: "Ivy")
++    globex_token = sign_in!(subdomain: "globex", email: "ivy@globex.test", password: CUSTOMER_PASSWORD)
++                   .dig("session", "token")
++    elsewhere = open_request!(globex_token)
++
++    get "/api/v1/requests/#{elsewhere['id']}", headers: bearer(@avery_token)
++
++    assert_response :not_found
++  end
++
++  test "an unknown or non-numeric request id is a 404" do
++    get "/api/v1/requests/999999", headers: bearer(@avery_token)
++    assert_response :not_found
++
++    get "/api/v1/requests/abc", headers: bearer(@avery_token)
++    assert_response :not_found
++  end
++
++  test "request endpoints need a session" do
++    get "/api/v1/requests"
++    assert_response :unauthorized
++
++    post "/api/v1/requests", params: { request: { subject: "Help", comment: { body: "Help" } } }, as: :json
++    assert_response :unauthorized
++  end
++
++  # --- Replying -----------------------------------------------------------------
++
++  test "a reply to an open request keeps it open" do
++    opened = open_request!(@avery_token)
++
++    customer_patch(@avery_token, opened["id"], comment: { body: "Any update?" })
++
++    assert_response :ok
++    assert_equal "open", json.dig("request", "status")
++    assert_equal 2, Request.find(opened["id"]).comments.count
++  end
++
++  test "a reply reopens a pending request" do
++    opened = open_request!(@avery_token)
++    staff_set_status(opened["id"], "pending")
++
++    customer_patch(@avery_token, opened["id"], comment: { body: "I tried again and it still fails." })
++
++    assert_response :ok
++    assert_equal "open", json.dig("request", "status")
++  end
++
++  test "a reply reopens a solved request" do
++    opened = open_request!(@avery_token)
++    staff_set_status(opened["id"], "solved")
++
++    customer_patch(@avery_token, opened["id"], comment: { body: "It is broken again." })
++
++    assert_response :ok
++    assert_equal "open", json.dig("request", "status")
++  end
++
++  test "a reply that marks the request solved leaves it solved" do
++    opened = open_request!(@avery_token)
++    staff_set_status(opened["id"], "pending")
++
++    customer_patch(@avery_token, opened["id"], comment: { body: "Works now, thanks." }, status: "solved")
++
++    assert_response :ok
++    assert_equal "solved", json.dig("request", "status")
++  end
++
++  test "marking solved without a comment solves the request" do
++    opened = open_request!(@avery_token)
++
++    customer_patch(@avery_token, opened["id"], status: "solved")
++
++    assert_response :ok
++    assert_equal "solved", json.dig("request", "status")
++    assert_equal 1, Request.find(opened["id"]).comments.count
++  end
++
++  test "customers can mark a request solved but cannot set open or pending" do
++    opened = open_request!(@avery_token)
++
++    %w[pending open].each do |status|
++      assert_no_difference -> { Comment.count } do
++        customer_patch(@avery_token, opened["id"], comment: { body: "Trying to sneak a status in." }, status: status)
++      end
++      assert_response :unprocessable_content
++      assert json.dig("error", "details", "status").present?
++    end
++    assert_equal "open", Request.find(opened["id"]).status
++  end
++
++  test "a blank reply is rejected and does not reopen the request" do
++    opened = open_request!(@avery_token)
++    staff_set_status(opened["id"], "solved")
++
++    assert_no_difference -> { Comment.count } do
++      customer_patch(@avery_token, opened["id"], comment: { body: "" })
++    end
++
++    assert_response :unprocessable_content
++    assert json.dig("error", "details", "body").present?
++    assert_equal "solved", Request.find(opened["id"]).status
++  end
++
++  test "a reply with neither a comment nor a status is rejected" do
++    opened = open_request!(@avery_token)
++
++    customer_patch(@avery_token, opened["id"], subject: "Changed my mind")
++
++    assert_response :unprocessable_content
++    assert json.dig("error", "details", "base").present?
++  end
++
++  test "a reply envelope must be an object" do
++    opened = open_request!(@avery_token)
++
++    patch "/api/v1/requests/#{opened['id']}", params: { request: "solved" }, headers: bearer(@avery_token), as: :json
++
++    assert_response :bad_request
++    assert_equal "parameter_missing", json.dig("error", "code")
++  end
++
++  # --- Comments -----------------------------------------------------------------
++
++  test "comments show public messages only, oldest first, with their author" do
++    opened = open_request!(@avery_token, body: "The download button does nothing.")
++    request = Request.find(opened["id"])
++    staff = User.find_by!(email: "sam@acme.test")
++
++    request.comments.create!(author: staff, body: "Looking into it.", public: true)
++    request.comments.create!(author: staff, body: "Internal: check billing logs.", public: false)
++    customer_patch(@avery_token, opened["id"], comment: { body: "Still nothing on Safari." })
++
++    get "/api/v1/requests/#{opened['id']}/comments", headers: bearer(@avery_token)
++
++    assert_response :ok
++    comments = json.fetch("comments")
++    assert_equal ["The download button does nothing.", "Looking into it.", "Still nothing on Safari."],
++                 comments.map { |c| c["body"] }
++    assert_equal [true, true, true], comments.map { |c| c["public"] }
++    assert_equal({ "id" => @avery_id, "name" => "Avery" }, comments.first["author"])
++    assert_equal({ "id" => staff.id, "name" => "Sam" }, comments.second["author"])
++    assert comments.first["created_at"].present?
++    assert_equal %w[author body created_at id public], comments.first.keys.sort
++    assert_equal 3, json["count"]
++  end
++
++  test "a customer's comment list is paginated" do
++    opened = open_request!(@avery_token)
++    customer_patch(@avery_token, opened["id"], comment: { body: "Second" })
++    customer_patch(@avery_token, opened["id"], comment: { body: "Third" })
++
++    get "/api/v1/requests/#{opened['id']}/comments", params: { per_page: 2, page: 2 }, headers: bearer(@avery_token)
++
++    assert_response :ok
++    assert_equal ["Third"], json.fetch("comments").map { |c| c["body"] }
++    assert_equal 3, json["count"]
++    assert_equal 1, json["previous_page"]
++    assert_nil json["next_page"]
++  end
++
++  # --- Business boundaries ------------------------------------------------------
++
++  test "a customer session used with another business's header is refused" do
++    signup!(subdomain: "globex", name: "Globex", email: "jo@globex.test")
++
++    get "/api/v1/requests", headers: bearer(@avery_token).merge(in_account("globex"))
++
++    assert_response :forbidden
++    assert_equal "wrong_account", json.dig("error", "code")
++  end
++
++  test "subjects and comments have length limits" do
++    post "/api/v1/requests",
++         params: { request: { subject: "s" * 256, comment: { body: "Help" } } },
++         headers: bearer(@avery_token),
++         as: :json
++    assert_response :unprocessable_content
++    assert json.dig("error", "details", "subject").present?
++
++    opened = open_request!(@avery_token)
++    customer_patch(@avery_token, opened["id"], comment: { body: "b" * 10_001 })
++    assert_response :unprocessable_content
++    assert json.dig("error", "details", "body").present?
++
++    customer_patch(@avery_token, opened["id"], comment: { body: "b" * 10_000 })
++    assert_response :ok
++  end
++
++  test "marking an already solved request solved again is a no-op" do
++    opened = open_request!(@avery_token)
++    staff_set_status(opened["id"], "solved")
++
++    customer_patch(@avery_token, opened["id"], status: "solved")
++
++    assert_response :ok
++    assert_equal "solved", json.dig("request", "status")
++    assert_equal 1, Request.find(opened["id"]).comments.count
++  end
++
++  test "there is no PUT route for requests" do
++    opened = open_request!(@avery_token)
++
++    put "/api/v1/requests/#{opened['id']}", params: { request: { status: "solved" } }, headers: bearer(@avery_token), as: :json
++
++    assert_response :not_found
++    assert_equal "open", Request.find(opened["id"]).status
++  end
++
++  test "a cancelled business blocks requests for its customers" do
++    opened = open_request!(@avery_token)
++    owner_token = sign_in!.dig("session", "token")
++    post "/api/v1/account/cancel", headers: bearer(owner_token)
++
++    get "/api/v1/requests", headers: bearer(@avery_token)
++    assert_response :unauthorized
++
++    token = Session.start_for(User.find(@avery_id)).token
++    get "/api/v1/requests/#{opened['id']}", headers: bearer(token)
++    assert_response :forbidden
++    assert_equal "account_cancelled", json.dig("error", "code")
++  end
++end
+diff --git a/test/integration/tickets_test.rb b/test/integration/tickets_test.rb
+new file mode 100644
+index 0000000..7a1cafb
+--- /dev/null
++++ b/test/integration/tickets_test.rb
+@@ -0,0 +1,264 @@
++require "test_helper"
++
++class TicketsTest < ActionDispatch::IntegrationTest
++  setup do
++    @owner_token = owner_session.dig("session", "token")
++    add_staff!(email: "sam@acme.test", role: "agent")
++    @agent_token = sign_in!(email: "sam@acme.test").dig("session", "token")
++
++    @avery = customer_session
++    @avery_token = @avery.dig("session", "token")
++    @avery_id = @avery.dig("user", "id")
++    @ben_token = customer_session(email: "ben@example.test", name: "Ben").dig("session", "token")
++  end
++
++  def staff_patch(id, ticket, token: @agent_token)
++    patch "/api/v1/tickets/#{id}", params: { ticket: ticket }, headers: bearer(token), as: :json
++  end
++
++  # --- Access -------------------------------------------------------------------
++
++  test "customers cannot use the staff routes" do
++    opened = open_request!(@avery_token)
++
++    get "/api/v1/tickets", headers: bearer(@avery_token)
++    assert_response :forbidden
++    assert_equal "forbidden", json.dig("error", "code")
++
++    get "/api/v1/tickets/#{opened['id']}", headers: bearer(@avery_token)
++    assert_response :forbidden
++
++    get "/api/v1/tickets/#{opened['id']}/comments", headers: bearer(@avery_token)
++    assert_response :forbidden
++
++    staff_patch(opened["id"], { status: "solved" }, token: @avery_token)
++    assert_response :forbidden
++    assert_equal "open", Request.find(opened["id"]).status
++  end
++
++  test "staff replies store a string public flag as a boolean" do
++    opened = open_request!(@avery_token)
++
++    staff_patch(opened["id"], { comment: { body: "Internal.", public: "false" } })
++
++    assert_response :ok
++    assert_equal false, Request.find(opened["id"]).comments.order(:id).last.public?
++  end
++
++  test "the owner and agents can both work tickets" do
++    opened = open_request!(@avery_token)
++
++    get "/api/v1/tickets/#{opened['id']}", headers: bearer(@owner_token)
++    assert_response :ok
++    get "/api/v1/tickets/#{opened['id']}", headers: bearer(@agent_token)
++    assert_response :ok
++  end
++
++  test "staff routes need a session" do
++    get "/api/v1/tickets"
++    assert_response :unauthorized
++  end
++
++  # --- Listing and showing ------------------------------------------------------
++
++  test "lists every request in the business as a ticket, with the requester" do
++    first = open_request!(@avery_token, subject: "Receipt")
++    second = open_request!(@ben_token, subject: "Login")
++
++    get "/api/v1/tickets", headers: bearer(@agent_token)
++
++    assert_response :ok
++    assert_equal 2, json["count"]
++    tickets = json.fetch("tickets")
++    assert_equal [second["id"], first["id"]], tickets.map { |t| t["id"] }
++
++    ticket = tickets.last
++    assert_equal %w[created_at id requester requester_id status subject updated_at], ticket.keys.sort
++    assert_equal({ "id" => @avery_id, "name" => "Avery", "email" => "avery@example.test" }, ticket["requester"])
++    assert_equal @avery_id, ticket["requester_id"]
++    assert_equal "Receipt", ticket["subject"]
++  end
++
++  test "tickets are ordered by recent activity, so a new reply moves a ticket to the top" do
++    first = open_request!(@avery_token, subject: "First")
++    open_request!(@ben_token, subject: "Second")
++    customer_patch_reply(@avery_token, first["id"], "Any news?")
++
++    get "/api/v1/tickets", headers: bearer(@agent_token)
++
++    assert_equal "First", json.fetch("tickets").first["subject"]
++  end
++
++  test "shows one ticket with its requester" do
++    opened = open_request!(@avery_token)
++
++    get "/api/v1/tickets/#{opened['id']}", headers: bearer(@agent_token)
++
++    assert_response :ok
++    assert_equal opened["id"], json.dig("ticket", "id")
++    assert_equal "Avery", json.dig("ticket", "requester", "name")
++    assert_equal "avery@example.test", json.dig("ticket", "requester", "email")
++  end
++
++  test "a ticket from another business is not found" do
++    signup!(subdomain: "globex", name: "Globex", email: "jo@globex.test")
++    verify_email!(email: "jo@globex.test", subdomain: "globex")
++    globex_token = sign_in!(subdomain: "globex", email: "jo@globex.test").dig("session", "token")
++    globex_customer = customer_session(subdomain: "globex", email: "ivy@globex.test", name: "Ivy")
++    elsewhere = open_request!(globex_customer.dig("session", "token"))
++
++    get "/api/v1/tickets/#{elsewhere['id']}", headers: bearer(@agent_token)
++    assert_response :not_found
++
++    staff_patch(elsewhere["id"], { status: "solved" })
++    assert_response :not_found
++    assert_equal "open", Request.find(elsewhere["id"]).status
++
++    get "/api/v1/tickets", headers: bearer(globex_token)
++    assert_equal ["ivy@globex.test"], json.fetch("tickets").map { |t| t.dig("requester", "email") }
++  end
++
++  test "the ticket list is paginated" do
++    3.times { |i| open_request!(@ben_token, subject: "Issue #{i}") }
++
++    get "/api/v1/tickets", params: { per_page: 2 }, headers: bearer(@agent_token)
++
++    assert_response :ok
++    assert_equal 2, json.fetch("tickets").size
++    assert_equal 3, json["count"]
++    assert_equal 2, json["per_page"]
++    assert_equal 2, json["next_page"]
++  end
++
++  # --- Replying -----------------------------------------------------------------
++
++  test "a staff reply with a status posts the comment and changes the status" do
++    opened = open_request!(@avery_token)
++
++    staff_patch(opened["id"], { comment: { body: "Please try again now." }, status: "pending" })
++
++    assert_response :ok
++    assert_equal "pending", json.dig("ticket", "status")
++    comment = Request.find(opened["id"]).comments.order(:id).last
++    assert_equal "Please try again now.", comment.body
++    assert_equal "Sam", comment.author.name
++    assert comment.public?
++  end
++
++  test "a staff reply on its own does not change the status" do
++    opened = open_request!(@avery_token)
++    staff_patch(opened["id"], { status: "pending" })
++
++    staff_patch(opened["id"], { comment: { body: "Looking into it." } })
++
++    assert_response :ok
++    assert_equal "pending", json.dig("ticket", "status")
++    assert_equal "pending", Request.find(opened["id"]).status
++  end
++
++  test "staff can set open, pending and solved, and nothing else" do
++    opened = open_request!(@avery_token)
++
++    %w[pending solved open].each do |status|
++      staff_patch(opened["id"], { status: status })
++      assert_response :ok
++      assert_equal status, json.dig("ticket", "status")
++    end
++
++    staff_patch(opened["id"], { comment: { body: "Adding a note." }, status: "closed" })
++    assert_response :unprocessable_content
++    assert json.dig("error", "details", "status").present?
++    assert_equal "open", Request.find(opened["id"]).status
++  end
++
++  test "a rejected status change does not leave its comment behind" do
++    opened = open_request!(@avery_token)
++
++    assert_no_difference -> { Comment.count } do
++      staff_patch(opened["id"], { comment: { body: "Half done." }, status: "" })
++    end
++    assert_response :unprocessable_content
++  end
++
++  test "a staff status change without a comment is allowed" do
++    opened = open_request!(@avery_token)
++
++    assert_no_difference -> { Comment.count } do
++      staff_patch(opened["id"], { status: "solved" })
++    end
++
++    assert_response :ok
++    assert_equal "solved", json.dig("ticket", "status")
++  end
++
++  test "a staff update needs a comment or a status" do
++    opened = open_request!(@avery_token)
++
++    staff_patch(opened["id"], { subject: "Renamed" })
++
++    assert_response :unprocessable_content
++    assert json.dig("error", "details", "base").present?
++  end
++
++  test "a staff update envelope must be an object" do
++    opened = open_request!(@avery_token)
++
++    patch "/api/v1/tickets/#{opened['id']}", params: { ticket: "pending" }, headers: bearer(@agent_token), as: :json
++
++    assert_response :bad_request
++    assert_equal "parameter_missing", json.dig("error", "code")
++  end
++
++  test "a customer reply after a staff reply reopens a solved ticket" do
++    opened = open_request!(@avery_token)
++    staff_patch(opened["id"], { comment: { body: "Fixed." }, status: "solved" })
++
++    customer_patch_reply(@avery_token, opened["id"], "Thanks, but it broke again.")
++
++    assert_equal "open", Request.find(opened["id"]).status
++  end
++
++  # --- Private notes ------------------------------------------------------------
++
++  test "private notes are visible to staff and hidden from the customer" do
++    opened = open_request!(@avery_token)
++    staff_patch(opened["id"], { comment: { body: "Check the billing logs first.", public: false } })
++    staff_patch(opened["id"], { comment: { body: "We are on it." } })
++
++    get "/api/v1/tickets/#{opened['id']}/comments", headers: bearer(@agent_token)
++    assert_response :ok
++    staff_view = json.fetch("comments")
++    assert_equal ["The download button does nothing.", "Check the billing logs first.", "We are on it."],
++                 staff_view.map { |c| c["body"] }
++    assert_equal [true, false, true], staff_view.map { |c| c["public"] }
++
++    get "/api/v1/requests/#{opened['id']}/comments", headers: bearer(@avery_token)
++    customer_view = json.fetch("comments").map { |c| c["body"] }
++    assert_equal ["The download button does nothing.", "We are on it."], customer_view
++  end
++
++  test "a private note does not reopen a solved request" do
++    opened = open_request!(@avery_token)
++    staff_patch(opened["id"], { status: "solved" })
++
++    staff_patch(opened["id"], { comment: { body: "Internal only.", public: false } })
++
++    assert_equal "solved", Request.find(opened["id"]).status
++  end
++
++  test "public must be true or false" do
++    opened = open_request!(@avery_token)
++
++    staff_patch(opened["id"], { comment: { body: "Hmm.", public: nil } })
++
++    assert_response :unprocessable_content
++    assert json.dig("error", "details", "public").present?
++  end
++
++  private
++
++  def customer_patch_reply(token, id, body)
++    patch "/api/v1/requests/#{id}", params: { request: { comment: { body: body } } }, headers: bearer(token), as: :json
++    assert_response :ok, response.body
++  end
++end
+diff --git a/test/models/request_test.rb b/test/models/request_test.rb
+new file mode 100644
+index 0000000..5442dfb
+--- /dev/null
++++ b/test/models/request_test.rb
+@@ -0,0 +1,129 @@
++require "test_helper"
++
++class RequestTest < ActiveSupport::TestCase
++  setup do
++    @account = Account.create!(name: "Acme", subdomain: "acme")
++    @customer = @account.users.create!(name: "Avery", email: "avery@example.test", password: "my-customer-password", role: "customer")
++    @agent = @account.users.create!(name: "Sam", email: "sam@acme.test", password: "my-first-password", role: "agent")
++    @request = Request.submit!(requester: @customer, subject: "Receipt", body: "Button does nothing.")
++  end
++
++  def status
++    @request.reload.status
++  end
++
++  test "submit! opens the request with a public first comment" do
++    assert_equal "open", @request.status
++    assert_equal @customer, @request.requester
++    assert_equal @account, @request.account
++    assert_equal [["Button does nothing.", true]], @request.comments.map { |c| [c.body, c.public?] }
++  end
++
++  test "submit! saves nothing when the comment is blank" do
++    assert_no_difference -> { Request.count } do
++      assert_raises(ActiveRecord::RecordInvalid) do
++        Request.submit!(requester: @customer, subject: "Receipt", body: "")
++      end
++    end
++  end
++
++  test "a requester reply reopens pending and solved requests" do
++    @request.staff_reply!(author: @agent, status: "pending")
++    @request.requester_reply!(author: @customer, body: "Still broken")
++    assert_equal "open", status
++
++    @request.staff_reply!(author: @agent, status: "solved")
++    @request.requester_reply!(author: @customer, body: "Broken again")
++    assert_equal "open", status
++  end
++
++  test "a requester can mark solved, with or without a comment" do
++    @request.requester_reply!(author: @customer, status: "solved")
++    assert_equal "solved", status
++
++    @request.requester_reply!(author: @customer, body: "Thanks!", status: "solved")
++    assert_equal "solved", status
++  end
++
++  test "a requester cannot set pending or open" do
++    %w[pending open bogus].each do |value|
++      error = assert_raises(ActiveRecord::RecordInvalid) do
++        @request.requester_reply!(author: @customer, body: "Nope", status: value)
++      end
++      assert error.record.errors[:status].present?
++    end
++    assert_equal 1, @request.comments.count
++    assert_equal "open", status
++  end
++
++  test "a requester reply needs a comment or a status" do
++    error = assert_raises(ActiveRecord::RecordInvalid) { @request.requester_reply!(author: @customer) }
++
++    assert error.record.errors[:base].present?
++  end
++
++  test "a staff reply without a status keeps the status" do
++    @request.staff_reply!(author: @agent, status: "pending")
++    @request.staff_reply!(author: @agent, body: "On it.")
++
++    assert_equal "pending", status
++    assert_equal "On it.", @request.comments.order(:id).last.body
++  end
++
++  test "a staff reply can be a private note" do
++    @request.staff_reply!(author: @agent, body: "Internal.", public: false)
++
++    assert_equal false, @request.comments.order(:id).last.public?
++  end
++
++  test "a bad status from staff saves nothing, including the comment" do
++    assert_no_difference -> { Comment.count } do
++      assert_raises(ActiveRecord::RecordInvalid) do
++        @request.staff_reply!(author: @agent, body: "Half done.", status: "closed")
++      end
++    end
++    assert_equal "open", status
++  end
++
++  test "a request and its comments cannot belong to another business" do
++    other = Account.create!(name: "Globex", subdomain: "globex")
++    outsider = other.users.create!(name: "Ivy", email: "ivy@globex.test", password: "my-first-password", role: "agent")
++
++    mismatched = Request.new(account: @account, requester: outsider, subject: "Hi", status: "open")
++    refute mismatched.valid?
++    assert mismatched.errors[:requester].present?
++
++    comment = @request.comments.build(author: outsider, body: "Hello", public: true)
++    refute comment.valid?
++    assert comment.errors[:author].present?
++  end
++
++  test "a comment touches its request so the request sorts as recently active" do
++    other = Request.submit!(requester: @customer, subject: "Other", body: "Hi")
++    # Without a touch, `other` would be the most recent. The reply must move @request ahead of it.
++    @request.update_columns(updated_at: 3.days.ago)
++    other.update_columns(updated_at: 2.days.ago)
++    assert_equal other.id, Request.where(account: @account).recently_active.first.id
++
++    @request.comments.create!(author: @customer, body: "Bump", public: true)
++
++    assert_equal @request.id, Request.where(account: @account).recently_active.first.id
++  end
++
++  test "the staff view adds the requester's details" do
++    view = @request.as_ticket_api_json
++
++    assert_equal({ id: @customer.id, name: "Avery", email: "avery@example.test" }, view[:requester])
++    assert_equal @customer.id, view[:requester_id]
++  end
++
++  test "purging a cancelled account removes its requests and their comments" do
++    @request.staff_reply!(author: @agent, body: "Internal", public: false)
++    Request.submit!(requester: @customer, subject: "Second", body: "Hello")
++    @account.update!(cancelled_at: 100.days.ago)
++
++    assert_equal 1, Account.purge_cancelled!
++    assert_equal 0, Request.count
++    assert_equal 0, Comment.count
++  end
++end
+diff --git a/test/test_helper.rb b/test/test_helper.rb
+index aa479b7..fd166fd 100644
+--- a/test/test_helper.rb
++++ b/test/test_helper.rb
+@@ -5,6 +5,7 @@ require "rails/test_help"
+ module ApiTestHelpers
+   ACCOUNT_HEADER = "X-Helpdesk-Account".freeze
+   PASSWORD = "my-first-password".freeze
++  CUSTOMER_PASSWORD = "my-customer-password".freeze
+ 
+   def json
+     JSON.parse(response.body)
+@@ -66,6 +67,43 @@ module ApiTestHelpers
+     assert_response :ok, response.body
+   end
+ 
++  def registration_params(name: "Avery", email: "avery@example.test", password: CUSTOMER_PASSWORD)
++    { user: { name: name, email: email, password: password } }
++  end
++
++  def register!(subdomain: "acme", **options)
++    post "/api/v1/registrations",
++         params: registration_params(**options),
++         headers: in_account(subdomain),
++         as: :json
++    assert_response :created, response.body
++    json
++  end
++
++  # Registers, verifies and signs in a customer. Returns the sign-in JSON.
++  def customer_session(subdomain: "acme", email: "avery@example.test", password: CUSTOMER_PASSWORD, name: "Avery")
++    register!(subdomain: subdomain, name: name, email: email, password: password)
++    verify_email!(email: email, subdomain: subdomain)
++    sign_in!(email: email, password: password, subdomain: subdomain)
++  end
++
++  # Adds a staff member directly, since the API has no staff invitations yet.
++  def add_staff!(email:, role: "agent", subdomain: "acme", password: PASSWORD)
++    Account.find_by!(subdomain: subdomain).users.create!(
++      name: "Sam", email: email, password: password, role: role, verified_at: Time.current
++    )
++  end
++
++  # Opens a request as the customer behind `token`. Returns the request JSON.
++  def open_request!(token, subject: "Cannot download my receipt", body: "The download button does nothing.")
++    post "/api/v1/requests",
++         params: { request: { subject: subject, comment: { body: body } } },
++         headers: bearer(token),
++         as: :json
++    assert_response :created, response.body
++    json.fetch("request")
++  end
++
+   # Signs up and verifies the owner, then signs in. Returns the sign-in JSON.
+   def owner_session(subdomain: "acme", email: "jo@acme.test", password: PASSWORD)
+     signup!(subdomain: subdomain, email: email, password: password)

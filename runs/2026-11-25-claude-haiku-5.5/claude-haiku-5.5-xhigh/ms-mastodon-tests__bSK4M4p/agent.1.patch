@@ -1,0 +1,409 @@
+diff --git a/config/environments/test.rb b/config/environments/test.rb
+index 12709d5..17f308d 100644
+--- a/config/environments/test.rb
++++ b/config/environments/test.rb
+@@ -22,6 +22,10 @@ Rails.application.configure do
+   # Show full error reports and disable caching.
+   config.consider_all_requests_local = true
+   config.action_controller.perform_caching = false
++  # At debug level every SQL query (and its binds) is formatted and written to the
++  # test log, which costs a noticeable share of the suite run time. Keep the default
++  # quieter; set RAILS_LOG_LEVEL=debug to get the SQL logs back when debugging.
++  config.log_level = ENV.fetch('RAILS_LOG_LEVEL', 'info')
+   config.cache_store = :memory_store
+ 
+   # Render exception templates for rescuable exceptions and raise for other exceptions.
+diff --git a/docs/rspec-performance.md b/docs/rspec-performance.md
+new file mode 100644
+index 0000000..b82cf47
+--- /dev/null
++++ b/docs/rspec-performance.md
+@@ -0,0 +1,318 @@
++# RSpec suite performance: notes, baselines and plan
++
++Living document for the "make the suite fast again" effort. Update the
++numbers and the phase log whenever a change is measured.
++
++- Goal: the full RSpec run (serial, no parallelisation) on CI had grown past
++  10 minutes.
++- Phase 1: `spec/models`. Target: at least 30-35% faster. **Done: about 61%
++  faster** (see results).
++- Phase 2: `spec/requests`. Then the combined target: `spec/models` +
++  `spec/requests` at least 2x faster than the baseline (see "Phase 2 plan").
++- Constraints that applied in every phase: no app code changes that alter
++  runtime behaviour, no changes to what examples assert, factories untouched
++  until their own phase, system and streaming specs ignored.
++
++## How to measure
++
++```bash
++cd /app
++bundle exec rspec spec/models --seed 4242 --format progress --format json --out tmp/perf/models.json
++```
++
++- Always pass a fixed `--seed`. `config.order = 'random'` makes the order
++  (and therefore the cost of shared state) differ otherwise.
++- Read the timing from the JSON: `summary.duration` is the sum of example time
++  and matches wall-clock minus about 2-3 s of boot. Do not use the console
++  "Finished in" line for comparisons.
++- Run one `rspec` process at a time. Runs share the `mastodon_test` database
++  and the Redis keyspace (`config.after` flushes Redis keys), so concurrent runs
++  corrupt each other.
++- This container is noisy: the same code and seed varied by about 10-20%
++  between runs (models: 48.0 s and 58.4 s; requests: 135 s and 173 s). For any
++  claim, interleave a pristine run and a changed run (see "Paired runs").
++- `log/test.log` grows by about 100 MB per models run at debug level. After the
++  phase 1 log-level change it stays small by default. Truncate it when needed.
++- Tools that are not on this box: `python3`, `bc`. Use Ruby for JSON analysis.
++
++Environment during the measurements (container, shared VM host):
++Ruby 4.0.6, Rails 8.1.3.1, rspec-core 3.13.6, rspec-rails 8.0.4,
++rspec-mocks 3.13.8, sidekiq 8.1.6, fabrication 3.0.0, kt-paperclip 8.0.0,
++bcrypt 3.1.22, devise 5.0.4, PostgreSQL 17 (unix socket, `mastodon_test`),
++local redis-server, 12 vCPU aarch64. `CI` was unset, so `eager_load` was off
++(as in a normal local run).
++
++### Paired runs (how to compare pristine vs changed)
++
++```bash
++git stash push -u -m perf-current     # -u also stashes new support files
++bundle exec rspec spec/models --seed 4242 --format json --out tmp/perf/pristine.json
++git stash pop
++bundle exec rspec spec/models --seed 4242 --format json --out tmp/perf/current.json
++```
++
++Make sure `git stash list` is empty afterwards. Repeat the pair at least twice.
++
++### Analysis snippets (not part of the repo)
++
++Per-file and per-example breakdown from the JSON report:
++
++```ruby
++require 'json'
++d = JSON.parse(File.read(ARGV[0]))
++s = d['summary']
++puts "examples=#{s['example_count']} failures=#{s['failure_count']} duration=#{s['duration'].round(2)}s"
++per_file = Hash.new(0.0)
++d['examples'].each { |e| per_file[e['file_path'].sub(%r{^\./}, '')] += e['run_time'] }
++per_file.sort_by { |_, v| -v }.first(25).each { |f, t| printf("%8.2fs  %s\n", t, f) }
++```
++
++Sampling profile (wall mode) with StackProf, loaded via `rspec -r`:
++
++```ruby
++# tmp/profile_hook.rb, load with: bundle exec rspec spec/models -r ./tmp/profile_hook.rb
++require 'stackprof'
++RSpec.configure do |config|
++  config.before(:suite) { StackProf.start(mode: :wall, raw: true, interval: 1000) }
++  config.after(:suite)  { StackProf.stop; StackProf.results('tmp/stackprof.dump') }
++end
++```
++
++Then aggregate the dump by source (gem, app, spec support, factories) with a
++short script over `Marshal.load(File.binread(dump))[:frames]` (self samples
++by `:file`), and look at inclusive totals for suspicious method names
++(`serialize_event`, `LogSubscriber#sql`, `BacktraceCleaner`, `BCrypt`,
++`Paperclip::Processor.make`, `Fabrication::Generator::Base#create`, ...).
++
++SQL shape per run: subscribe to `sql.active_record`, normalise literals out of
++the SQL (`gsub(/'(?:[^']|'')*'/, '?').gsub(/\b\d+\b/, '?')`), count templates and
++queries per example. Do this in a temporary hook, never in the repo.
++
++## Baseline (before any change)
++
++| Group | Examples | Example time (JSON `duration`) | Notes |
++|---|---:|---:|---|
++| `spec/models` | 1795 | 133.98 s single run, 129.40 s and 127.30 s paired | seed 4242, 0 failures |
++| `spec/requests` | 1877 | 165.12 s single run, 177.69 s paired | seed 4242, 0 failures |
++
++Combined baseline: about 300 s (models 134 + requests 165, single runs) or
++about 306 s from the paired pristine runs. The 2x target for the final state
++is therefore about 150 s combined.
++
++Heaviest files at baseline (single run):
++
++- models: `account_statuses_cleanup_policy_spec` 12.1 s (36 ex),
++  `tag_feed_spec` 11.2 s (33), `trends/statuses_spec` 11.2 s (12),
++  `status_spec` 10.5 s (62), `public_feed_spec` 7.3 s (43),
++  `threading_concern_spec` 5.9 s (16), `notification_spec` 5.7 s (25),
++  `media_attachment_spec` 5.4 s (27).
++- requests: `cache_spec.rb` 35.6 s (258 ex), `activitypub/replies_spec.rb`
++  14.8 s (45), `support/examples/api.rb` shared examples 13.7 s (239),
++  `api/v2/notifications_spec.rb` 7.2 s (24), `signature_verification_spec.rb`
++  6.3 s (30), `api/v1/notifications_spec.rb` 5.1 s (17).
++
++## Phase 1 (spec/models): what was wrong and what changed
++
++Three shared problems explained nearly all of the models overhead. Shares below
++are from StackProf sample counts on the same seed.
++
++### 1. A spec leaked `ActiveRecord.verbose_query_logs = true` into the whole run
++
++`spec/models/concerns/status/fetch_replies_concern_spec.rb` assigned the global
++at load time (in the `describe` body), so it was in effect for every example in
++the process. With verbose query logs on, ActiveRecord computes the caller
++source location of every SQL query by walking the backtrace
++(`ActiveSupport::BacktraceCleaner#first_clean_frame` and
++`Thread.each_caller_location`). That was about 30% of all samples.
++
++Fix: scope the setting to that group with an `around` hook that restores the
++previous value. The spec's assertions are unchanged.
++
++Rule for future specs: never assign global configuration in a `describe` body
++or at file load time. Use an `around` hook that restores the old value.
++
++### 2. Every local status, account, report and user event serialized its webhook payload for nothing
++
++`WebhookService#call` builds the full ActiveModelSerializers payload
++(`serialize_event`) before it asks which enabled webhooks subscribe to the
++event. Specs create lots of local records with no webhook configured, so the
++payload was computed and thrown away. Serialization alone was about 24.5% of
++samples and about 35k of the roughly 114k SQL queries per run (serializers load
++`account_stats`, `user_roles`, `user_ips`, `user_invite_requests`, ...).
++
++Fix (test-only, `spec/support/skip_unsubscribed_webhook_serialization.rb`): a
++prepended module skips `serialize_event` when no enabled webhook subscribes to
++the event. The subscriber lookup still runs, so the enqueued delivery jobs and
++the return value are unchanged. The shortcut is switched on by an `around`
++hook for `type: :model` only, so other spec types are not affected in this
++phase. Its own check (not committed) covered: no subscriber means no
++serialization and no enqueue; an enabled subscriber still serializes and
++enqueues; a disabled subscriber counts as no subscriber.
++
++The production code has the same waste: `WebhookService` serializes for every
++local event on every instance, whether or not a webhook exists. Reordering the
++check in app code would fix it at the source. That is an app change, so it was
++deliberately not made in this phase. It needs a decision from the owners.
++
++### 3. Debug-level test logging formatted every SQL query
++
++Rails' default test log level is `debug`. Each SQL query then builds a debug
++message (name, binds, colorised SQL) and writes it to `log/test.log`. That was
++about 8.4% of samples plus about 1.6% for the logger writes, and about 90-100 MB
++of log per models run.
++
++Fix: `config/environments/test.rb` sets `config.log_level =
++ENV.fetch('RAILS_LOG_LEVEL', 'info')`. Set `RAILS_LOG_LEVEL=debug` to get SQL
++logs back when debugging a spec. Nothing in the suite asserts on debug output:
++the only logger assertion stubs `Rails.logger.debug`, and `httplog` is still
++loaded in the test env.
++
++## Results
++
++Models, seed 4242, example time:
++
++| Step | Duration | Change vs previous | Cumulative vs baseline |
++|---|---:|---:|---:|
++| Baseline (pristine), single run | 134.0 s | | |
++| 1. Scope verbose query logs to the spec group | 79.4 s | -41% | -41% |
++| 2. Skip unsubscribed webhook serialization (models) | 57.0 s | -28% | -57% |
++| 3. Test log level `info` | 48.0 s | -16% | -64% |
++| Final, paired with pristine (seed 4242), run 1 | 50.5 s | | vs 129.4 s pristine: -61% |
++| Final, paired with pristine (seed 4242), run 2 | 49.9 s | | vs 127.3 s pristine: -61% |
++| Final, seed 98765 (different order) | 51.5 s | | 0 failures |
++
++The per-step numbers are single runs and carry the noise described above. Treat
++them as a rough ladder and use the paired numbers as the result. The step
++attribution is backed by the profiler shares above. All runs: 1795 examples,
++0 failures.
++
++Query count per models run: 113,739 before, 78,987 after (-31%).
++
++Per-file change (paired pristine vs final, seconds):
++
++| spec file | before | after | change |
++|---|---:|---:|---:|
++| `account_statuses_cleanup_policy_spec.rb` | 13.3 | 3.9 | -71% |
++| `trends/statuses_spec.rb` | 10.9 | 3.4 | -69% |
++| `tag_feed_spec.rb` | 10.0 | 3.3 | -67% |
++| `status_spec.rb` | 9.5 | 3.2 | -66% |
++| `public_feed_spec.rb` | 6.7 | 2.4 | -64% |
++| `notification_spec.rb` | 6.0 | 1.9 | -68% |
++| `media_attachment_spec.rb` | 5.4 | 5.1 | -5% |
++| `concerns/status/threading_concern_spec.rb` | 5.2 | 1.7 | -67% |
++| `concerns/account/interactions_spec.rb` | 4.5 | 1.7 | -61% |
++| `account_spec.rb` | 4.4 | 2.0 | -54% |
++| `concerns/status/fetch_replies_concern_spec.rb` | 3.7 | 1.2 | -68% |
++| `form/import_spec.rb` | 3.0 | 1.0 | -66% |
++| `user_spec.rb` | 2.7 | 1.3 | -53% |
++| `report_spec.rb` | 2.1 | 0.6 | -74% |
++| **total (sum of example run_time)** | **129.0** | **50.2** | **-61%** |
++
++`media_attachment_spec.rb` barely moved because its cost is image and audio
++processing (factory-driven). That belongs to the factories phase.
++
++Requests (not a phase 1 target): paired runs gave 177.7 s pristine and 173.3 s
++with the phase 1 changes. That is within noise, so there is no measured
++requests gain from phase 1. The earlier single run of 135 s did not reproduce.
++Webhook skipping is scoped to models by design. The log level is global, and
++the paired runs show no measurable requests effect from it (within noise).
++
++## Profile after phase 1 (spec/models, sample shares)
++
++- Factory creation (`Fabrication::Generator`, `Fabricate`): about 80% inclusive
++  (most of it is ActiveRecord save callbacks).
++- ActiveRecord internals: about 24% self. ActiveModel validations: about 7%
++  self. ActiveSupport callbacks: about 7% self.
++- PostgreSQL round trips (`exec*`, `IO.select`): about 24%. About 79k queries
++  per run, about 44 per example on average (median 21).
++- Paperclip post-processing (thumbnails, image and audio processing): about 9%
++  inclusive.
++- BCrypt password hashing: about 7% inclusive. Devise sets `stretches = 1` in
++  test, but bcrypt clamps the cost to its minimum of 4, so each fabricated user
++  costs about 1.1 ms.
++- GC: about 5%.
++- Remaining webhook overhead (subscriber lookup, `TriggerWebhookWorker#find`):
++  about 4%.
++
++Top remaining SQL templates per run:
++
++- `SELECT user_roles WHERE id = ?` (about 5.8k): `belongs_to :role` loads the
++  role again for each user instance.
++- `username_blocks` existence check (about 5.7k): one per account validation.
++- `SAVEPOINT` / `RELEASE` (about 5.6k): from nested transactions in callbacks.
++- `SELECT 1 AS one` uniqueness validations (about 26k): standard Rails
++  validators.
++- `SELECT webhooks ... ? = ANY(events)` (about 3.8k): the subscriber lookup
++  that remains.
++- `settings WHERE var = ?` (about 3k): settings are re-read because
++  `Rails.cache.clear` runs after each example.
++
++Heaviest examples by query count (candidates for per-example review in a
++later phase): `trends/statuses_spec.rb:140` (1444 queries),
++`trends/statuses_spec.rb:132` (1423), `trends/statuses_spec.rb:31` (617).
++
++## Tried and rejected (measured or checked)
++
++- YJIT (`RUBY_YJIT_ENABLE=1`): 51.2 s vs 48.0 s. Slower for a run this short
++  (warm-up cost). Not recommended for this suite.
++- RSA key generation: local accounts generate a 2048-bit key in
++  `Account#generate_keys` (about 52 ms each). The account fabricator already
++  supplies a keypair, so the cost does not occur in specs. Not a problem.
++- `sleep` in specs: none in `spec/models`.
++- `use_transactional_tests: false` and DatabaseCleaner: none in
++  `spec/models`, so no cleanup cost.
++- Redis cleanup in `config.after` (`redis.del(redis.keys)`) and
++  `Rails.cache.clear`: negligible (the keyspace is empty between examples).
++- Routes reload and DNS stubs in `config.before`: negligible in the profile.
++
++## Phase 2 plan (spec/requests)
++
++Target: together with models, at most about 150 s combined. With models at
++about 50 s, requests need to come down to about 100 s from about 175 s, which is
++about -43%.
++
++1. Profile `spec/requests` the same way (the profile hook and the per-file
++   summary above work unchanged). Expect different hot spots: HTTP stack and
++   controllers, signed requests (`SignedRequestHelpers`, RSA signing and
++   verification), serializers, and Devise sign-in in request helpers.
++2. Look at `cache_spec.rb` (258 examples, 35.6 s) first. It is the largest
++   single file. Check whether its examples share setup that is rebuilt per
++   example.
++3. Shared examples in `spec/support/examples/api.rb` run 239 times. Check their
++   per-example setup.
++4. Extend the webhook skip to `type: :request` if the profile still shows
++   serialization. Check first that no request spec expects serialization with
++   no subscriber (`spec/requests/admin/webhooks_spec.rb` creates webhooks, so
++   the skip is inactive there).
++5. Keep checking for global state assigned at load time:
++   `grep -rnE "^\s{2}[A-Za-z:]+\.[a-z_]+\s*=[^=~]" spec/`.
++
++## Factories phase (later, not started)
++
++- Paperclip post-processing for media attachments (about 9% of models samples):
++  check which fabricators generate thumbnails or process real files, and
++  whether specs need the processed versions.
++- BCrypt cost is a floor of 4 in bcrypt. Reducing it would mean changing the
++  hashing scheme, which is out of scope.
++- Account and user fabricators create extra records (a user per account, the
++  keypair, stats). Check which of those each spec actually needs.
++
++## App-level findings (reported, not changed)
++
++These cost time in production as well as in tests. None is changed here, and
++each needs a decision from the owners.
++
++- `WebhookService#call` serializes before checking for subscribers. Check
++  `Webhook.enabled` first and serialize only when there is something to deliver.
++- `User#role` and similar associations load `UserRole` by id once per user
++  instance (about 5.8k queries per models run).
++- `UsernameBlock` checks run once per account validation (about 5.7k queries).
++
++## Log
++
++- 2026-11-25, models: baseline 134.0 s (single) and paired pristine 128.4 s
++  mean. Final: 50.2 s mean paired (-61%). Requests baseline 165.1 s single,
++  177.7 s paired pristine; 173.3 s paired current.
++- Final verification after comment-only edits to `config/environments/test.rb`:
++  models 55.2 s (seed 4242), 1795 examples, 0 failures. Within the noise band
++  above; the paired runs remain the reference numbers.
+diff --git a/spec/models/concerns/status/fetch_replies_concern_spec.rb b/spec/models/concerns/status/fetch_replies_concern_spec.rb
+index e9c81d4..08e64ac 100644
+--- a/spec/models/concerns/status/fetch_replies_concern_spec.rb
++++ b/spec/models/concerns/status/fetch_replies_concern_spec.rb
+@@ -3,7 +3,16 @@
+ require 'rails_helper'
+ 
+ RSpec.describe Status::FetchRepliesConcern do
+-  ActiveRecord.verbose_query_logs = true
++  # Verbose query logs compute the caller source location for every SQL query.
++  # Scope them to this group only: assigning the global at load time leaked into
++  # every other example in the process and slowed down the whole suite.
++  around do |example|
++    previous_verbose_query_logs = ActiveRecord.verbose_query_logs
++    ActiveRecord.verbose_query_logs = true
++    example.run
++  ensure
++    ActiveRecord.verbose_query_logs = previous_verbose_query_logs
++  end
+ 
+   let!(:alice)  { Fabricate(:account, username: 'alice') }
+   let!(:bob)    { Fabricate(:account, username: 'bob', domain: 'other.com') }
+diff --git a/spec/support/skip_unsubscribed_webhook_serialization.rb b/spec/support/skip_unsubscribed_webhook_serialization.rb
+new file mode 100644
+index 0000000..0f0a1dc
+--- /dev/null
++++ b/spec/support/skip_unsubscribed_webhook_serialization.rb
+@@ -0,0 +1,42 @@
++# frozen_string_literal: true
++
++# WebhookService serializes the whole event payload before it looks up which
++# enabled webhooks subscribe to the event. Specs create many local statuses and
++# accounts without any webhook, where that payload is computed and then thrown
++# away. Skip the serialization only when no enabled webhook subscribes to the
++# event: the subscriber lookup still runs and the enqueued jobs (and so the
++# observable behaviour) are unchanged. This is test-only; the production code is
++# not modified.
++#
++# Enabled per example for `type: :model` (see the around hook below).
++module SkipUnsubscribedWebhookSerialization
++  class << self
++    attr_accessor :enabled
++  end
++
++  private
++
++  def webhooks_for_event
++    return super unless SkipUnsubscribedWebhookSerialization.enabled
++
++    @webhooks_for_event ||= super
++  end
++
++  def serialize_event
++    return super unless SkipUnsubscribedWebhookSerialization.enabled
++    return super if webhooks_for_event.any?
++
++    nil
++  end
++end
++
++WebhookService.prepend(SkipUnsubscribedWebhookSerialization)
++
++RSpec.configure do |config|
++  config.around(:each, type: :model) do |example|
++    SkipUnsubscribedWebhookSerialization.enabled = true
++    example.run
++  ensure
++    SkipUnsubscribedWebhookSerialization.enabled = false
++  end
++end
