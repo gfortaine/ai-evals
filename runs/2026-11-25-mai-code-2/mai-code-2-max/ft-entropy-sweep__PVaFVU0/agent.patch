@@ -1,0 +1,190 @@
+diff --git a/app/jobs/card/auto_postpone_all_due_job.rb b/app/jobs/card/auto_postpone_all_due_job.rb
+new file mode 100644
+index 0000000..64af4d7
+--- /dev/null
++++ b/app/jobs/card/auto_postpone_all_due_job.rb
+@@ -0,0 +1,14 @@
++class Card::AutoPostponeAllDueJob < ApplicationJob
++  BATCH_SIZE = 500
++
++  queue_as :backend
++  limits_concurrency to: 1, key: "card-auto-postpone-all-due"
++
++  def perform
++    jobs = Card.due_to_be_postponed.ids.sort.each_slice(BATCH_SIZE).map do |card_ids|
++      Card::AutoPostponeJob.new(card_ids)
++    end
++
++    ActiveJob.perform_all_later jobs if jobs.any?
++  end
++end
+diff --git a/app/jobs/card/auto_postpone_job.rb b/app/jobs/card/auto_postpone_job.rb
+new file mode 100644
+index 0000000..6bd6291
+--- /dev/null
++++ b/app/jobs/card/auto_postpone_job.rb
+@@ -0,0 +1,8 @@
++class Card::AutoPostponeJob < ApplicationJob
++  queue_as :backend
++  limits_concurrency to: 1, key: "card-auto-postpone"
++
++  def perform(card_ids)
++    Card.auto_postpone_all_due(card_ids: card_ids)
++  end
++end
+diff --git a/app/models/card/entropic.rb b/app/models/card/entropic.rb
+index ebaad78..e36a0af 100644
+--- a/app/models/card/entropic.rb
++++ b/app/models/card/entropic.rb
+@@ -24,11 +24,33 @@ module Card::Entropic
+   end
+ 
+   class_methods do
+-    def auto_postpone_all_due
+-      due_to_be_postponed.find_each do |card|
+-        card.auto_postpone(user: card.account.system_user)
+-      end
++    def auto_postpone_all_due(card_ids: nil)
++      cards = due_to_be_postponed
++      cards = cards.where(id: card_ids) unless card_ids.nil?
++
++      cards
++        .preload(:account, :board, :column, :activity_spike, :closure, :not_now)
++        .find_in_batches do |batch|
++          auto_postpone_batch(batch)
++        end
+     end
++
++    private
++      def auto_postpone_batch(cards)
++        boards = cards.index_by(&:board_id).transform_values(&:board)
++        system_users = {}
++
++        Card.no_touching do
++          Board.no_touching do
++            cards.each do |card|
++              system_user = system_users[card.account_id] ||= card.account.system_user
++              card.auto_postpone(user: system_user)
++            end
++          end
++        end
++
++        boards.each_value(&:touch)
++      end
+   end
+ 
+   def entropy
+diff --git a/app/models/card/eventable/system_commenter.rb b/app/models/card/eventable/system_commenter.rb
+index 5c7defc..a1b76cf 100644
+--- a/app/models/card/eventable/system_commenter.rb
++++ b/app/models/card/eventable/system_commenter.rb
+@@ -10,10 +10,18 @@ class Card::Eventable::SystemCommenter
+   def comment
+     return unless comment_body.present?
+ 
+-    card.comments.create! creator: card.account.system_user, body: comment_body, created_at: event.created_at
++    card.comments.create! creator: system_user, body: comment_body, created_at: event.created_at
+   end
+ 
+   private
++    def system_user
++      if event.creator.system? && event.creator.account_id == card.account_id
++        event.creator
++      else
++        card.account.system_user
++      end
++    end
++
+     def comment_body
+       case event.action
+       when "card_assigned"
+diff --git a/config/recurring.yml b/config/recurring.yml
+index 894c57b..aa0dd52 100644
+--- a/config/recurring.yml
++++ b/config/recurring.yml
+@@ -8,7 +8,7 @@ production: &production
+ 
+   # Application cleanup
+   auto_postpone_all_due:
+-    command: "Card.auto_postpone_all_due"
++    class: Card::AutoPostponeAllDueJob
+     schedule: every hour at minute 50
+   delete_unused_tags:
+     class: DeleteUnusedTagsJob
+diff --git a/test/jobs/card/auto_postpone_all_due_job_test.rb b/test/jobs/card/auto_postpone_all_due_job_test.rb
+new file mode 100644
+index 0000000..b5734e0
+--- /dev/null
++++ b/test/jobs/card/auto_postpone_all_due_job_test.rb
+@@ -0,0 +1,32 @@
++require "test_helper"
++
++class Card::AutoPostponeAllDueJobTest < ActiveJob::TestCase
++  setup do
++    cards(:logo).update_column(:last_active_at, 1.year.ago)
++    clear_enqueued_jobs
++  end
++
++  test "enqueue due cards for auto postponement without postponing them in the sweep" do
++    assert_enqueued_with job: Card::AutoPostponeJob, queue: "backend" do
++      assert_no_difference -> { Card.postponed.count } do
++        Card::AutoPostponeAllDueJob.perform_now
++      end
++    end
++
++    args = enqueued_jobs.filter { it[:job] == Card::AutoPostponeJob }.flat_map { it[:args].first }
++    assert_includes args, cards(:logo).id
++    assert_not_includes args, cards(:shipping).id
++  end
++
++  test "split due cards into bounded jobs" do
++    ids = Array.new(Card::AutoPostponeAllDueJob::BATCH_SIZE + 1) { ActiveRecord::Type::Uuid.generate }
++    Card.stubs(:due_to_be_postponed).returns(stub(ids: ids))
++
++    assert_enqueued_jobs 2, only: Card::AutoPostponeJob do
++      Card::AutoPostponeAllDueJob.perform_now
++    end
++
++    batches = enqueued_jobs.filter { it[:job] == Card::AutoPostponeJob }.map { it[:args].first }
++    assert_equal [ Card::AutoPostponeAllDueJob::BATCH_SIZE, 1 ], batches.map(&:size)
++  end
++end
+diff --git a/test/jobs/card/auto_postpone_job_test.rb b/test/jobs/card/auto_postpone_job_test.rb
+new file mode 100644
+index 0000000..cad6e8e
+--- /dev/null
++++ b/test/jobs/card/auto_postpone_job_test.rb
+@@ -0,0 +1,33 @@
++require "test_helper"
++
++class Card::AutoPostponeJobTest < ActiveJob::TestCase
++  setup do
++    cards(:logo).update_column(:last_active_at, 1.year.ago)
++    clear_enqueued_jobs
++  end
++
++  test "postpone due cards" do
++    Card::AutoPostponeJob.perform_now([ cards(:logo).id ])
++
++    assert cards(:logo).reload.postponed?
++    assert_equal accounts("37s").system_user, cards(:logo).postponed_by
++  end
++
++  test "recheck cards when running a queued batch" do
++    cards(:logo).update_column(:last_active_at, Time.current)
++
++    assert_no_difference -> { cards(:logo).events.count } do
++      Card::AutoPostponeJob.perform_now([ cards(:logo).id ])
++    end
++
++    assert cards(:logo).reload.active?
++  end
++
++  test "ignore cards already postponed by another batch" do
++    Card::AutoPostponeJob.perform_now([ cards(:logo).id ])
++
++    assert_no_difference -> { cards(:logo).events.count } do
++      Card::AutoPostponeJob.perform_now([ cards(:logo).id ])
++    end
++  end
++end

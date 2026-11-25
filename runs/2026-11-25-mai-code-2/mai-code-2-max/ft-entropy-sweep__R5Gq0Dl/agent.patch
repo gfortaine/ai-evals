@@ -1,0 +1,300 @@
+diff --git a/app/jobs/card/auto_postpone_job.rb b/app/jobs/card/auto_postpone_job.rb
+new file mode 100644
+index 0000000..978dd5f
+--- /dev/null
++++ b/app/jobs/card/auto_postpone_job.rb
+@@ -0,0 +1,11 @@
++class Card::AutoPostponeJob < ApplicationJob
++  queue_as :backend
++
++  discard_on ActiveJob::DeserializationError
++
++  def perform(account, card_ids)
++    Current.with_account(account) do
++      Card.auto_postpone_batch(account, card_ids)
++    end
++  end
++end
+diff --git a/app/models/card/entropic.rb b/app/models/card/entropic.rb
+index ebaad78..cc488d2 100644
+--- a/app/models/card/entropic.rb
++++ b/app/models/card/entropic.rb
+@@ -1,23 +1,29 @@
+ module Card::Entropic
+   extend ActiveSupport::Concern
+ 
++  AUTO_POSTPONE_BOARD_BATCH_SIZE = 1_000
++  AUTO_POSTPONE_CARD_BATCH_SIZE = 100
++
+   included do
++    scope :with_auto_postpone_period, -> do
++      joins(
++        "LEFT OUTER JOIN entropies AS board_entropies ON board_entropies.container_type = 'Board' AND board_entropies.container_id = cards.board_id",
++        "LEFT OUTER JOIN entropies AS account_entropies ON account_entropies.container_type = 'Account' AND account_entropies.container_id = cards.account_id"
++      )
++    end
++
+     scope :due_to_be_postponed, -> do
+       active
+-        .joins(board: :account)
+-        .left_outer_joins(board: :entropy)
+-        .joins("LEFT OUTER JOIN entropies AS account_entropies ON account_entropies.account_id = accounts.id AND account_entropies.container_type = 'Account' AND account_entropies.container_id = accounts.id")
+-        .where("last_active_at <= #{connection.date_subtract('?', 'COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period)')}", Time.now)
++        .with_auto_postpone_period
++        .where("cards.last_active_at <= #{connection.date_subtract('?', 'COALESCE(board_entropies.auto_postpone_period, account_entropies.auto_postpone_period)')}", Time.current)
+     end
+ 
+     scope :postponing_soon, -> do
+-      now = Time.now
++      now = Time.current
+       active
+-        .joins(board: :account)
+-        .left_outer_joins(board: :entropy)
+-        .joins("LEFT OUTER JOIN entropies AS account_entropies ON account_entropies.account_id = accounts.id AND account_entropies.container_type = 'Account' AND account_entropies.container_id = accounts.id")
+-        .where("last_active_at > #{connection.date_subtract('?', 'COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period)')}", now)
+-        .where("last_active_at <= #{connection.date_subtract('?', 'COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period) * 0.75')}", now)
++        .with_auto_postpone_period
++        .where("cards.last_active_at > #{connection.date_subtract('?', 'COALESCE(board_entropies.auto_postpone_period, account_entropies.auto_postpone_period)')}", now)
++        .where("cards.last_active_at <= #{connection.date_subtract('?', 'COALESCE(board_entropies.auto_postpone_period, account_entropies.auto_postpone_period) * 0.75')}", now)
+     end
+ 
+     delegate :auto_postpone_period, to: :board
+@@ -25,10 +31,61 @@ module Card::Entropic
+ 
+   class_methods do
+     def auto_postpone_all_due
+-      due_to_be_postponed.find_each do |card|
+-        card.auto_postpone(user: card.account.system_user)
++      system_users = {}
++
++      each_due_card_id_batch do |account, card_ids|
++        system_user = system_users[account.id] ||= account.system_user
++        auto_postpone_batch(account, card_ids, user: system_user)
++      end
++    end
++
++    def auto_postpone_all_due_later
++      jobs = []
++
++      each_due_card_id_batch do |account, card_ids|
++        jobs << Card::AutoPostponeJob.new(account, card_ids)
++      end
++
++      ActiveJob.perform_all_later(jobs) if jobs.any?
++    end
++
++    def auto_postpone_batch(account, card_ids, user: nil)
++      cards = account.cards.active
++        .where(id: card_ids)
++        .preload(:closure, :not_now, :activity_spike, :column, board: [ :entropy, { account: :entropy } ])
++        .select { |card| card.entropy.auto_clean_at <= Time.current }
++
++      if cards.any?
++        user ||= account.system_user
++        boards = cards.map(&:board).uniq
++
++        transaction do
++          Board.no_touching do
++            cards.each { |card| card.auto_postpone(user: user) }
++          end
++
++          boards.each(&:touch)
++        end
+       end
+     end
++
++    private
++      def each_due_card_id_batch
++        now = Time.current
++
++        Account.preload(:entropy).find_each do |account|
++          account.boards.preload(:entropy).group_by(&:auto_postpone_period).each do |period, boards|
++            boards.map(&:id).each_slice(AUTO_POSTPONE_BOARD_BATCH_SIZE) do |board_ids|
++              account.cards.active
++                .where(board_id: board_ids, last_active_at: ..(now - period))
++                .pluck(:id)
++                .each_slice(AUTO_POSTPONE_CARD_BATCH_SIZE) do |card_ids|
++                  yield account, card_ids
++                end
++            end
++          end
++        end
++      end
+   end
+ 
+   def entropy
+diff --git a/app/models/card/eventable/system_commenter.rb b/app/models/card/eventable/system_commenter.rb
+index 5c7defc..9ec2d80 100644
+--- a/app/models/card/eventable/system_commenter.rb
++++ b/app/models/card/eventable/system_commenter.rb
+@@ -10,10 +10,18 @@ class Card::Eventable::SystemCommenter
+   def comment
+     return unless comment_body.present?
+ 
+-    card.comments.create! creator: card.account.system_user, body: comment_body, created_at: event.created_at
++    card.comments.create! creator: system_user, body: comment_body, created_at: event.created_at
+   end
+ 
+   private
++    def system_user
++      if event.creator.system?
++        event.creator
++      else
++        card.account.system_user
++      end
++    end
++
+     def comment_body
+       case event.action
+       when "card_assigned"
+diff --git a/app/models/card/postponable.rb b/app/models/card/postponable.rb
+index ab58960..4396092 100644
+--- a/app/models/card/postponable.rb
++++ b/app/models/card/postponable.rb
+@@ -24,8 +24,23 @@ module Card::Postponable
+     open? && published? && !postponed?
+   end
+ 
+-  def auto_postpone(**args)
+-    postpone(**args, event_name: :auto_postponed)
++  def auto_postpone(user: Current.user)
++    if active?
++      suppress_search_indexing
++
++      without_activity_spike_detection do
++        self.class.no_touching do
++          transaction do
++            activity_spike&.destroy
++            update!(column: nil) if column_id
++            create_not_now!(user: user)
++            track_event :auto_postponed, creator: user
++          end
++        end
++      end
++    else
++      postpone(user: user, event_name: :auto_postponed)
++    end
+   end
+ 
+   def postpone(user: Current.user, event_name: :postponed)
+diff --git a/app/models/card/stallable.rb b/app/models/card/stallable.rb
+index 9e82b3f..acdf126 100644
+--- a/app/models/card/stallable.rb
++++ b/app/models/card/stallable.rb
+@@ -29,8 +29,15 @@ module Card::Stallable
+   end
+ 
+   private
++    def without_activity_spike_detection
++      @suppress_activity_spike_detection = true
++      yield
++    ensure
++      @suppress_activity_spike_detection = false
++    end
++
+     def remember_to_detect_activity_spikes
+-      @should_detect_activity_spikes = published? && last_active_at_changed?
++      @should_detect_activity_spikes = published? && last_active_at_changed? && !@suppress_activity_spike_detection
+     end
+ 
+     def should_detect_activity_spikes?
+diff --git a/app/models/concerns/searchable.rb b/app/models/concerns/searchable.rb
+index 2be34fe..3c6d936 100644
+--- a/app/models/concerns/searchable.rb
++++ b/app/models/concerns/searchable.rb
+@@ -14,6 +14,10 @@ module Searchable
+   end
+ 
+   private
++    def suppress_search_indexing
++      @search_indexing_suppressed = true
++    end
++
+     def create_in_search_index
+       if searchable?
+         search_record_class.create!(search_record_attributes)
+@@ -21,7 +25,9 @@ module Searchable
+     end
+ 
+     def update_in_search_index
+-      if searchable?
++      if @search_indexing_suppressed
++        @search_indexing_suppressed = false
++      elsif searchable?
+         search_record_class.upsert!(search_record_attributes)
+       else
+         remove_from_search_index
+diff --git a/config/recurring.yml b/config/recurring.yml
+index 894c57b..d4da1b6 100644
+--- a/config/recurring.yml
++++ b/config/recurring.yml
+@@ -8,7 +8,7 @@ production: &production
+ 
+   # Application cleanup
+   auto_postpone_all_due:
+-    command: "Card.auto_postpone_all_due"
++    command: "Card.auto_postpone_all_due_later"
+     schedule: every hour at minute 50
+   delete_unused_tags:
+     class: DeleteUnusedTagsJob
+diff --git a/test/models/card/entropic_test.rb b/test/models/card/entropic_test.rb
+index 848cfa7..7571527 100644
+--- a/test/models/card/entropic_test.rb
++++ b/test/models/card/entropic_test.rb
+@@ -59,6 +59,37 @@ class Card::EntropicTest < ActiveSupport::TestCase
+     assert_not cards(:shipping).reload.postponed?
+   end
+ 
++  test "auto postpone all due queues bounded batches" do
++    cards(:logo, :layout).each do |card|
++      card.update!(last_active_at: 1.day.ago - entropies(:writebook_board).auto_postpone_period)
++    end
++
++    stub_const(Card::Entropic, :AUTO_POSTPONE_CARD_BATCH_SIZE, 1) do
++      assert_enqueued_jobs 2, only: Card::AutoPostponeJob do
++        Card.auto_postpone_all_due_later
++      end
++    end
++
++    assert_not cards(:logo, :layout).any?(&:postponed?)
++
++    perform_enqueued_jobs only: Card::AutoPostponeJob
++
++    assert cards(:logo, :layout).all? { |card| card.reload.postponed? }
++  end
++
++  test "queued auto postpone skips cards that became active again" do
++    cards(:logo).update!(last_active_at: 1.day.ago - entropies(:writebook_board).auto_postpone_period)
++
++    Card.auto_postpone_all_due_later
++    cards(:logo).update!(last_active_at: Time.current)
++
++    assert_no_difference -> { Card.postponed.count } do
++      perform_enqueued_jobs only: Card::AutoPostponeJob
++    end
++
++    assert_not cards(:logo).reload.postponed?
++  end
++
+   test "postponing soon scope" do
+     cards(:logo, :shipping).each(&:published!)
+ 
+diff --git a/test/models/card/postponable_test.rb b/test/models/card/postponable_test.rb
+index 0bafd3e..7982378 100644
+--- a/test/models/card/postponable_test.rb
++++ b/test/models/card/postponable_test.rb
+@@ -36,9 +36,11 @@ class Card::PostponableTest < ActiveSupport::TestCase
+   test "auto_postpone a card" do
+     card = cards(:text)
+ 
+-    assert_changes -> { card.reload.postponed? }, to: true do
+-      assert_difference -> { card.events.count }, +1 do
+-        card.auto_postpone
++    assert_no_enqueued_jobs only: Card::ActivitySpike::DetectionJob do
++      assert_changes -> { card.reload.postponed? }, to: true do
++        assert_difference -> { card.events.count }, +1 do
++          card.auto_postpone
++        end
+       end
+     end
+ 

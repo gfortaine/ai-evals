@@ -1,0 +1,205 @@
+diff --git a/app/models/book/access_import.rb b/app/models/book/access_import.rb
+index 4d920cf..f3cf31d 100644
+--- a/app/models/book/access_import.rb
++++ b/app/models/book/access_import.rb
+@@ -6,20 +6,75 @@ class Book::AccessImport
+   end
+ 
+   def import
+-    accesses = []
+-    duplicate_index = nil
++    prepared_accesses = nil
++
++    result = begin
++      Access.transaction do
++        prepared_accesses, rejected_index = prepare_accesses
++
++        if rejected_index.nil?
++          insert_accesses(prepared_accesses)
++        else
++          Result.new([], rejected_index)
++        end
++      end
++    rescue ActiveRecord::RecordNotUnique
++      index = duplicate_index(prepared_accesses || [])
++      raise if index.nil?
++
++      Result.new([], index)
++    end
++
++    result.accesses.each { |access| Book::AccessNotificationJob.perform_later(access) }
++    result
++  end
++
++  private
++    def prepare_accesses
++      accesses = []
++      user_ids = Set.new
+ 
+-    Access.transaction do
+       @grants.each_with_index do |grant, index|
+-        access = @book.accesses.create!(user_id: grant[:user_id], level: grant[:level])
+-        Book::AccessNotificationJob.perform_later(access)
++        access = begin
++          Access.new(book: @book, user_id: grant[:user_id], level: grant[:level])
++        rescue ArgumentError
++          return [ accesses, index ]
++        end
++
++        return [ accesses, index ] if access.level.nil?
++
++        access.validate!
++
++        if user_ids.include?(access.user_id) || @book.accesses.exists?(user_id: access.user_id)
++          return [ accesses, index ]
++        end
++
++        user_ids << access.user_id
+         accesses << access
+-      rescue ActiveRecord::RecordNotUnique
+-        duplicate_index = index
+-        raise ActiveRecord::Rollback
+       end
++
++      [ accesses, nil ]
+     end
+ 
+-    duplicate_index ? Result.new([], duplicate_index) : Result.new(accesses, nil)
+-  end
++    def insert_accesses(prepared_accesses)
++      attributes = prepared_accesses.map do |access|
++        access.attributes.slice("user_id", "level")
++      end
++
++      @book.accesses.insert_all!(attributes)
++
++      accesses_by_user_id = @book.accesses.where(user_id: attributes.pluck("user_id")).index_by(&:user_id)
++      accesses = prepared_accesses.map { |access| accesses_by_user_id.fetch(access.user_id) }
++
++      Result.new(accesses, nil)
++    end
++
++    def duplicate_index(accesses)
++      existing_user_ids = @book.accesses.where(user_id: accesses.map(&:user_id)).pluck(:user_id).to_set
++      user_ids = Set.new
++
++      accesses.index do |access|
++        existing_user_ids.include?(access.user_id) || !user_ids.add?(access.user_id)
++      end
++    end
+ end
+diff --git a/test/models/book/access_import_test.rb b/test/models/book/access_import_test.rb
+new file mode 100644
+index 0000000..6b7215c
+--- /dev/null
++++ b/test/models/book/access_import_test.rb
+@@ -0,0 +1,109 @@
++require "test_helper"
++
++class Book::AccessImportTest < ActiveSupport::TestCase
++  include ActiveJob::TestHelper
++
++  setup do
++    @book = Book.create!(title: "Imported access", everyone_access: false)
++  end
++
++  test "imports all accesses and notifies each user" do
++    grants = [ users(:jz), users(:kevin) ].map { |user| { user_id: user.id, level: :reader } }
++    result = nil
++
++    assert_enqueued_jobs 2, only: Book::AccessNotificationJob do
++      result = Book::AccessImport.new(@book, grants).import
++    end
++
++    assert_nil result.duplicate_index
++    assert_equal grants.map { |grant| grant[:user_id] }, result.accesses.map(&:user_id)
++    assert result.accesses.all?(&:persisted?)
++  end
++
++  test "rejects the entire import and does not notify on a duplicate" do
++    grants = [
++      { user_id: users(:jz).id, level: :reader },
++      { user_id: users(:kevin).id, level: :editor },
++      { user_id: users(:jz).id, level: :editor }
++    ]
++    result = nil
++
++    assert_no_enqueued_jobs only: Book::AccessNotificationJob do
++      result = Book::AccessImport.new(@book, grants).import
++    end
++
++    assert_empty result.accesses
++    assert_equal 2, result.duplicate_index
++    assert_empty @book.accesses.reload
++  end
++
++  test "rejects an unknown level without inserting or notifying" do
++    grants = [
++      { user_id: users(:jz).id, level: :reader },
++      { user_id: users(:kevin).id, level: :owner }
++    ]
++    result = nil
++
++    assert_no_enqueued_jobs only: Book::AccessNotificationJob do
++      result = Book::AccessImport.new(@book, grants).import
++    end
++
++    assert_empty result.accesses
++    assert_equal 1, result.duplicate_index
++    assert_empty @book.accesses.reload
++  end
++
++  test "inserts different sized imports with one access write" do
++    small_users = 4.times.map { |index| create_user(index) }
++    large_users = 16.times.map { |index| create_user(index + 4) }
++
++    small_writes = access_insert_writes do
++      Book::AccessImport.new(@book, grants_for(small_users)).import
++    end
++    large_book = Book.create!(title: "Large imported access", everyone_access: false)
++    large_writes = access_insert_writes do
++      Book::AccessImport.new(large_book, grants_for(large_users)).import
++    end
++
++    assert_equal 1, small_writes
++    assert_equal small_writes, large_writes
++
++    rejected_small_writes = access_insert_writes do
++      small_grants = grants_for(small_users)
++      small_book = Book.create!(title: "Rejected small import", everyone_access: false)
++      Book::AccessImport.new(small_book, small_grants << small_grants.first).import
++    end
++    rejected_large_writes = access_insert_writes do
++      large_grants = grants_for(large_users)
++      large_book = Book.create!(title: "Rejected large import", everyone_access: false)
++      Book::AccessImport.new(large_book, large_grants << large_grants.first).import
++    end
++
++    assert_equal rejected_small_writes, rejected_large_writes
++  end
++
++  private
++    def create_user(index)
++      User.create!(
++        name: "Import user #{index}",
++        email_address: "import-user-#{index}@example.com",
++        password_digest: "not-a-real-digest"
++      )
++    end
++
++    def grants_for(users)
++      users.map { |user| { user_id: user.id, level: :reader } }
++    end
++
++    def access_insert_writes(&block)
++      writes = 0
++      subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
++        writes += 1 if payload[:sql].match?(/\AINSERT INTO "accesses"/)
++      end
++
++      block.call
++      writes
++    ensure
++      ActiveSupport::Notifications.unsubscribe(subscriber)
++    end
++end

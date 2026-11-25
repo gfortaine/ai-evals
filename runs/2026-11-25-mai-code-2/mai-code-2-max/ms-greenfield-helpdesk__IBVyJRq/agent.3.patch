@@ -1,0 +1,1418 @@
+diff --git a/README.md b/README.md
+index 19bf26d..59a7398 100644
+--- a/README.md
++++ b/README.md
+@@ -22,7 +22,11 @@ bin/rails server
+ 
+ All product endpoints are JSON endpoints under `/api/v1`. Requests other than account creation select a business with `X-Helpdesk-Account`. Authenticated requests use `Authorization: Bearer TOKEN`.
+ 
+-Customers register at `POST /api/v1/registrations`, then use the standard verification and session endpoints. Authenticated customers use `/api/v1/requests` and its nested `/comments` route; staff use `/api/v1/tickets`. Replies and status changes are submitted with `PATCH`. Lists accept `page` and `per_page` and include pagination metadata with the records.
++Customers register at `POST /api/v1/registrations`, then use the standard verification and session endpoints. Authenticated customers use `/api/v1/requests` and its nested `/comments` route; staff use `/api/v1/tickets`. Replies, status changes, and active-staff assignments are submitted with `PATCH`. Private staff comments are excluded from customer comment responses and do not touch the customer request timestamp. Lists accept `page` and `per_page` and include pagination metadata with the records.
++
++Admins manage staff invitations through `/api/v1/invitations`, including list/show, `POST /api/v1/invitations/:id/resend`, and `DELETE /api/v1/invitations/:id`. Invitations expire after seven days. The frontend previews a token with `POST /invitation_previews` (also available at `/api/v1/invitation_previews`) and accepts it at `POST /api/v1/invitation_acceptances`. Accepted staff are verified immediately.
++
++Admins list and inspect users at `/api/v1/users` and update roles or suspension at `/api/v1/users/:id`. User lists can filter by `role` and `suspended`. `GET /api/v1/staff` returns all active admin and agent choices for ticket assignment. Suspending a user revokes their sessions and clears their ticket assignments; the last active admin cannot be suspended or demoted.
+ 
+ Verification and password-reset emails contain links to the configured frontend URL. The confirmation API endpoints are `/api/v1/email_verifications/confirm` and `/api/v1/password_resets/confirm`.
+ 
+diff --git a/app/controllers/api/v1/base_controller.rb b/app/controllers/api/v1/base_controller.rb
+index a2a9116..2c56c8b 100644
+--- a/app/controllers/api/v1/base_controller.rb
++++ b/app/controllers/api/v1/base_controller.rb
+@@ -26,7 +26,9 @@ class Api::V1::BaseController < ApplicationController
+     token = bearer_token
+     @current_session = Session.includes(user: :account).find_by_token(token)
+ 
+-    unless @current_session && @current_session.user.account_id == current_account.id
++    unless @current_session &&
++        @current_session.user.account_id == current_account.id &&
++        !@current_session.user.suspended?
+       render json: { error: "Unauthorized" }, status: :unauthorized
+       return
+     end
+@@ -53,11 +55,17 @@ class Api::V1::BaseController < ApplicationController
+   end
+ 
+   def require_staff!
+-    return if current_user.staff?
++    return if current_user.active_staff?
+ 
+     render json: { error: "Only staff may perform this action" }, status: :forbidden
+   end
+ 
++  def require_admin!
++    return if current_user.admin? && !current_user.suspended?
++
++    render json: { error: "Only admins may perform this action" }, status: :forbidden
++  end
++
+   def bearer_token
+     authorization = request.headers["Authorization"].to_s
+     return unless authorization.match?(/\ABearer\s+/i)
+@@ -83,13 +91,14 @@ class Api::V1::BaseController < ApplicationController
+       name: user.name,
+       email: user.email,
+       role: user.role,
++      suspended: user.suspended?,
+       verified: user.verified?,
+       created_at: user.created_at.iso8601,
+       updated_at: user.updated_at.iso8601
+     }
+   end
+ 
+-  def ticket_json(ticket, include_requester: false)
++  def ticket_json(ticket, include_requester: false, include_assignee: false)
+     json = {
+       id: ticket.id,
+       subject: ticket.subject,
+@@ -107,9 +116,56 @@ class Api::V1::BaseController < ApplicationController
+       }
+     end
+ 
++    if include_assignee
++      json[:assignee_id] = ticket.assignee_id
++      json[:assignee] = if ticket.assignee
++        {
++          id: ticket.assignee.id,
++          name: ticket.assignee.name
++        }
++      end
++    end
++
+     json
+   end
+ 
++  def invitation_json(invitation)
++    {
++      id: invitation.id,
++      account_id: invitation.account_id,
++      email: invitation.email,
++      role: invitation.role,
++      status: invitation.status,
++      invited_by_id: invitation.invited_by_id,
++      invited_by: invitation.invited_by && {
++        id: invitation.invited_by.id,
++        name: invitation.invited_by.name
++      },
++      accepted_user_id: invitation.accepted_user_id,
++      sent_at: invitation.sent_at.iso8601,
++      expires_at: invitation.expires_at.iso8601,
++      accepted_at: invitation.accepted_at&.iso8601,
++      revoked_at: invitation.revoked_at&.iso8601,
++      created_at: invitation.created_at.iso8601,
++      updated_at: invitation.updated_at.iso8601
++    }
++  end
++
++  def invitation_preview_json(invitation)
++    {
++      email: invitation.email,
++      role: invitation.role,
++      business_name: invitation.account.name,
++      account_name: invitation.account.name,
++      subdomain: invitation.account.subdomain,
++      account: {
++        name: invitation.account.name,
++        subdomain: invitation.account.subdomain
++      },
++      expires_at: invitation.expires_at.iso8601
++    }
++  end
++
+   def comment_json(comment)
+     {
+       id: comment.id,
+diff --git a/app/controllers/api/v1/invitation_acceptances_controller.rb b/app/controllers/api/v1/invitation_acceptances_controller.rb
+new file mode 100644
+index 0000000..1c66ccb
+--- /dev/null
++++ b/app/controllers/api/v1/invitation_acceptances_controller.rb
+@@ -0,0 +1,61 @@
++class Api::V1::InvitationAcceptancesController < Api::V1::BaseController
++  def create
++    attributes = params.require(:invitation_acceptance).permit(:token, :name, :password)
++    token = attributes.require(:token)
++    name = attributes.require(:name)
++    password = attributes.require(:password)
++    invitation = Invitation.includes(:account).find_by_token(token)
++    result = :invalid
++    accepted_user = nil
++
++    if invitation
++      invitation.account.with_lock do
++        invitation.lock!
++        invitation.expire_if_needed!
++
++        if !account_header_matches?(invitation.account)
++          result = :invalid
++        elsif invitation.account.cancelled?
++          result = :cancelled
++        elsif invitation.token_valid?(token)
++          invitation.update!(
++            status: "accepted",
++            token_digest: nil,
++            accepted_at: Time.current
++          )
++          accepted_user = invitation.account.users.create!(
++            name: name,
++            email: invitation.email,
++            password: password,
++            role: invitation.role,
++            verified: true
++          )
++          invitation.update!(accepted_user: accepted_user)
++          result = :accepted
++        end
++      end
++    end
++
++    if result == :cancelled
++      render json: { error: "Account is cancelled" }, status: :forbidden
++      return
++    end
++
++    unless result == :accepted
++      render json: { error: "Invalid or expired invitation token" }, status: :unprocessable_content
++      return
++    end
++
++    render json: {
++      user: user_json(accepted_user),
++      account: account_json(invitation.account)
++    }, status: :created
++  end
++
++  private
++
++  def account_header_matches?(account)
++    subdomain = request.headers["X-Helpdesk-Account"].to_s.strip.downcase.presence
++    subdomain.nil? || subdomain == account.subdomain
++  end
++end
+diff --git a/app/controllers/api/v1/invitation_previews_controller.rb b/app/controllers/api/v1/invitation_previews_controller.rb
+new file mode 100644
+index 0000000..b0ff8f8
+--- /dev/null
++++ b/app/controllers/api/v1/invitation_previews_controller.rb
+@@ -0,0 +1,28 @@
++class Api::V1::InvitationPreviewsController < Api::V1::BaseController
++  def create
++    token = params.require(:invitation_preview).permit(:token).require(:token)
++    invitation = Invitation.includes(:account).find_by_token(token)
++    valid = false
++
++    if invitation
++      invitation.with_lock do
++        invitation.expire_if_needed!
++        valid = invitation.token_valid?(token) && account_header_matches?(invitation.account)
++      end
++    end
++
++    unless valid
++      render json: { error: "Invalid or expired invitation token" }, status: :unprocessable_content
++      return
++    end
++
++    render json: { invitation_preview: invitation_preview_json(invitation) }
++  end
++
++  private
++
++  def account_header_matches?(account)
++    subdomain = request.headers["X-Helpdesk-Account"].to_s.strip.downcase.presence
++    subdomain.nil? || subdomain == account.subdomain
++  end
++end
+diff --git a/app/controllers/api/v1/invitations_controller.rb b/app/controllers/api/v1/invitations_controller.rb
+new file mode 100644
+index 0000000..aa4cd24
+--- /dev/null
++++ b/app/controllers/api/v1/invitations_controller.rb
+@@ -0,0 +1,98 @@
++class Api::V1::InvitationsController < Api::V1::BaseController
++  before_action :set_account
++  before_action :authenticate_user!
++  before_action :require_active_account!
++  before_action :require_admin!
++  before_action :set_invitation, only: %i[show resend destroy]
++
++  def index
++    current_account.with_lock do
++      Invitation.expire_due!(account: current_account)
++    end
++    scope = current_account.invitations.includes(:invited_by, :accepted_user)
++
++    if params.key?(:status)
++      status = params[:status].to_s
++      unless Invitation::STATUSES.include?(status)
++        raise ActionController::BadRequest, "status is invalid"
++      end
++
++      scope = scope.where(status: status)
++    end
++
++    invitations, pagination = paginate(scope.oldest_first)
++    render json: {
++      invitations: invitations.map { |invitation| invitation_json(invitation) }
++    }.merge(pagination)
++  end
++
++  def show
++    current_account.with_lock do
++      @invitation.lock!
++      @invitation.expire_if_needed!
++    end
++    render json: { invitation: invitation_json(@invitation) }
++  end
++
++  def create
++    invitation_params = params.require(:invitation)
++    email = invitation_params.require(:email).to_s.strip.downcase
++    token = nil
++
++    current_account.with_lock do
++      current_account.reload
++      Invitation.expire_due!(account: current_account, email: email)
++      @invitation = current_account.invitations.new(
++        email: email,
++        role: invitation_params.require(:role),
++        invited_by: current_user
++      )
++      token = @invitation.issue_token
++      @invitation.save!
++    end
++
++    InvitationMailer.with(invitation: @invitation, token: token).staff_invitation.deliver_now
++    render json: { invitation: invitation_json(@invitation) }, status: :created
++  end
++
++  def resend
++    token = nil
++
++    current_account.with_lock do
++      @invitation.lock!
++      @invitation.expire_if_needed!
++      unless @invitation.pending? || @invitation.expired?
++        @invitation.errors.add(:status, "cannot be resent")
++        raise ActiveRecord::RecordInvalid, @invitation
++      end
++
++      token = @invitation.issue_token!
++    end
++
++    InvitationMailer.with(invitation: @invitation, token: token).staff_invitation.deliver_now
++    render json: { invitation: invitation_json(@invitation) }
++  end
++
++  def destroy
++    current_account.with_lock do
++      @invitation.lock!
++      @invitation.expire_if_needed!
++      unless @invitation.pending?
++        @invitation.errors.add(:status, "cannot be revoked")
++        raise ActiveRecord::RecordInvalid, @invitation
++      end
++
++      @invitation.revoke!
++    end
++
++    head :no_content
++  end
++
++  private
++
++  def set_invitation
++    @invitation = current_account.invitations
++      .includes(:invited_by, :accepted_user)
++      .find(params[:id])
++  end
++end
+diff --git a/app/controllers/api/v1/registrations_controller.rb b/app/controllers/api/v1/registrations_controller.rb
+index 3022d50..4d352c7 100644
+--- a/app/controllers/api/v1/registrations_controller.rb
++++ b/app/controllers/api/v1/registrations_controller.rb
+@@ -4,10 +4,13 @@ class Api::V1::RegistrationsController < Api::V1::BaseController
+ 
+   def create
+     attributes = params.require(:user).permit(:name, :email, :password)
++    email = attributes[:email].to_s.strip.downcase
+     token = nil
+ 
+-    User.transaction do
+-      @user = current_account.users.create!(attributes.merge(role: "member"))
++    current_account.with_lock do
++      current_account.reload
++      Invitation.expire_due!(account: current_account, email: email)
++      @user = current_account.users.create!(attributes.merge(role: "member", email: email))
+       token = @user.rotate_email_verification_token!
+     end
+ 
+diff --git a/app/controllers/api/v1/sessions_controller.rb b/app/controllers/api/v1/sessions_controller.rb
+index e078fda..241f462 100644
+--- a/app/controllers/api/v1/sessions_controller.rb
++++ b/app/controllers/api/v1/sessions_controller.rb
+@@ -8,7 +8,7 @@ class Api::V1::SessionsController < Api::V1::BaseController
+     password = session_params.require(:password)
+     user = current_account.users.find_by(email: email)
+ 
+-    unless user&.authenticate(password) && user.verified?
++    unless user&.authenticate(password) && user.verified? && !user.suspended?
+       render json: { error: "Invalid email, password, or unverified account" }, status: :unauthorized
+       return
+     end
+@@ -16,12 +16,20 @@ class Api::V1::SessionsController < Api::V1::BaseController
+     issued_session = nil
+     current_account.with_lock do
+       current_account.reload
+-      if current_account.active? || (current_account.reactivatable? && user.owner?)
++      user.reload
++      account_allows_session = current_account.active? ||
++        (current_account.reactivatable? && user.owner?)
++      if account_allows_session && !user.suspended? && user.verified?
+         issued_session = Session.issue_for(user)
+       end
+     end
+ 
+     unless issued_session
++      if user.suspended? || !user.verified?
++        render json: { error: "Unauthorized" }, status: :unauthorized
++        return
++      end
++
+       render json: { error: "Account is cancelled" }, status: :forbidden
+       return
+     end
+diff --git a/app/controllers/api/v1/staff_controller.rb b/app/controllers/api/v1/staff_controller.rb
+new file mode 100644
+index 0000000..3bd652d
+--- /dev/null
++++ b/app/controllers/api/v1/staff_controller.rb
+@@ -0,0 +1,20 @@
++class Api::V1::StaffController < Api::V1::BaseController
++  before_action :set_account
++  before_action :authenticate_user!
++  before_action :require_active_account!
++  before_action :require_staff!
++
++  def index
++    staff = current_account.users.active_staff.order(id: :asc)
++    render json: {
++      staff: staff.map { |user|
++        {
++          id: user.id,
++          name: user.name,
++          email: user.email,
++          role: user.role
++        }
++      }
++    }
++  end
++end
+diff --git a/app/controllers/api/v1/tickets_controller.rb b/app/controllers/api/v1/tickets_controller.rb
+index bbf37c0..8b639ac 100644
+--- a/app/controllers/api/v1/tickets_controller.rb
++++ b/app/controllers/api/v1/tickets_controller.rb
+@@ -7,23 +7,31 @@ class Api::V1::TicketsController < Api::V1::BaseController
+ 
+   def index
+     tickets, pagination = paginate(
+-      current_account.tickets.includes(:requester).recently_active
++      current_account.tickets.includes(:requester, :assignee).recently_active
+     )
+     render json: {
+-      tickets: tickets.map { |ticket| ticket_json(ticket, include_requester: true) }
++      tickets: tickets.map do |ticket|
++        ticket_json(ticket, include_requester: true, include_assignee: true)
++      end
+     }.merge(pagination)
+   end
+ 
+   def show
+-    render json: { ticket: ticket_json(@ticket, include_requester: true) }
++    render json: {
++      ticket: ticket_json(@ticket, include_requester: true, include_assignee: true)
++    }
+   end
+ 
+   def update
+     ticket_params = params.require(:ticket)
+     comment = comment_parameters(ticket_params)
+     status_supplied = ticket_params.key?(:status)
++    assignee_supplied = ticket_params.key?(:assignee_id)
++
++    current_account.with_lock do
++      @ticket.lock!
++      @ticket.assignee = assignee_for(ticket_params[:assignee_id]) if assignee_supplied
+ 
+-    @ticket.with_lock do
+       if comment
+         @ticket.comments.create!(
+           author: current_user,
+@@ -32,13 +40,13 @@ class Api::V1::TicketsController < Api::V1::BaseController
+         )
+       end
+ 
+-      if status_supplied
+-        @ticket.status = ticket_params[:status]
+-        @ticket.save!
+-      end
++      @ticket.status = ticket_params[:status] if status_supplied
++      @ticket.save! if @ticket.changed?
+     end
+ 
+-    render json: { ticket: ticket_json(@ticket, include_requester: true) }
++    render json: {
++      ticket: ticket_json(@ticket, include_requester: true, include_assignee: true)
++    }
+   end
+ 
+   def comments
+@@ -53,7 +61,7 @@ class Api::V1::TicketsController < Api::V1::BaseController
+   private
+ 
+   def set_ticket
+-    @ticket = current_account.tickets.includes(:requester).find(params[:id])
++    @ticket = current_account.tickets.includes(:requester, :assignee).find(params[:id])
+   end
+ 
+   def comment_parameters(ticket_params)
+@@ -61,4 +69,14 @@ class Api::V1::TicketsController < Api::V1::BaseController
+ 
+     ticket_params.require(:comment).permit(:body, :public)
+   end
++
++  def assignee_for(assignee_id)
++    return if assignee_id.nil?
++
++    assignee = current_account.users.find_by(id: assignee_id)
++    return assignee if assignee&.active_staff?
++
++    @ticket.errors.add(:assignee, "must be an active staff member in the account")
++    raise ActiveRecord::RecordInvalid, @ticket
++  end
+ end
+diff --git a/app/controllers/api/v1/users_controller.rb b/app/controllers/api/v1/users_controller.rb
+new file mode 100644
+index 0000000..f12865e
+--- /dev/null
++++ b/app/controllers/api/v1/users_controller.rb
+@@ -0,0 +1,60 @@
++class Api::V1::UsersController < Api::V1::BaseController
++  before_action :set_account
++  before_action :authenticate_user!
++  before_action :require_active_account!
++  before_action :require_admin!
++  before_action :set_user, only: %i[show update]
++
++  def index
++    scope = current_account.users
++    if params.key?(:role)
++      role = params[:role].to_s
++      raise ActionController::BadRequest, "role is invalid" unless User::ROLES.include?(role)
++
++      scope = scope.where(role: role)
++    end
++    scope = scope.where(suspended: boolean_filter(:suspended)) if params.key?(:suspended)
++
++    users, pagination = paginate(scope.order(id: :asc))
++    render json: { users: users.map { |user| user_json(user) } }.merge(pagination)
++  end
++
++  def show
++    render json: { user: user_json(@user) }
++  end
++
++  def update
++    user_params = params.require(:user)
++    attributes = {}
++    attributes[:role] = user_params[:role] if user_params.key?(:role)
++    attributes[:suspended] = user_params[:suspended] if user_params.key?(:suspended)
++    raise ActionController::BadRequest, "No user attributes supplied" if attributes.empty?
++
++    current_account.with_lock do
++      @user = current_account.users.lock.find(params[:id])
++      @user.update!(attributes)
++
++      unless @user.active_staff?
++        @user.sessions.delete_all
++        @user.assigned_tickets.update_all(assignee_id: nil)
++      end
++    end
++
++    render json: { user: user_json(@user) }
++  end
++
++  private
++
++  def set_user
++    @user = current_account.users.find(params[:id])
++  end
++
++  def boolean_filter(name)
++    case params[name].to_s
++    when "true", "1" then true
++    when "false", "0" then false
++    else
++      raise ActionController::BadRequest, "#{name} must be true or false"
++    end
++  end
++end
+diff --git a/app/mailers/invitation_mailer.rb b/app/mailers/invitation_mailer.rb
+new file mode 100644
+index 0000000..5ca1f7a
+--- /dev/null
++++ b/app/mailers/invitation_mailer.rb
+@@ -0,0 +1,15 @@
++class InvitationMailer < ApplicationMailer
++  def staff_invitation
++    @invitation = params.fetch(:invitation)
++    @invitation_url = frontend_link(
++      "/accept-invitation",
++      account: @invitation.account,
++      token: params.fetch(:token)
++    )
++
++    mail(
++      to: @invitation.email,
++      subject: "You have been invited to #{@invitation.account.name}"
++    )
++  end
++end
+diff --git a/app/models/account.rb b/app/models/account.rb
+index 5a8cf56..178874b 100644
+--- a/app/models/account.rb
++++ b/app/models/account.rb
+@@ -2,6 +2,7 @@ class Account < ApplicationRecord
+   has_many :users, dependent: :destroy
+   has_many :sessions, through: :users
+   has_many :tickets, dependent: :destroy
++  has_many :invitations, dependent: :destroy
+   has_one :owner, -> { where(owner: true) }, class_name: "User"
+ 
+   before_validation :normalize_subdomain
+diff --git a/app/models/comment.rb b/app/models/comment.rb
+index ca7aed2..429e10d 100644
+--- a/app/models/comment.rb
++++ b/app/models/comment.rb
+@@ -1,7 +1,9 @@
+ class Comment < ApplicationRecord
+-  belongs_to :ticket, touch: true
++  belongs_to :ticket
+   belongs_to :author, class_name: "User", inverse_of: :comments
+ 
++  after_create :touch_ticket_if_public
++
+   validates :body, presence: true, length: { maximum: 20_000 }
+   validates :public, inclusion: { in: [ true, false ] }
+   validate :author_belongs_to_ticket_account
+@@ -11,6 +13,10 @@ class Comment < ApplicationRecord
+ 
+   private
+ 
++  def touch_ticket_if_public
++    ticket.touch if public? && ticket.persisted?
++  end
++
+   def author_belongs_to_ticket_account
+     return unless author && ticket
+     return if author.account_id == ticket.account_id
+diff --git a/app/models/invitation.rb b/app/models/invitation.rb
+new file mode 100644
+index 0000000..594de44
+--- /dev/null
++++ b/app/models/invitation.rb
+@@ -0,0 +1,128 @@
++require "uri"
++
++class Invitation < ApplicationRecord
++  STATUSES = %w[pending accepted revoked expired].freeze
++  ROLES = %w[admin agent].freeze
++  TOKEN_LIFETIME = 7.days
++
++  belongs_to :account
++  belongs_to :invited_by, class_name: "User", optional: true, inverse_of: :sent_invitations
++  belongs_to :accepted_user,
++    class_name: "User",
++    optional: true,
++    inverse_of: :accepted_invitation
++
++  before_validation :normalize_email
++
++  validates :email,
++    presence: true,
++    length: { maximum: 254 },
++    format: { with: URI::MailTo::EMAIL_REGEXP }
++  validates :role, inclusion: { in: ROLES }
++  validates :status, inclusion: { in: STATUSES }
++  validates :sent_at, :expires_at, presence: true
++  validates :token_digest, presence: true, if: :pending?
++  validate :email_is_not_registered, if: :pending?
++  validate :only_one_pending_invitation, if: :pending?
++
++  scope :pending, -> { where(status: "pending") }
++  scope :oldest_first, -> { order(id: :asc) }
++
++  def self.digest_token(token)
++    Digest::SHA256.hexdigest(token.to_s)
++  end
++
++  def self.find_by_token(token)
++    return if token.blank?
++
++    find_by(token_digest: digest_token(token))
++  end
++
++  def self.expire_due!(account: nil, email: nil, now: Time.current)
++    scope = pending.where("expires_at <= ?", now)
++    scope = scope.where(account: account) if account
++    scope = scope.where(email: email) if email
++    scope.update_all(status: "expired", token_digest: nil, updated_at: now)
++  end
++
++  def issue_token
++    token = SecureRandom.urlsafe_base64(32)
++    issued_at = Time.current
++    self.status = "pending"
++    self.token_digest = self.class.digest_token(token)
++    self.sent_at = issued_at
++    self.expires_at = issued_at + TOKEN_LIFETIME
++    self.accepted_at = nil
++    self.revoked_at = nil
++    self.accepted_user = nil
++    token
++  end
++
++  def issue_token!
++    token = issue_token
++    save!
++    token
++  end
++
++  def token_valid?(token)
++    return false unless pending? && token_digest.present? && expires_at.future?
++    return false if token.blank?
++
++    ActiveSupport::SecurityUtils.secure_compare(
++      self.class.digest_token(token),
++      token_digest
++    )
++  end
++
++  def expire_if_needed!
++    return self unless pending? && !expires_at.future?
++
++    update_columns(status: "expired", token_digest: nil, updated_at: Time.current)
++    self
++  end
++
++  def revoke!
++    update!(
++      status: "revoked",
++      token_digest: nil,
++      revoked_at: Time.current
++    )
++  end
++
++  def pending?
++    status == "pending"
++  end
++
++  def accepted?
++    status == "accepted"
++  end
++
++  def revoked?
++    status == "revoked"
++  end
++
++  def expired?
++    status == "expired"
++  end
++
++  private
++
++  def normalize_email
++    self.email = email.to_s.strip.downcase if email
++  end
++
++  def email_is_not_registered
++    return unless account_id && email.present?
++    return unless account.users.exists?(email: email)
++
++    errors.add(:email, "is already registered")
++  end
++
++  def only_one_pending_invitation
++    return unless account_id && email.present?
++
++    competing = account.invitations.where(email: email, status: "pending")
++    competing = competing.where.not(id: id) if persisted?
++    errors.add(:email, "already has a pending invitation") if competing.exists?
++  end
++end
+diff --git a/app/models/ticket.rb b/app/models/ticket.rb
+index be5a2a2..ebdbd56 100644
+--- a/app/models/ticket.rb
++++ b/app/models/ticket.rb
+@@ -3,11 +3,16 @@ class Ticket < ApplicationRecord
+ 
+   belongs_to :account
+   belongs_to :requester, class_name: "User", inverse_of: :requested_tickets
++  belongs_to :assignee,
++    class_name: "User",
++    optional: true,
++    inverse_of: :assigned_tickets
+   has_many :comments, dependent: :destroy
+ 
+   validates :subject, presence: true, length: { maximum: 255 }
+   validates :status, inclusion: { in: STATUSES }
+   validate :requester_belongs_to_account
++  validate :assignee_is_active_account_staff
+ 
+   scope :recently_active, -> { order(updated_at: :desc, id: :desc) }
+ 
+@@ -19,4 +24,11 @@ class Ticket < ApplicationRecord
+ 
+     errors.add(:requester, "must belong to the account")
+   end
++
++  def assignee_is_active_account_staff
++    return unless assignee
++    return if assignee.account_id == account_id && assignee.active_staff?
++
++    errors.add(:assignee, "must be active staff in the ticket account")
++  end
+ end
+diff --git a/app/models/user.rb b/app/models/user.rb
+index b8bb2b1..f909134 100644
+--- a/app/models/user.rb
++++ b/app/models/user.rb
+@@ -2,6 +2,7 @@ require "uri"
+ 
+ class User < ApplicationRecord
+   ROLES = %w[admin agent member].freeze
++  STAFF_ROLES = %w[admin agent].freeze
+   VERIFICATION_TOKEN_LIFETIME = 24.hours
+   PASSWORD_RESET_TOKEN_LIFETIME = 2.hours
+ 
+@@ -16,6 +17,21 @@ class User < ApplicationRecord
+     foreign_key: :author_id,
+     dependent: :destroy,
+     inverse_of: :author
++  has_many :assigned_tickets,
++    class_name: "Ticket",
++    foreign_key: :assignee_id,
++    dependent: :nullify,
++    inverse_of: :assignee
++  has_many :sent_invitations,
++    class_name: "Invitation",
++    foreign_key: :invited_by_id,
++    dependent: :nullify,
++    inverse_of: :invited_by
++  has_one :accepted_invitation,
++    class_name: "Invitation",
++    foreign_key: :accepted_user_id,
++    dependent: :nullify,
++    inverse_of: :accepted_user
+ 
+   has_secure_password
+ 
+@@ -27,7 +43,15 @@ class User < ApplicationRecord
+     uniqueness: { scope: :account_id, case_sensitive: false },
+     format: { with: URI::MailTo::EMAIL_REGEXP }
+   validates :role, inclusion: { in: ROLES }
++  validates :suspended, inclusion: { in: [ true, false ] }
+   validate :owner_must_be_an_admin
++  validate :cannot_remove_last_active_admin
++  validate :email_is_not_reserved_by_pending_invitation,
++    if: -> { new_record? || will_save_change_to_email? }
++
++  scope :active, -> { where(suspended: false) }
++  scope :staff, -> { where(role: STAFF_ROLES) }
++  scope :active_staff, -> { active.staff }
+ 
+   def self.digest_token(token)
+     Digest::SHA256.hexdigest(token.to_s)
+@@ -73,8 +97,20 @@ class User < ApplicationRecord
+     role == "member"
+   end
+ 
++  def admin?
++    role == "admin"
++  end
++
++  def agent?
++    role == "agent"
++  end
++
+   def staff?
+-    !customer?
++    STAFF_ROLES.include?(role)
++  end
++
++  def active_staff?
++    staff? && !suspended?
+   end
+ 
+   private
+@@ -96,4 +132,22 @@ class User < ApplicationRecord
+   def owner_must_be_an_admin
+     errors.add(:role, "must be admin for the account owner") if owner? && role != "admin"
+   end
++
++  def cannot_remove_last_active_admin
++    return unless persisted?
++    return unless role_in_database == "admin" && !suspended_in_database
++    return if admin? && !suspended?
++
++    another_active_admin = account.users.where(role: "admin", suspended: false).where.not(id: id).exists?
++    errors.add(:base, "The account must have at least one active admin") unless another_active_admin
++  end
++
++  def email_is_not_reserved_by_pending_invitation
++    return unless account_id && email.present?
++
++    reserved = account.invitations.pending.where(email: email, accepted_user_id: nil)
++      .where("expires_at > ?", Time.current)
++      .exists?
++    errors.add(:email, "is reserved by a pending invitation") if reserved
++  end
+ end
+diff --git a/app/views/invitation_mailer/staff_invitation.text.erb b/app/views/invitation_mailer/staff_invitation.text.erb
+new file mode 100644
+index 0000000..dcc18a2
+--- /dev/null
++++ b/app/views/invitation_mailer/staff_invitation.text.erb
+@@ -0,0 +1,7 @@
++You have been invited to join <%= @invitation.account.name %> as an <%= @invitation.role %>.
++
++Accept the invitation:
++
++<%= @invitation_url %>
++
++This link expires on <%= @invitation.expires_at.iso8601 %>.
+diff --git a/config/initializers/cors.rb b/config/initializers/cors.rb
+index 01ab80f..7e49866 100644
+--- a/config/initializers/cors.rb
++++ b/config/initializers/cors.rb
+@@ -12,4 +12,12 @@ Rails.application.config.middleware.insert_before 0, Rack::Cors do
+       expose: %w[Authorization],
+       max_age: 600
+   end
++
++  allow do
++    origins frontend_origin
++    resource "/invitation_previews",
++      headers: :any,
++      methods: %i[post options],
++      max_age: 600
++  end
+ end
+diff --git a/config/routes.rb b/config/routes.rb
+index ab0a5e3..ddc0b3d 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -1,6 +1,8 @@
+ Rails.application.routes.draw do
+   get "up" => "rails/health#show", as: :rails_health_check
+ 
++  post "invitation_previews", to: "api/v1/invitation_previews#create", defaults: { format: :json }
++
+   namespace :api, defaults: { format: :json } do
+     namespace :v1 do
+       post "account/create", to: "accounts#create"
+@@ -23,6 +25,14 @@ Rails.application.routes.draw do
+         get :comments, on: :member
+       end
+ 
++      resources :invitations, only: %i[index show create destroy] do
++        post :resend, on: :member
++      end
++      resources :users, only: %i[index show update]
++      get "staff", to: "staff#index"
++      post "invitation_previews", to: "invitation_previews#create"
++      post "invitation_acceptances", to: "invitation_acceptances#create"
++
+       get "me", to: "profiles#show"
+       patch "me", to: "profiles#update"
+       put "me/password", to: "passwords#update"
+diff --git a/db/migrate/20261123020000_add_staff_management_and_invitations.rb b/db/migrate/20261123020000_add_staff_management_and_invitations.rb
+new file mode 100644
+index 0000000..43ba461
+--- /dev/null
++++ b/db/migrate/20261123020000_add_staff_management_and_invitations.rb
+@@ -0,0 +1,43 @@
++class AddStaffManagementAndInvitations < ActiveRecord::Migration[8.1]
++  def change
++    add_column :users, :suspended, :boolean, null: false, default: false
++    add_index :users, %i[account_id role suspended]
++
++    add_reference :tickets,
++      :assignee,
++      foreign_key: { to_table: :users, on_delete: :nullify }
++    add_index :tickets, %i[account_id assignee_id]
++
++    create_table :invitations do |t|
++      t.references :account, null: false, foreign_key: { on_delete: :cascade }
++      t.references :invited_by,
++        foreign_key: { to_table: :users, on_delete: :nullify }
++      t.references :accepted_user,
++        foreign_key: { to_table: :users, on_delete: :nullify }
++      t.string :email, null: false
++      t.string :role, null: false
++      t.string :status, null: false, default: "pending"
++      t.string :token_digest
++      t.datetime :sent_at, null: false
++      t.datetime :expires_at, null: false
++      t.datetime :accepted_at
++      t.datetime :revoked_at
++
++      t.timestamps
++    end
++
++    add_index :invitations, :token_digest, unique: true
++    add_index :invitations,
++      %i[account_id email],
++      unique: true,
++      where: "status = 'pending'",
++      name: "index_invitations_one_pending_per_account_email"
++    add_index :invitations, %i[account_id status id]
++    add_check_constraint :invitations,
++      "role IN ('admin', 'agent')",
++      name: "invitations_role_valid"
++    add_check_constraint :invitations,
++      "status IN ('pending', 'accepted', 'revoked', 'expired')",
++      name: "invitations_status_valid"
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 9454ed4..87ec060 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.1].define(version: 2026_11_23_010000) do
++ActiveRecord::Schema[8.1].define(version: 2026_11_23_020000) do
+   # These are extensions that must be enabled in order to support this database
+   enable_extension "pg_catalog.plpgsql"
+ 
+@@ -35,6 +35,30 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_23_010000) do
+     t.index ["ticket_id"], name: "index_comments_on_ticket_id"
+   end
+ 
++  create_table "invitations", force: :cascade do |t|
++    t.bigint "account_id", null: false
++    t.bigint "invited_by_id"
++    t.bigint "accepted_user_id"
++    t.string "email", null: false
++    t.string "role", null: false
++    t.string "status", default: "pending", null: false
++    t.string "token_digest"
++    t.datetime "sent_at", null: false
++    t.datetime "expires_at", null: false
++    t.datetime "accepted_at"
++    t.datetime "revoked_at"
++    t.datetime "created_at", null: false
++    t.datetime "updated_at", null: false
++    t.index ["accepted_user_id"], name: "index_invitations_on_accepted_user_id"
++    t.index ["account_id", "email"], name: "index_invitations_one_pending_per_account_email", unique: true, where: "((status)::text = 'pending'::text)"
++    t.index ["account_id", "status", "id"], name: "index_invitations_on_account_id_and_status_and_id"
++    t.index ["account_id"], name: "index_invitations_on_account_id"
++    t.index ["invited_by_id"], name: "index_invitations_on_invited_by_id"
++    t.index ["token_digest"], name: "index_invitations_on_token_digest", unique: true
++    t.check_constraint "role::text = ANY (ARRAY['admin'::character varying, 'agent'::character varying]::text[])", name: "invitations_role_valid"
++    t.check_constraint "status::text = ANY (ARRAY['pending'::character varying, 'accepted'::character varying, 'revoked'::character varying, 'expired'::character varying]::text[])", name: "invitations_status_valid"
++  end
++
+   create_table "sessions", force: :cascade do |t|
+     t.bigint "user_id", null: false
+     t.string "token_digest", null: false
+@@ -51,11 +75,14 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_23_010000) do
+     t.string "status", default: "open", null: false
+     t.datetime "created_at", null: false
+     t.datetime "updated_at", null: false
++    t.bigint "assignee_id"
++    t.index ["account_id", "assignee_id"], name: "index_tickets_on_account_id_and_assignee_id"
+     t.index ["account_id", "updated_at", "id"], name: "index_tickets_on_account_id_and_updated_at_and_id"
+     t.index ["account_id"], name: "index_tickets_on_account_id"
++    t.index ["assignee_id"], name: "index_tickets_on_assignee_id"
+     t.index ["requester_id", "updated_at", "id"], name: "index_tickets_on_requester_id_and_updated_at_and_id"
+     t.index ["requester_id"], name: "index_tickets_on_requester_id"
+-    t.check_constraint "status::text = ANY (ARRAY['open'::character varying, 'pending'::character varying, 'solved'::character varying]::text[])", name: "tickets_status_valid"
++    t.check_constraint "status::text = ANY (ARRAY['open'::character varying::text, 'pending'::character varying::text, 'solved'::character varying::text])", name: "tickets_status_valid"
+   end
+ 
+   create_table "users", force: :cascade do |t|
+@@ -72,7 +99,9 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_23_010000) do
+     t.datetime "password_reset_sent_at"
+     t.datetime "created_at", null: false
+     t.datetime "updated_at", null: false
++    t.boolean "suspended", default: false, null: false
+     t.index ["account_id", "email"], name: "index_users_on_account_id_and_email", unique: true
++    t.index ["account_id", "role", "suspended"], name: "index_users_on_account_id_and_role_and_suspended"
+     t.index ["account_id"], name: "index_users_on_account_id"
+     t.index ["account_id"], name: "index_users_one_owner_per_account", unique: true, where: "(owner = true)"
+     t.index ["email_verification_token_digest"], name: "index_users_on_email_verification_token_digest", unique: true
+@@ -81,8 +110,12 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_23_010000) do
+ 
+   add_foreign_key "comments", "tickets", on_delete: :cascade
+   add_foreign_key "comments", "users", column: "author_id", on_delete: :cascade
++  add_foreign_key "invitations", "accounts", on_delete: :cascade
++  add_foreign_key "invitations", "users", column: "accepted_user_id", on_delete: :nullify
++  add_foreign_key "invitations", "users", column: "invited_by_id", on_delete: :nullify
+   add_foreign_key "sessions", "users", on_delete: :cascade
+   add_foreign_key "tickets", "accounts", on_delete: :cascade
++  add_foreign_key "tickets", "users", column: "assignee_id", on_delete: :nullify
+   add_foreign_key "tickets", "users", column: "requester_id", on_delete: :cascade
+   add_foreign_key "users", "accounts", on_delete: :cascade
+ end
+diff --git a/test/integration/staff_management_api_test.rb b/test/integration/staff_management_api_test.rb
+new file mode 100644
+index 0000000..8cdb7ed
+--- /dev/null
++++ b/test/integration/staff_management_api_test.rb
+@@ -0,0 +1,342 @@
++require "test_helper"
++require "uri"
++
++class StaffManagementApiTest < ActionDispatch::IntegrationTest
++  setup do
++    ActionMailer::Base.deliveries.clear
++    @account = Account.create!(name: "Acme", subdomain: "acme")
++    @owner = create_user(
++      name: "Jo",
++      email: "jo@acme.test",
++      role: "admin",
++      owner: true
++    )
++    @owner_token = issue_token(@owner)
++  end
++
++  test "admins invite, preview, resend, accept, and sign in staff" do
++    post "/api/v1/invitations",
++      params: { invitation: { email: "SAM@example.test", role: "agent" } },
++      headers: authenticated_headers(@owner_token),
++      as: :json
++
++    assert_response :created
++    invitation = response.parsed_body.fetch("invitation")
++    invitation_id = invitation.fetch("id")
++    assert_equal "sam@example.test", invitation["email"]
++    assert_equal "agent", invitation["role"]
++    assert_equal "pending", invitation["status"]
++    assert_match %r{\Ahttp://localhost:3001/accept-invitation\?account=acme&token=}, latest_mail_link
++
++    old_token = token_from_latest_mail
++    post "/invitation_previews",
++      params: { invitation_preview: { token: old_token } },
++      as: :json
++
++    assert_response :success
++    preview = response.parsed_body.fetch("invitation_preview")
++    assert_equal "sam@example.test", preview["email"]
++    assert_equal "agent", preview["role"]
++    assert_equal "Acme", preview["business_name"]
++    assert_equal "acme", preview["subdomain"]
++    assert preview["expires_at"]
++
++    post "/api/v1/invitations/#{invitation_id}/resend",
++      headers: authenticated_headers(@owner_token),
++      as: :json
++
++    assert_response :success
++    new_token = token_from_latest_mail
++    refute_equal old_token, new_token
++
++    post "/api/v1/invitation_previews",
++      params: { invitation_preview: { token: old_token } },
++      as: :json
++    assert_response :unprocessable_content
++
++    post "/api/v1/invitation_acceptances",
++      params: {
++        invitation_acceptance: {
++          token: new_token,
++          name: "Sam",
++          password: "my-team-password"
++        }
++      },
++      as: :json
++
++    assert_response :created
++    accepted = response.parsed_body
++    assert_equal "Sam", accepted.dig("user", "name")
++    assert_equal "agent", accepted.dig("user", "role")
++    assert_equal true, accepted.dig("user", "verified")
++    assert_equal false, accepted.dig("user", "suspended")
++    assert_equal "Acme", accepted.dig("account", "name")
++    assert_equal "accepted", Invitation.find(invitation_id).status
++
++    post "/api/v1/sessions",
++      params: {
++        session: {
++          email: "sam@example.test",
++          password: "my-team-password"
++        }
++      },
++      headers: account_headers,
++      as: :json
++    assert_response :success
++
++    post "/api/v1/invitation_acceptances",
++      params: {
++        invitation_acceptance: {
++          token: new_token,
++          name: "Sam Again",
++          password: "another-password"
++        }
++      },
++      as: :json
++    assert_response :unprocessable_content
++  end
++
++  test "pending invitations reserve email addresses and states are filterable" do
++    first = create_invitation(email: "sam@example.test", role: "agent")
++    second = create_invitation(email: "ren@example.test", role: "admin")
++
++    post "/api/v1/invitations",
++      params: { invitation: { email: "SAM@example.test", role: "admin" } },
++      headers: authenticated_headers(@owner_token),
++      as: :json
++    assert_response :unprocessable_content
++    assert_equal 2, @account.invitations.count
++
++    post "/api/v1/registrations",
++      params: {
++        user: {
++          name: "Customer",
++          email: "sam@example.test",
++          password: "customer-password"
++        }
++      },
++      headers: account_headers,
++      as: :json
++    assert_response :unprocessable_content
++
++    delete "/api/v1/invitations/#{first.id}",
++      headers: authenticated_headers(@owner_token)
++    assert_response :no_content
++    assert_equal "revoked", first.reload.status
++
++    post "/api/v1/registrations",
++      params: {
++        user: {
++          name: "Customer",
++          email: "sam@example.test",
++          password: "customer-password"
++        }
++      },
++      headers: account_headers,
++      as: :json
++    assert_response :created
++
++    get "/api/v1/invitations",
++      params: { status: "pending" },
++      headers: authenticated_headers(@owner_token)
++    assert_response :success
++    assert_equal [ second.id ], response.parsed_body.fetch("invitations").pluck("id")
++
++    get "/api/v1/invitations",
++      headers: authenticated_headers(@owner_token)
++    assert_response :success
++    assert_equal [ first.id, second.id ], response.parsed_body.fetch("invitations").pluck("id")
++
++    get "/api/v1/invitations/#{second.id}",
++      headers: authenticated_headers(@owner_token)
++    assert_response :success
++    assert_equal "pending", response.parsed_body.dig("invitation", "status")
++  end
++
++  test "expired invitations become trackable and can be renewed" do
++    invitation = create_invitation(email: "expired@example.test")
++    token = token_from_latest_mail
++    invitation.update_column(:expires_at, 1.minute.ago)
++
++    post "/api/v1/invitation_previews",
++      params: { invitation_preview: { token: token } },
++      as: :json
++    assert_response :unprocessable_content
++    assert_equal "expired", invitation.reload.status
++
++    get "/api/v1/invitations",
++      params: { status: "expired" },
++      headers: authenticated_headers(@owner_token)
++    assert_response :success
++    assert_equal [ invitation.id ], response.parsed_body.fetch("invitations").pluck("id")
++
++    post "/api/v1/invitations/#{invitation.id}/resend",
++      headers: authenticated_headers(@owner_token),
++      as: :json
++    assert_response :success
++    assert_equal "pending", invitation.reload.status
++    assert_operator invitation.expires_at, :>, Time.current
++  end
++
++  test "only admins manage users and suspension revokes access and assignments" do
++    agent = create_user(name: "Alex", email: "alex@example.test", role: "agent")
++    customer = create_user(name: "Avery", email: "avery@example.test", role: "member")
++    second_admin = create_user(name: "Mo", email: "mo@example.test", role: "admin")
++    agent_token = issue_token(agent)
++    issue_token(second_admin)
++
++    ticket = Ticket.create!(
++      account: @account,
++      requester: customer,
++      assignee: agent,
++      subject: "Billing question"
++    )
++
++    get "/api/v1/users", headers: authenticated_headers(agent_token)
++    assert_response :forbidden
++
++    get "/api/v1/staff", headers: authenticated_headers(agent_token)
++    assert_response :success
++    assert_equal [ @owner.id, agent.id, second_admin.id ],
++      response.parsed_body.fetch("staff").pluck("id")
++
++    patch "/api/v1/users/#{agent.id}",
++      params: { user: { suspended: true } },
++      headers: authenticated_headers(@owner_token),
++      as: :json
++    assert_response :success
++    assert_equal true, response.parsed_body.dig("user", "suspended")
++    assert_not Session.exists?(user: agent)
++    assert_nil ticket.reload.assignee_id
++
++    get "/api/v1/me", headers: authenticated_headers(agent_token)
++    assert_response :unauthorized
++
++    get "/api/v1/users",
++      params: { role: "agent", suspended: true },
++      headers: authenticated_headers(@owner_token)
++    assert_response :success
++    assert_equal [ agent.id ], response.parsed_body.fetch("users").pluck("id")
++
++    patch "/api/v1/users/#{second_admin.id}",
++      params: { user: { suspended: true } },
++      headers: authenticated_headers(@owner_token),
++      as: :json
++    assert_response :success
++
++    patch "/api/v1/users/#{@owner.id}",
++      params: { user: { suspended: true } },
++      headers: authenticated_headers(@owner_token),
++      as: :json
++    assert_response :unprocessable_content
++    assert_equal false, @owner.reload.suspended?
++  end
++
++  test "agents and admins assign tickets but private notes do not touch requests" do
++    agent = create_user(name: "Alex", email: "alex@example.test", role: "agent")
++    suspended_agent = create_user(
++      name: "Casey",
++      email: "casey@example.test",
++      role: "agent",
++      suspended: true
++    )
++    customer = create_user(name: "Avery", email: "avery@example.test", role: "member")
++    agent_token = issue_token(agent)
++    customer_token = issue_token(customer)
++    ticket = Ticket.create!(
++      account: @account,
++      requester: customer,
++      subject: "Delivery issue"
++    )
++    ticket.comments.create!(author: customer, body: "Please help.", public: true)
++    ticket.update_columns(updated_at: 2.minutes.ago)
++    customer_updated_at = ticket.reload.updated_at
++
++    patch "/api/v1/tickets/#{ticket.id}",
++      params: {
++        ticket: {
++          assignee_id: agent.id,
++          comment: { body: "Checking billing.", public: false }
++        }
++      },
++      headers: authenticated_headers(agent_token),
++      as: :json
++
++    assert_response :success
++    assert_equal agent.id, response.parsed_body.dig("ticket", "assignee_id")
++    assert_equal agent.id, response.parsed_body.dig("ticket", "assignee", "id")
++    assert_equal "Alex", response.parsed_body.dig("ticket", "assignee", "name")
++    assert_not_equal customer_updated_at, ticket.reload.updated_at
++
++    ticket.update_columns(updated_at: customer_updated_at)
++    patch "/api/v1/tickets/#{ticket.id}",
++      params: { ticket: { comment: { body: "Internal follow-up.", public: false } } },
++      headers: authenticated_headers(agent_token),
++      as: :json
++    assert_response :success
++    assert_equal customer_updated_at, ticket.reload.updated_at
++
++    get "/api/v1/requests/#{ticket.id}/comments",
++      headers: authenticated_headers(customer_token)
++    assert_response :success
++    assert_equal [ "Please help." ], response.parsed_body.fetch("comments").pluck("body")
++
++    patch "/api/v1/tickets/#{ticket.id}",
++      params: { ticket: { assignee_id: suspended_agent.id } },
++      headers: authenticated_headers(@owner_token),
++      as: :json
++    assert_response :unprocessable_content
++    assert_equal agent.id, ticket.reload.assignee_id
++
++    patch "/api/v1/tickets/#{ticket.id}",
++      params: { ticket: { assignee_id: nil } },
++      headers: authenticated_headers(@owner_token),
++      as: :json
++    assert_response :success
++    assert_nil response.parsed_body.dig("ticket", "assignee_id")
++  end
++
++  private
++
++  def create_user(name:, email:, role:, owner: false, suspended: false)
++    @account.users.create!(
++      name: name,
++      email: email,
++      password: "account-password",
++      role: role,
++      owner: owner,
++      verified: true,
++      suspended: suspended
++    )
++  end
++
++  def create_invitation(email:, role: "agent")
++    post "/api/v1/invitations",
++      params: { invitation: { email: email, role: role } },
++      headers: authenticated_headers(@owner_token),
++      as: :json
++    assert_response :created
++
++    Invitation.find(response.parsed_body.dig("invitation", "id"))
++  end
++
++  def issue_token(user)
++    Session.issue_for(user).last
++  end
++
++  def token_from_latest_mail
++    URI.decode_www_form_component(latest_mail_link[/[?&]token=([^&\s]+)/, 1])
++  end
++
++  def latest_mail_link
++    ActionMailer::Base.deliveries.last.body.decoded[%r{https?://[^\s]+}]
++  end
++
++  def account_headers
++    { "X-Helpdesk-Account" => @account.subdomain }
++  end
++
++  def authenticated_headers(token)
++    account_headers.merge("Authorization" => "Bearer #{token}")
++  end
++end

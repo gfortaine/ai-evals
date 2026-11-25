@@ -1,0 +1,734 @@
+diff --git a/README.md b/README.md
+index 1a879e0..b96a378 100644
+--- a/README.md
++++ b/README.md
+@@ -28,6 +28,8 @@ Customers register at `POST /api/v1/registrations`, then use the standard verifi
+ 
+ Staff can set each ticket's `priority` to `normal` (the default) or `high`. Staff ticket responses include priority, while customer request responses do not. Staff can combine `status`, `assignee_id`, `group_id`, `requester_id`, `priority`, and `q` filters on `/api/v1/tickets`; `assignee_id=unassigned` selects tickets without an assignee. `q` is a case-insensitive literal search of subjects and public comments. Customer request lists support only the `status` filter.
+ 
++Staff can merge duplicate tickets for the same customer with `POST /api/v1/tickets/:id/merge` and a JSON `merge.target_id`. The source becomes `closed` and both ticket views expose `merged_into_id`, including `null` for unmerged tickets; `status=closed` filters are supported in both staff and customer lists. Merge notes are private by default and may be customized independently with `source_comment` and `target_comment` objects containing `body` and `public`. Merges never move comments or send email for their notes, and closed tickets remain readable but reject edits and inbound email replies.
++
+ Admins manage staff invitations through `/api/v1/invitations`, including list/show, `POST /api/v1/invitations/:id/resend`, and `DELETE /api/v1/invitations/:id`. Invitations expire after seven days. The frontend previews a token with `POST /invitation_previews` (also available at `/api/v1/invitation_previews`) and accepts it at `POST /api/v1/invitation_acceptances`. Accepted staff are verified immediately.
+ 
+ Admins list and inspect users at `/api/v1/users` and update roles or suspension at `/api/v1/users/:id`. User lists can filter by `role` and `suspended`. `GET /api/v1/staff` returns all active admin and agent choices for ticket assignment. Suspending a user revokes their sessions and clears their ticket assignments; the last active admin cannot be suspended or demoted.
+diff --git a/app/controllers/api/v1/base_controller.rb b/app/controllers/api/v1/base_controller.rb
+index 62978b5..0f8bf1f 100644
+--- a/app/controllers/api/v1/base_controller.rb
++++ b/app/controllers/api/v1/base_controller.rb
+@@ -133,6 +133,7 @@ class Api::V1::BaseController < ApplicationController
+       subject: ticket.subject,
+       status: ticket.status,
+       requester_id: ticket.requester_id,
++      merged_into_id: ticket.merged_into_id,
+       email_origin: ticket.email_origin?,
+       reply_address: ticket.reply_address,
+       created_at: ticket.created_at.iso8601,
+@@ -222,6 +223,13 @@ class Api::V1::BaseController < ApplicationController
+     }
+   end
+ 
++  def ensure_ticket_editable!(ticket)
++    return unless ticket.closed?
++
++    ticket.errors.add(:base, "Closed tickets cannot be edited")
++    raise ActiveRecord::RecordInvalid, ticket
++  end
++
+   def paginate(scope)
+     page = positive_integer_parameter(:page, default: 1)
+     per_page = positive_integer_parameter(:per_page, default: 25)
+diff --git a/app/controllers/api/v1/requests_controller.rb b/app/controllers/api/v1/requests_controller.rb
+index d55aca3..f46bdb4 100644
+--- a/app/controllers/api/v1/requests_controller.rb
++++ b/app/controllers/api/v1/requests_controller.rb
+@@ -59,6 +59,7 @@ class Api::V1::RequestsController < Api::V1::BaseController
+     end
+ 
+     @ticket.with_lock do
++      ensure_ticket_editable!(@ticket)
+       if comment_supplied
+         @ticket.comments.create!(author: current_user, body: body, public: true)
+       end
+diff --git a/app/controllers/api/v1/tickets_controller.rb b/app/controllers/api/v1/tickets_controller.rb
+index 31922f1..8434656 100644
+--- a/app/controllers/api/v1/tickets_controller.rb
++++ b/app/controllers/api/v1/tickets_controller.rb
+@@ -3,7 +3,7 @@ class Api::V1::TicketsController < Api::V1::BaseController
+   before_action :authenticate_user!
+   before_action :require_active_account!
+   before_action :require_staff!
+-  before_action :set_ticket, only: %i[show update comments]
++  before_action :set_ticket, only: %i[show update comments merge]
+ 
+   def index
+     scope = filtered_scope(current_account.tickets)
+@@ -21,6 +21,46 @@ class Api::V1::TicketsController < Api::V1::BaseController
+     render json: { ticket: staff_ticket_json(@ticket) }
+   end
+ 
++  def merge
++    merge_payload = params.require(:merge)
++    validate_merge_parameter_shapes!(merge_payload)
++    merge_params = merge_payload.permit(
++      :target_id,
++      source_comment: %i[body public],
++      target_comment: %i[body public]
++    )
++    target_id = positive_merge_target_id(merge_params)
++
++    current_account.with_lock do
++      @ticket.lock!
++      @target_ticket = current_account.tickets.lock.find(target_id)
++      ensure_ticket_mergeable!(@target_ticket)
++
++      source_note = merge_note_attributes(
++        merge_params,
++        :source_comment,
++        default_body: "Merged into ticket ##{@target_ticket.id}."
++      )
++      target_note = merge_note_attributes(
++        merge_params,
++        :target_comment,
++        default_body: "Merged ticket ##{@ticket.id} into this ticket."
++      )
++
++      @ticket.comments.create!(author: current_user, **source_note)
++      @target_ticket.comments.create!(author: current_user, **target_note)
++      @ticket.update!(status: "closed", merged_into: @target_ticket)
++
++      @ticket.reload
++      @target_ticket.reload
++    end
++
++    render json: {
++      source: staff_ticket_json(@ticket),
++      target: staff_ticket_json(@target_ticket)
++    }
++  end
++
+   def update
+     ticket_params = params.require(:ticket)
+     comment = comment_parameters(ticket_params)
+@@ -31,6 +71,7 @@ class Api::V1::TicketsController < Api::V1::BaseController
+ 
+     current_account.with_lock do
+       @ticket.lock!
++      ensure_ticket_editable!(@ticket)
+       update_ticket_group_and_assignee(
+         ticket_params,
+         group_supplied: group_supplied,
+@@ -139,6 +180,52 @@ class Api::V1::TicketsController < Api::V1::BaseController
+     ticket_params.require(:comment).permit(:body, :public)
+   end
+ 
++  def validate_merge_parameter_shapes!(merge_payload)
++    raise ActionController::BadRequest, "merge must be an object" unless merge_payload.respond_to?(:permit)
++
++    %i[source_comment target_comment].each do |key|
++      next unless merge_payload.respond_to?(:key?) && merge_payload.key?(key)
++      next if merge_payload[key].respond_to?(:permit)
++
++      raise ActionController::BadRequest, "#{key} must be an object"
++    end
++  end
++
++  def positive_merge_target_id(merge_params)
++    value = Integer(merge_params.require(:target_id).to_s, 10, exception: false)
++    return value if value&.positive?
++
++    raise ActionController::BadRequest, "target_id must be a positive integer"
++  end
++
++  def ensure_ticket_mergeable!(target_ticket)
++    @ticket.errors.add(:base, "A closed ticket cannot be merged") if @ticket.closed?
++    if @ticket.merged_into_id.present?
++      @ticket.errors.add(:merged_into, "is already set")
++    end
++    if target_ticket.id == @ticket.id
++      @ticket.errors.add(:merged_into, "cannot be the ticket itself")
++    end
++    if target_ticket.requester_id != @ticket.requester_id
++      @ticket.errors.add(:merged_into, "must belong to the same customer")
++    end
++    if target_ticket.closed? || target_ticket.merged_into_id.present?
++      @ticket.errors.add(:merged_into, "must not already be closed or merged")
++    end
++
++    raise ActiveRecord::RecordInvalid, @ticket if @ticket.errors.any?
++  end
++
++  def merge_note_attributes(merge_params, key, default_body:)
++    note = merge_params[key]
++    return { body: default_body, public: false } unless note
++
++    {
++      body: note.key?(:body) ? note[:body] : default_body,
++      public: note.fetch(:public, false)
++    }
++  end
++
+   def update_ticket_group_and_assignee(ticket_params, group_supplied:, assignee_supplied:)
+     if group_supplied
+       @ticket.group = group_for(ticket_params[:group_id])
+diff --git a/app/mailboxes/support_mailbox.rb b/app/mailboxes/support_mailbox.rb
+index a0dd280..a61639a 100644
+--- a/app/mailboxes/support_mailbox.rb
++++ b/app/mailboxes/support_mailbox.rb
+@@ -122,6 +122,7 @@ class SupportMailbox < ApplicationMailbox
+   def record_reply(account, attributes)
+     ticket = account.tickets.lock.find_by(id: attributes[:destination][:ticket_id])
+     return :invalid unless ticket
++    return :invalid if ticket.closed?
+     return :invalid unless ticket.requester.email.casecmp?(attributes[:sender][:email])
+ 
+     ticket.comments.create!(author: ticket.requester, body: attributes[:body], public: true)
+diff --git a/app/models/comment.rb b/app/models/comment.rb
+index 429e10d..00d97a4 100644
+--- a/app/models/comment.rb
++++ b/app/models/comment.rb
+@@ -7,6 +7,7 @@ class Comment < ApplicationRecord
+   validates :body, presence: true, length: { maximum: 20_000 }
+   validates :public, inclusion: { in: [ true, false ] }
+   validate :author_belongs_to_ticket_account
++  validate :ticket_is_not_closed, on: :create
+ 
+   scope :oldest_first, -> { order(created_at: :asc, id: :asc) }
+   scope :visible_to_customers, -> { where(public: true) }
+@@ -23,4 +24,10 @@ class Comment < ApplicationRecord
+ 
+     errors.add(:author, "must belong to the ticket account")
+   end
++
++  def ticket_is_not_closed
++    return unless ticket&.closed?
++
++    errors.add(:ticket, "is closed and cannot receive comments")
++  end
+ end
+diff --git a/app/models/ticket.rb b/app/models/ticket.rb
+index 3192af9..28c5676 100644
+--- a/app/models/ticket.rb
++++ b/app/models/ticket.rb
+@@ -1,5 +1,5 @@
+ class Ticket < ApplicationRecord
+-  STATUSES = %w[open pending solved].freeze
++  STATUSES = %w[open pending solved closed].freeze
+   PRIORITIES = %w[normal high].freeze
+ 
+   belongs_to :account
+@@ -9,7 +9,16 @@ class Ticket < ApplicationRecord
+     optional: true,
+     inverse_of: :assigned_tickets
+   belongs_to :group, optional: true, inverse_of: :tickets
++  belongs_to :merged_into,
++    class_name: "Ticket",
++    optional: true,
++    inverse_of: :merged_tickets
+   has_many :comments, dependent: :destroy
++  has_many :merged_tickets,
++    class_name: "Ticket",
++    foreign_key: :merged_into_id,
++    dependent: :nullify,
++    inverse_of: :merged_into
+ 
+   before_validation :ensure_reply_token, on: :create
+   before_validation :reconcile_group_and_assignee
+@@ -22,6 +31,9 @@ class Ticket < ApplicationRecord
+   validate :group_belongs_to_account
+   validate :assignee_is_active_account_staff
+   validate :assignee_belongs_to_group
++  validate :merge_target_is_valid
++  validate :merged_link_cannot_be_rewritten
++  validate :closed_ticket_is_read_only, on: :update
+ 
+   scope :recently_active, -> { order(updated_at: :desc, id: :desc) }
+   scope :matching_text, ->(query) {
+@@ -50,6 +62,10 @@ class Ticket < ApplicationRecord
+   alias_method :reply_email_address, :reply_address
+   alias_method :support_reply_address, :reply_address
+ 
++  def closed?
++    status == "closed"
++  end
++
+   private
+ 
+   def ensure_reply_token
+@@ -110,4 +126,37 @@ class Ticket < ApplicationRecord
+   def membership_exists_for_assignee?
+     GroupMembership.exists?(group_id: group_id, user_id: assignee_id)
+   end
++
++  def merge_target_is_valid
++    return unless will_save_change_to_merged_into_id? && merged_into
++
++    if merged_into.id == id
++      errors.add(:merged_into, "cannot be the ticket itself")
++    elsif merged_into.account_id != account_id || merged_into.requester_id != requester_id
++      errors.add(:merged_into, "must belong to the same customer")
++    elsif merged_into.closed? || merged_into.merged_into_id.present?
++      errors.add(:merged_into, "must not already be closed or merged")
++    end
++
++    errors.add(:status, "must be closed when merged") unless closed?
++  end
++
++  def merged_link_cannot_be_rewritten
++    return unless will_save_change_to_merged_into_id?
++    return if merged_into_id_in_database.nil?
++
++    errors.add(:merged_into, "cannot be changed once set")
++  end
++
++  def closed_ticket_is_read_only
++    return unless status_in_database == "closed"
++
++    changes_to_save.each do |attribute, (_before, after)|
++      next if attribute == "updated_at"
++      next if %w[assignee_id group_id].include?(attribute) && after.nil?
++
++      errors.add(:base, "Closed tickets cannot be edited")
++      break
++    end
++  end
+ end
+diff --git a/config/routes.rb b/config/routes.rb
+index 09b4148..300327b 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -23,6 +23,7 @@ Rails.application.routes.draw do
+ 
+       resources :tickets, only: %i[index show update] do
+         get :comments, on: :member
++        post :merge, on: :member
+       end
+ 
+       resources :groups, only: %i[index show create update destroy]
+diff --git a/db/migrate/20261123070000_add_ticket_merging.rb b/db/migrate/20261123070000_add_ticket_merging.rb
+new file mode 100644
+index 0000000..a00f9f6
+--- /dev/null
++++ b/db/migrate/20261123070000_add_ticket_merging.rb
+@@ -0,0 +1,24 @@
++class AddTicketMerging < ActiveRecord::Migration[8.1]
++  def up
++    add_reference :tickets,
++      :merged_into,
++      foreign_key: { to_table: :tickets, on_delete: :nullify }
++
++    remove_check_constraint :tickets, name: "tickets_status_valid"
++    add_check_constraint :tickets,
++      "status IN ('open', 'pending', 'solved', 'closed')",
++      name: "tickets_status_valid"
++  end
++
++  def down
++    remove_check_constraint :tickets, name: "tickets_status_valid"
++    execute("UPDATE tickets SET status = 'solved' WHERE status = 'closed'")
++    add_check_constraint :tickets,
++      "status IN ('open', 'pending', 'solved')",
++      name: "tickets_status_valid"
++
++    remove_reference :tickets,
++      :merged_into,
++      foreign_key: { to_table: :tickets }
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 75ae62f..5e5f201 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.1].define(version: 2026_11_23_060000) do
++ActiveRecord::Schema[8.1].define(version: 2026_11_23_070000) do
+   # These are extensions that must be enabled in order to support this database
+   enable_extension "pg_catalog.plpgsql"
+ 
+@@ -145,6 +145,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_23_060000) do
+     t.boolean "email_origin", default: false, null: false
+     t.string "reply_token", null: false
+     t.bigint "group_id"
++    t.bigint "merged_into_id"
+     t.index ["account_id", "assignee_id"], name: "index_tickets_on_account_id_and_assignee_id"
+     t.index ["account_id", "group_id"], name: "index_tickets_on_account_id_and_group_id"
+     t.index ["account_id", "priority"], name: "index_tickets_on_account_id_and_priority"
+@@ -152,11 +153,12 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_23_060000) do
+     t.index ["account_id"], name: "index_tickets_on_account_id"
+     t.index ["assignee_id"], name: "index_tickets_on_assignee_id"
+     t.index ["group_id"], name: "index_tickets_on_group_id"
++    t.index ["merged_into_id"], name: "index_tickets_on_merged_into_id"
+     t.index ["reply_token"], name: "index_tickets_on_reply_token", unique: true
+     t.index ["requester_id", "updated_at", "id"], name: "index_tickets_on_requester_id_and_updated_at_and_id"
+     t.index ["requester_id"], name: "index_tickets_on_requester_id"
+     t.check_constraint "priority::text = ANY (ARRAY['normal'::character varying::text, 'high'::character varying::text])", name: "tickets_priority_valid"
+-    t.check_constraint "status::text = ANY (ARRAY['open'::character varying::text, 'pending'::character varying::text, 'solved'::character varying::text])", name: "tickets_status_valid"
++    t.check_constraint "status::text = ANY (ARRAY['open'::character varying, 'pending'::character varying, 'solved'::character varying, 'closed'::character varying]::text[])", name: "tickets_status_valid"
+   end
+ 
+   create_table "users", force: :cascade do |t|
+@@ -195,6 +197,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_23_060000) do
+   add_foreign_key "sessions", "users", on_delete: :cascade
+   add_foreign_key "tickets", "accounts", on_delete: :cascade
+   add_foreign_key "tickets", "groups", on_delete: :nullify
++  add_foreign_key "tickets", "tickets", column: "merged_into_id", on_delete: :nullify
+   add_foreign_key "tickets", "users", column: "assignee_id", on_delete: :nullify
+   add_foreign_key "tickets", "users", column: "requester_id", on_delete: :cascade
+   add_foreign_key "users", "accounts", on_delete: :cascade
+diff --git a/test/integration/ticket_merge_api_test.rb b/test/integration/ticket_merge_api_test.rb
+new file mode 100644
+index 0000000..b115585
+--- /dev/null
++++ b/test/integration/ticket_merge_api_test.rb
+@@ -0,0 +1,349 @@
++require "test_helper"
++require "mail"
++
++class TicketMergeApiTest < ActionDispatch::IntegrationTest
++  setup do
++    @previous_ingress_password = ENV["RAILS_INBOUND_EMAIL_PASSWORD"]
++    ENV["RAILS_INBOUND_EMAIL_PASSWORD"] = "inbound-secret"
++    ActionMailer::Base.deliveries.clear
++
++    @account = Account.create!(name: "Acme", subdomain: "acme")
++    @owner = create_user("Jo", "jo@acme.test", role: "admin", owner: true)
++    @agent = create_user("Alex", "alex@acme.test", role: "agent")
++    @customer = create_user("Avery", "avery@example.test")
++    @other_customer = create_user("Blake", "blake@example.test")
++    @owner_token = Session.issue_for(@owner).last
++    @customer_token = Session.issue_for(@customer).last
++  end
++
++teardown do
++  if @previous_ingress_password
++    ENV["RAILS_INBOUND_EMAIL_PASSWORD"] = @previous_ingress_password
++  else
++    ENV.delete("RAILS_INBOUND_EMAIL_PASSWORD")
++  end
++end
++
++test "staff merges a duplicate without moving or reconfiguring the conversation" do
++    group = @account.groups.create!(name: "Support")
++    GroupMembership.create!(group: group, user: @agent)
++    source = create_ticket(subject: "Cannot sign in", status: "pending", email_origin: true)
++    target = create_ticket(
++      subject: "Sign-in issue",
++      status: "solved",
++      priority: "high",
++      email_origin: true,
++      group: group,
++      assignee: @agent
++    )
++    source_comment = source.comments.create!(author: @customer, body: "The page loops.", public: true)
++    target_comment = target.comments.create!(author: @customer, body: "I cannot log in.", public: true)
++    target_identity = target.attributes.slice(
++      "status",
++      "priority",
++      "group_id",
++      "assignee_id",
++      "email_origin",
++      "reply_token"
++    )
++    original_source_comment_ids = source.comments.ids
++    original_target_comment_ids = target.comments.ids
++
++    post "/api/v1/tickets/#{source.id}/merge",
++      params: {
++        merge: {
++          target_id: target.id,
++          source_comment: { body: "Continuing in the original conversation.", public: true },
++          target_comment: { body: "Duplicate checked.", public: false }
++        }
++      },
++      headers: staff_headers,
++      as: :json
++
++    assert_response :success
++    assert_empty ActionMailer::Base.deliveries
++    assert_equal "closed", response.parsed_body.dig("source", "status")
++    assert_equal target.id, response.parsed_body.dig("source", "merged_into_id")
++    assert_equal "solved", response.parsed_body.dig("target", "status")
++    assert_nil response.parsed_body.dig("target", "merged_into_id")
++
++    source.reload
++    target.reload
++    assert_predicate source, :closed?
++    assert_equal target.id, source.merged_into_id
++    assert_equal target_identity, target.attributes.slice(*target_identity.keys)
++    assert_includes original_source_comment_ids, source_comment.id
++    assert_includes original_target_comment_ids, target_comment.id
++    assert_equal original_source_comment_ids + [ source.comments.order(:id).last.id ], source.comments.ids
++    assert_equal original_target_comment_ids + [ target.comments.order(:id).last.id ], target.comments.ids
++
++    source_note = source.comments.order(:id).last
++    target_note = target.comments.order(:id).last
++    assert_equal "Continuing in the original conversation.", source_note.body
++    assert_equal true, source_note.public?
++    assert_equal "Duplicate checked.", target_note.body
++    assert_equal false, target_note.public?
++    assert_equal @owner.id, source_note.author_id
++    assert_equal @owner.id, target_note.author_id
++
++    get "/api/v1/tickets",
++      params: { status: "closed" },
++      headers: staff_headers
++    assert_response :success
++    assert_equal [ source.id ], response.parsed_body.fetch("tickets").pluck("id")
++
++    get "/api/v1/requests",
++      params: { status: "closed" },
++      headers: customer_headers
++    assert_response :success
++    assert_equal [ source.id ], response.parsed_body.fetch("requests").pluck("id")
++
++    get "/api/v1/requests/#{source.id}", headers: customer_headers
++    assert_response :success
++    assert_equal target.id, response.parsed_body.dig("request", "merged_into_id")
++
++    get "/api/v1/requests/#{target.id}", headers: customer_headers
++    assert_response :success
++    assert response.parsed_body.dig("request").key?("merged_into_id")
++    assert_nil response.parsed_body.dig("request", "merged_into_id")
++
++    get "/api/v1/requests/#{source.id}/comments", headers: customer_headers
++    assert_response :success
++    assert_equal [ "The page loops.", source_note.body ],
++      response.parsed_body.fetch("comments").pluck("body")
++
++    get "/api/v1/requests/#{target.id}/comments", headers: customer_headers
++    assert_response :success
++    assert_equal [ "I cannot log in." ], response.parsed_body.fetch("comments").pluck("body")
++
++    patch "/api/v1/tickets/#{source.id}",
++      params: { ticket: { status: "open", comment: { body: "Do not add.", public: true } } },
++      headers: staff_headers,
++      as: :json
++    assert_response :unprocessable_content
++    assert_equal "closed", source.reload.status
++    assert_not source.comments.exists?(body: "Do not add.")
++
++    patch "/api/v1/requests/#{source.id}",
++      params: { request: { comment: { body: "Please reopen." } } },
++      headers: customer_headers,
++      as: :json
++    assert_response :unprocessable_content
++    assert_not source.comments.exists?(body: "Please reopen.")
++    assert_empty ActionMailer::Base.deliveries
++  end
++
++  test "default notes are private and later merges preserve original links" do
++    first = create_ticket(subject: "First")
++    second = create_ticket(subject: "Second")
++    final = create_ticket(subject: "Final")
++
++    post "/api/v1/tickets/#{first.id}/merge",
++      params: { merge: { target_id: second.id } },
++      headers: staff_headers,
++      as: :json
++    assert_response :success
++
++    first_note = first.comments.order(:id).last
++    second_note = second.comments.order(:id).last
++    assert_equal "Merged into ticket ##{second.id}.", first_note.body
++    assert_equal "Merged ticket ##{first.id} into this ticket.", second_note.body
++    assert_not first_note.public?
++    assert_not second_note.public?
++
++    post "/api/v1/tickets/#{second.id}/merge",
++      params: { merge: { target_id: final.id } },
++      headers: staff_headers,
++      as: :json
++    assert_response :success
++
++    assert_equal second.id, first.reload.merged_into_id
++    assert_equal final.id, second.reload.merged_into_id
++    assert_nil final.reload.merged_into_id
++    assert_equal "closed", first.status
++    assert_equal "closed", second.status
++    assert_equal 1, first.comments.count
++    assert_equal 2, second.comments.count
++    assert_equal 1, final.comments.count
++
++    post "/api/v1/tickets/#{first.id}/merge",
++      params: { merge: { target_id: final.id } },
++      headers: staff_headers,
++      as: :json
++    assert_response :unprocessable_content
++    assert_equal second.id, first.reload.merged_into_id
++    assert_empty ActionMailer::Base.deliveries
++  end
++
++  test "invalid merges leave both tickets and their notes unchanged" do
++    source = create_ticket(subject: "Source")
++    same_customer_target = create_ticket(subject: "Target")
++    other_customer_target = create_ticket(
++      subject: "Other customer",
++      requester: @other_customer
++    )
++
++    post "/api/v1/tickets/#{source.id}/merge",
++      params: { merge: { target_id: other_customer_target.id } },
++      headers: staff_headers,
++      as: :json
++    assert_response :unprocessable_content
++    assert_equal "open", source.reload.status
++    assert_nil source.merged_into_id
++    assert_empty source.comments
++    assert_empty other_customer_target.comments
++
++    post "/api/v1/tickets/#{source.id}/merge",
++      params: { merge: { target_id: source.id } },
++      headers: staff_headers,
++      as: :json
++    assert_response :unprocessable_content
++    assert_equal "open", source.reload.status
++    assert_empty source.comments
++
++    post "/api/v1/tickets/#{source.id}/merge",
++      params: {
++        merge: {
++          target_id: same_customer_target.id,
++          source_comment: "not an object"
++        }
++      },
++      headers: staff_headers,
++      as: :json
++    assert_response :bad_request
++    assert_empty source.comments
++
++    post "/api/v1/tickets/#{source.id}/merge",
++      params: {
++        merge: {
++          target_id: same_customer_target.id,
++          source_comment: { body: "This would be added.", public: false },
++          target_comment: { body: "", public: true }
++        }
++      },
++      headers: staff_headers,
++      as: :json
++    assert_response :unprocessable_content
++    assert_equal "open", source.reload.status
++    assert_nil source.merged_into_id
++    assert_empty source.comments
++    assert_empty same_customer_target.comments
++    assert_empty ActionMailer::Base.deliveries
++
++    same_customer_target.update!(status: "closed")
++    post "/api/v1/tickets/#{source.id}/merge",
++      params: { merge: { target_id: same_customer_target.id } },
++      headers: staff_headers,
++      as: :json
++    assert_response :unprocessable_content
++    assert_equal "open", source.reload.status
++  end
++
++  test "closed tickets still receive assignment cleanup but reject email replies" do
++    group = @account.groups.create!(name: "Escalations")
++    membership = GroupMembership.create!(group: group, user: @agent)
++    source = create_ticket(
++      subject: "Duplicate by email",
++      email_origin: true,
++      group: group,
++      assignee: @agent
++    )
++    target = create_ticket(subject: "Email survivor")
++
++    post "/api/v1/tickets/#{source.id}/merge",
++      params: { merge: { target_id: target.id } },
++      headers: staff_headers,
++      as: :json
++    assert_response :success
++    assert_equal @agent.id, source.reload.assignee_id
++
++    membership.destroy!
++    assert_nil source.reload.assignee_id
++    assert_equal group.id, source.group_id
++
++    second_source = create_ticket(subject: "Assigned duplicate", assignee: @agent)
++    second_target = create_ticket(subject: "Second survivor")
++    post "/api/v1/tickets/#{second_source.id}/merge",
++      params: { merge: { target_id: second_target.id } },
++      headers: staff_headers,
++      as: :json
++    assert_response :success
++
++    patch "/api/v1/users/#{@agent.id}",
++      params: { user: { suspended: true } },
++      headers: staff_headers,
++      as: :json
++    assert_response :success
++    assert_nil second_source.reload.assignee_id
++    assert_equal "closed", second_source.status
++
++    comment_count = source.comments.count
++    relay_mail(
++      from: @customer.email,
++      to: source.reply_address,
++      subject: "Re: Duplicate by email",
++      body: "Do not reopen the duplicate."
++    )
++
++    assert_equal comment_count, source.comments.reload.count
++    assert_equal "closed", source.reload.status
++    assert_equal "bounced", ActionMailbox::InboundEmail.order(:id).last.status
++    assert_empty ActionMailer::Base.deliveries
++  end
++
++  private
++
++  def create_user(name, email, role: "member", owner: false)
++    @account.users.create!(
++      name: name,
++      email: email,
++      password: "account-password",
++      role: role,
++      owner: owner,
++      verified: true
++    )
++  end
++
++  def create_ticket(subject:, requester: @customer, **attributes)
++    @account.tickets.create!(
++      requester: requester,
++      subject: subject,
++      **attributes
++    )
++  end
++
++  def staff_headers
++    account_headers.merge("Authorization" => "Bearer #{@owner_token}")
++  end
++
++  def customer_headers
++    account_headers.merge("Authorization" => "Bearer #{@customer_token}")
++  end
++
++  def account_headers
++    { "X-Helpdesk-Account" => @account.subdomain }
++  end
++
++  def relay_mail(from:, to:, subject:, body:)
++    message = Mail.new do
++      from from
++      to to
++      subject subject
++      text_part do
++        body body
++        content_type "text/plain; charset=UTF-8"
++      end
++    end
++    message.message_id = "<closed-reply-#{SecureRandom.uuid}@example.test>"
++
++    post "/rails/action_mailbox/relay/inbound_emails",
++      params: message.encoded,
++      headers: {
++        "CONTENT_TYPE" => "message/rfc822",
++        "Authorization" => ActionController::HttpAuthentication::Basic.encode_credentials(
++          "actionmailbox",
++          ENV.fetch("RAILS_INBOUND_EMAIL_PASSWORD")
++        )
++      }
++  end
++end

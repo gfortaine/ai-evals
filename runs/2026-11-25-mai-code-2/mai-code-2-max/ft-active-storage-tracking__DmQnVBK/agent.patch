@@ -1,0 +1,779 @@
+diff --git a/app/jobs/storage/usage/rebuild_job.rb b/app/jobs/storage/usage/rebuild_job.rb
+new file mode 100644
+index 0000000..9d7a6de
+--- /dev/null
++++ b/app/jobs/storage/usage/rebuild_job.rb
+@@ -0,0 +1,23 @@
++class Storage::Usage::RebuildJob < ApplicationJob
++  include ActiveJob::Continuable
++
++  discard_on ActiveJob::DeserializationError
++
++  queue_as :backend
++  limits_concurrency key: ->(account_id, **) { [ :storage_usage_rebuild, account_id ] }
++
++  def perform(account_id, batch_size: 100)
++    ApplicationRecord.connected_to(role: :writing) do
++      step :boards do |step|
++        Board.where(account_id: account_id).find_each(start: step.cursor, batch_size: batch_size) do |board|
++          Storage::Usage.recalculate("Board", board.id)
++          step.advance! from: board.id
++        end
++      end
++
++      step :account do
++        Storage::Usage.recalculate("Account", account_id)
++      end
++    end
++  end
++end
+diff --git a/app/jobs/storage/usage/repair_job.rb b/app/jobs/storage/usage/repair_job.rb
+new file mode 100644
+index 0000000..75da8ce
+--- /dev/null
++++ b/app/jobs/storage/usage/repair_job.rb
+@@ -0,0 +1,26 @@
++class Storage::Usage::RepairJob < ApplicationJob
++  include ActiveJob::Continuable
++
++  queue_as :backend
++  limits_concurrency key: "storage-usage-repair", on_conflict: :discard
++
++  def perform(batch_size: 100)
++    ApplicationRecord.connected_to(role: :writing) do
++      step :boards do |step|
++        repair_stale_records(Board, step, batch_size)
++      end
++
++      step :accounts do |step|
++        repair_stale_records(Account, step, batch_size)
++      end
++    end
++  end
++
++  private
++    def repair_stale_records(model, step, batch_size)
++      Storage::Usage.repairable(model).find_each(start: step.cursor, batch_size: batch_size) do |record|
++        Storage::Usage.recalculate(model.name, record.id) if Storage::Usage.claim_for_repair(model, record.id)
++        step.advance! from: record.id
++      end
++    end
++end
+diff --git a/app/jobs/storage/usage_job.rb b/app/jobs/storage/usage_job.rb
+new file mode 100644
+index 0000000..938c3b2
+--- /dev/null
++++ b/app/jobs/storage/usage_job.rb
+@@ -0,0 +1,9 @@
++class Storage::UsageJob < ApplicationJob
++  discard_on ActiveJob::DeserializationError
++
++  queue_as :backend
++
++  def perform(record_type, record_id)
++    Storage::Usage.recalculate(record_type, record_id)
++  end
++end
+diff --git a/app/models/account.rb b/app/models/account.rb
+index 18d4f42..46ed739 100644
+--- a/app/models/account.rb
++++ b/app/models/account.rb
+@@ -1,5 +1,5 @@
+ class Account < ApplicationRecord
+-  include Cancellable, Entropic, Incineratable, MultiTenantable, Searchable, Seedeable
++  include Cancellable, Entropic, Incineratable, MultiTenantable, Searchable, Seedeable, Storage::Usage::Trackable
+ 
+   has_one :join_code, dependent: :destroy
+   has_many :users, dependent: :destroy
+diff --git a/app/models/account/import.rb b/app/models/account/import.rb
+index feb41c4..a3eb62d 100644
+--- a/app/models/account/import.rb
++++ b/app/models/account/import.rb
+@@ -70,6 +70,7 @@ class Account::Import < ApplicationRecord
+   private
+     def mark_completed
+       update!(status: :completed, completed_at: Time.current)
++      Storage::Usage.rebuild_account_later(account)
+       ImportMailer.completed(identity, account).deliver_later
+     end
+ 
+@@ -89,5 +90,4 @@ class Account::Import < ApplicationRecord
+         board.accesses.grant_to(importer)
+       end
+     end
+-
+ end
+diff --git a/app/models/board.rb b/app/models/board.rb
+index 9f1bcd5..127319f 100644
+--- a/app/models/board.rb
++++ b/app/models/board.rb
+@@ -1,5 +1,5 @@
+ class Board < ApplicationRecord
+-  include Accessible, AutoPostponing, Broadcastable, Cards, Entropic, Filterable, Publishable, Triageable
++  include Accessible, AutoPostponing, Broadcastable, Cards, Entropic, Filterable, Publishable, Storage::Usage::Trackable, Triageable
+ 
+   belongs_to :creator, class_name: "User", default: -> { Current.user }
+   belongs_to :account, default: -> { creator.account }
+@@ -12,4 +12,16 @@ class Board < ApplicationRecord
+ 
+   scope :alphabetically, -> { order("lower(name)") }
+   scope :ordered_by_recently_accessed, -> { merge(Access.ordered_by_recently_accessed) }
++
++  after_update_commit :mark_storage_usage_accounts_dirty, if: :saved_change_to_account_id?
++  after_destroy_commit :mark_storage_usage_account_dirty
++
++  private
++    def mark_storage_usage_accounts_dirty
++      saved_change_to_account_id.compact.each { |account_id| Storage::Usage.mark_account_dirty(account_id) }
++    end
++
++    def mark_storage_usage_account_dirty
++      Storage::Usage.mark_account_dirty(account_id)
++    end
+ end
+diff --git a/app/models/card.rb b/app/models/card.rb
+index 19c3fc2..2a6ebef 100644
+--- a/app/models/card.rb
++++ b/app/models/card.rb
+@@ -73,7 +73,9 @@ class Card < ApplicationRecord
+     end
+ 
+     def handle_board_change
+-      old_board = account.boards.find_by(id: board_id_before_last_save)
++      old_board_id = board_id_before_last_save
++      old_board = account.boards.find_by(id: old_board_id)
++      [ old_board_id, board_id ].compact.uniq.each { |id| Storage::Usage.mark_board_dirty(id) }
+ 
+       transaction do
+         update! column: nil
+diff --git a/app/models/storage/usage.rb b/app/models/storage/usage.rb
+new file mode 100644
+index 0000000..acea778
+--- /dev/null
++++ b/app/models/storage/usage.rb
+@@ -0,0 +1,201 @@
++module Storage::Usage
++  CLAIM_DURATION = 5.minutes
++  RECORD_TYPES = %w[ Account Board ].freeze
++
++  class << self
++    def bytes_used(record)
++      if record.persisted?
++        ApplicationRecord.connected_to(role: :writing) do
++          values = record.class.where(id: record.id).pick(:bytes_used, :storage_usage_dirty, :storage_usage_job_claimed_at)
++
++          if values
++            claim_recalculation(record.class, record.id) if values.second && claim_due?(values.last)
++            values.first.to_i
++          else
++            record[:bytes_used].to_i
++          end
++        end
++      else
++        record[:bytes_used].to_i
++      end
++    end
++
++    def mark_board_dirty(board_id)
++      mark_dirty(Board, board_id)
++    end
++
++    def mark_account_dirty(account_id)
++      mark_dirty(Account, account_id)
++    end
++
++    def recalculate(record_type, record_id)
++      ApplicationRecord.connected_to(role: :writing) do
++        model = model_for(record_type)
++
++        3.times do
++          snapshot = snapshot_for(model, record_id)
++
++          return unless snapshot
++          return snapshot[:bytes_used] unless snapshot[:dirty]
++
++          calculated_bytes = if model == Board
++            bytes_for_board(snapshot[:id], snapshot[:account_id])
++          else
++            bytes_for_account(snapshot[:id])
++          end
++
++          if apply_snapshot(model, snapshot, calculated_bytes)
++            return calculated_bytes
++          end
++        end
++
++        enqueue_recalculation(model, record_id)
++        nil
++      end
++    end
++
++    def repairable(model)
++      model.where(storage_usage_dirty: true)
++        .where("storage_usage_job_claimed_at IS NULL OR storage_usage_job_claimed_at < ?", CLAIM_DURATION.ago)
++    end
++
++    def claim_for_repair(model, record_id)
++      claim_recalculation(model, record_id, enqueue: false)
++    end
++
++    def rebuild_account_later(account)
++      claimed_at = Time.current
++
++      account.class.transaction do
++        Board.where(account_id: account.id).update_all([
++          "storage_usage_dirty = ?, storage_usage_revision = storage_usage_revision + 1, storage_usage_job_claimed_at = ?",
++          true, claimed_at
++        ])
++        account.class.where(id: account.id).update_all([
++          "storage_usage_dirty = ?, storage_usage_revision = storage_usage_revision + 1, storage_usage_job_claimed_at = ?",
++          true, claimed_at
++        ])
++      end
++
++      ActiveRecord.after_all_transactions_commit do
++        Storage::Usage::RebuildJob.perform_later(account.id)
++      end
++    end
++
++    private
++      def claim_due?(claimed_at)
++        claimed_at.nil? || claimed_at < CLAIM_DURATION.ago
++      end
++
++      def mark_dirty(model, record_id)
++        updated = model.where(id: record_id).update_all([
++          "storage_usage_dirty = ?, storage_usage_revision = storage_usage_revision + 1",
++          true
++        ])
++        claim_recalculation(model, record_id) if updated.positive?
++      end
++
++      def claim_recalculation(model, record_id, enqueue: true)
++        claimed = model.where(id: record_id, storage_usage_dirty: true)
++          .where("storage_usage_job_claimed_at IS NULL OR storage_usage_job_claimed_at < ?", CLAIM_DURATION.ago)
++          .update_all(storage_usage_job_claimed_at: Time.current)
++
++        if claimed.positive? && enqueue
++          enqueue_recalculation(model, record_id)
++        end
++
++        claimed.positive?
++      end
++
++      def enqueue_recalculation(model, record_id)
++        ActiveRecord.after_all_transactions_commit do
++          Storage::UsageJob.perform_later(model.name, record_id)
++        end
++      end
++
++      def model_for(record_type)
++        if RECORD_TYPES.include?(record_type)
++          record_type.constantize
++        else
++          raise ArgumentError, "Unsupported storage usage record type: #{record_type}"
++        end
++      end
++
++      def snapshot_for(model, record_id)
++        if model == Board
++          if values = model.where(id: record_id).pick(
++            :id, :bytes_used, :storage_usage_revision, :storage_usage_dirty, :account_id
++          )
++            id, bytes_used, revision, dirty, account_id = values
++            { id: id, bytes_used: bytes_used, revision: revision, dirty: dirty, account_id: account_id }
++          end
++        elsif values = model.where(id: record_id).pick(
++          :id, :bytes_used, :storage_usage_revision, :storage_usage_dirty
++        )
++          id, bytes_used, revision, dirty = values
++          { id: id, bytes_used: bytes_used, revision: revision, dirty: dirty }
++        end
++      end
++
++      def apply_snapshot(model, snapshot, calculated_bytes)
++        updated = false
++
++        model.transaction do
++          updated = model.where(
++            id: snapshot[:id],
++            storage_usage_revision: snapshot[:revision],
++            storage_usage_dirty: true
++          ).update_all(
++            bytes_used: calculated_bytes,
++            storage_usage_dirty: false,
++            storage_usage_job_claimed_at: nil
++          ) > 0
++
++          if updated && model == Board && calculated_bytes != snapshot[:bytes_used]
++            mark_account_dirty(snapshot[:account_id])
++          end
++        end
++
++        updated
++      end
++
++      def bytes_for_account(account_id)
++        Board.where(account_id: account_id).sum(:bytes_used).to_i
++      end
++
++      def bytes_for_board(board_id, account_id)
++        card_ids = Card.where(account_id: account_id, board_id: board_id).select(:id)
++        comment_ids = Comment.where(account_id: account_id, card_id: card_ids).select(:id)
++
++        rich_texts = ActionText::RichText.where(account_id: account_id)
++        relevant_rich_text_ids = rich_texts
++          .where(record_type: "Board", record_id: board_id, name: "public_description")
++          .or(rich_texts.where(record_type: "Card", record_id: card_ids, name: "description"))
++          .or(rich_texts.where(record_type: "Comment", record_id: comment_ids, name: "body"))
++          .select(:id)
++
++        image_bytes = attachment_bytes(
++          account_id: account_id,
++          record_type: "Card",
++          record_ids: card_ids,
++          name: "image"
++        )
++        embed_bytes = attachment_bytes(
++          account_id: account_id,
++          record_type: "ActionText::RichText",
++          record_ids: relevant_rich_text_ids,
++          name: "embeds"
++        )
++
++        image_bytes + embed_bytes
++      end
++
++      def attachment_bytes(account_id:, record_type:, record_ids:, name:)
++        ActiveStorage::Attachment
++          .where(account_id: account_id, record_type: record_type, record_id: record_ids, name: name)
++          .joins(:blob)
++          .sum("active_storage_blobs.byte_size")
++          .to_i
++      end
++  end
++end
+diff --git a/app/models/storage/usage/attachment_tracking.rb b/app/models/storage/usage/attachment_tracking.rb
+new file mode 100644
+index 0000000..8dd32fe
+--- /dev/null
++++ b/app/models/storage/usage/attachment_tracking.rb
+@@ -0,0 +1,108 @@
++module Storage::Usage::AttachmentTracking
++  extend ActiveSupport::Concern
++
++  included do
++    before_create :remember_storage_usage_board_id
++    before_destroy :remember_storage_usage_board_id
++
++    after_create :track_storage_usage_change
++    after_destroy :track_storage_usage_change
++  end
++
++  def delete
++    board_id = remember_storage_usage_board_id
++    was_persisted = persisted?
++
++    self.class.transaction do
++      super.tap do
++        Storage::Usage.mark_board_dirty(board_id) if was_persisted && board_id
++      end
++    end
++  end
++
++  private
++    def remember_storage_usage_board_id
++      if defined?(@storage_usage_board_id_remembered)
++        @storage_usage_board_id
++      else
++        @storage_usage_board_id_remembered = true
++        @storage_usage_board_id = counted_board_id
++      end
++    end
++
++    def track_storage_usage_change
++      if board_id = remember_storage_usage_board_id
++        Storage::Usage.mark_board_dirty(board_id)
++      end
++    end
++
++    def counted_board_id
++      if record_type == "Card" && name == "image"
++        attachment_card&.board_id
++      elsif record_type == "ActionText::RichText" && name == "embeds"
++        if rich_text = attachment_rich_text
++          board_id_for_rich_text(rich_text)
++        end
++      end
++    end
++
++    def attachment_card
++      associated_record(Card)
++    end
++
++    def attachment_rich_text
++      associated_record(ActionText::RichText)
++    end
++
++    def associated_record(model)
++      association = association(:record)
++
++      if association.loaded? && association.target
++        association.target
++      else
++        model.find_by(id: record_id)
++      end
++    end
++
++    def board_id_for_rich_text(rich_text)
++      case [ rich_text.record_type, rich_text.name ]
++      when [ "Board", "public_description" ]
++        rich_text.record_id
++      when [ "Card", "description" ]
++        rich_text_card(rich_text)&.board_id
++      when [ "Comment", "body" ]
++        comment = rich_text_comment(rich_text)
++        comment && Card.where(id: comment.card_id).pick(:board_id)
++      end
++    end
++
++    def board_id_for_comment(comment)
++      if comment
++        association = comment.association(:card)
++
++        if association.loaded? && association.target
++          association.target.board_id
++        else
++          Card.where(id: comment.card_id).pick(:board_id)
++        end
++      end
++    end
++
++    def rich_text_card(rich_text)
++      rich_text_record(rich_text, Card)
++    end
++
++    def rich_text_comment(rich_text)
++      rich_text_record(rich_text, Comment)
++    end
++
++    def rich_text_record(rich_text, model)
++      association = rich_text.association(:record)
++
++      if association.loaded? && association.target
++        association.target
++      else
++        model.find_by(id: rich_text.record_id)
++      end
++    end
++end
+diff --git a/app/models/storage/usage/trackable.rb b/app/models/storage/usage/trackable.rb
+new file mode 100644
+index 0000000..e70092d
+--- /dev/null
++++ b/app/models/storage/usage/trackable.rb
+@@ -0,0 +1,7 @@
++module Storage::Usage::Trackable
++  extend ActiveSupport::Concern
++
++  def bytes_used
++    Storage::Usage.bytes_used(self)
++  end
++end
+diff --git a/config/initializers/uuid_framework_models.rb b/config/initializers/uuid_framework_models.rb
+index 3345dd9..cefc7e0 100644
+--- a/config/initializers/uuid_framework_models.rb
++++ b/config/initializers/uuid_framework_models.rb
+@@ -3,6 +3,7 @@ Rails.application.config.to_prepare do
+   ActionText::RichText.belongs_to :account, default: -> { record.account }
+ 
+   ActiveStorage::Attachment.belongs_to :account, default: -> { record.account }
++  ActiveStorage::Attachment.include Storage::Usage::AttachmentTracking
+ 
+   ActiveStorage::Blob.belongs_to :account, default: -> { Current.account }
+ 
+diff --git a/config/recurring.yml b/config/recurring.yml
+index 894c57b..894e505 100644
+--- a/config/recurring.yml
++++ b/config/recurring.yml
+@@ -13,6 +13,9 @@ production: &production
+   delete_unused_tags:
+     class: DeleteUnusedTagsJob
+     schedule: every day at 04:02
++  repair_storage_usage:
++    class: Storage::Usage::RepairJob
++    schedule: every 5 minutes
+ 
+   # Operations cleanup and backups
+   clear_solid_queue_finished_jobs:
+@@ -42,7 +45,12 @@ production: &production
+ <% end %>
+ 
+ beta: &beta
+-  # Only Solid Queue maintenance
++  # Application background maintenance
++  repair_storage_usage:
++    class: Storage::Usage::RepairJob
++    schedule: every 5 minutes
++
++  # Solid Queue maintenance
+   clear_solid_queue_finished_jobs:
+     command: "SolidQueue::Job.clear_finished_in_batches(sleep_between_batches: 0.3)"
+     schedule: every hour at minute 12
+diff --git a/db/migrate/20261123050000_add_storage_usage_tracking.rb b/db/migrate/20261123050000_add_storage_usage_tracking.rb
+new file mode 100644
+index 0000000..48ad3de
+--- /dev/null
++++ b/db/migrate/20261123050000_add_storage_usage_tracking.rb
+@@ -0,0 +1,31 @@
++class AddStorageUsageTracking < ActiveRecord::Migration[8.2]
++  def up
++    add_storage_usage_columns_to :accounts
++    add_storage_usage_columns_to :boards
++
++    change_column_default :accounts, :storage_usage_dirty, from: true, to: false
++    change_column_default :boards, :storage_usage_dirty, from: true, to: false
++  end
++
++  def down
++    remove_storage_usage_columns_from :accounts
++    remove_storage_usage_columns_from :boards
++  end
++
++  private
++    def add_storage_usage_columns_to(table)
++      add_column table, :bytes_used, :bigint, default: 0, null: false
++      add_column table, :storage_usage_dirty, :boolean, default: true, null: false
++      add_column table, :storage_usage_revision, :bigint, default: 0, null: false
++      add_column table, :storage_usage_job_claimed_at, :datetime
++      add_index table, [ :storage_usage_dirty, :storage_usage_job_claimed_at ], name: "idx_#{table}_on_storage_usage_state"
++    end
++
++    def remove_storage_usage_columns_from(table)
++      remove_index table, name: "idx_#{table}_on_storage_usage_state"
++      remove_column table, :storage_usage_job_claimed_at
++      remove_column table, :storage_usage_revision
++      remove_column table, :storage_usage_dirty
++      remove_column table, :bytes_used
++    end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 81a3526..47afe4c 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
++ActiveRecord::Schema[8.2].define(version: 2026_11_23_050000) do
+   create_table "accesses", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+     t.datetime "accessed_at"
+     t.uuid "account_id", null: false
+@@ -66,7 +66,12 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.bigint "external_account_id"
+     t.string "name", null: false
+     t.datetime "updated_at", null: false
++    t.bigint "bytes_used", default: 0, null: false
++    t.boolean "storage_usage_dirty", default: false, null: false
++    t.bigint "storage_usage_revision", default: 0, null: false
++    t.datetime "storage_usage_job_claimed_at"
+     t.index ["external_account_id"], name: "index_accounts_on_external_account_id", unique: true
++    t.index ["storage_usage_dirty", "storage_usage_job_claimed_at"], name: "idx_accounts_on_storage_usage_state"
+   end
+ 
+   create_table "action_pack_passkeys", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+@@ -175,8 +180,13 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.uuid "creator_id", null: false
+     t.string "name", null: false
+     t.datetime "updated_at", null: false
++    t.bigint "bytes_used", default: 0, null: false
++    t.boolean "storage_usage_dirty", default: false, null: false
++    t.bigint "storage_usage_revision", default: 0, null: false
++    t.datetime "storage_usage_job_claimed_at"
+     t.index ["account_id"], name: "index_boards_on_account_id"
+     t.index ["creator_id"], name: "index_boards_on_creator_id"
++    t.index ["storage_usage_dirty", "storage_usage_job_claimed_at"], name: "idx_boards_on_storage_usage_state"
+   end
+ 
+   create_table "boards_filters", id: false, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+diff --git a/db/schema_sqlite.rb b/db/schema_sqlite.rb
+index 1c89abe..3d81f9d 100644
+--- a/db/schema_sqlite.rb
++++ b/db/schema_sqlite.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
++ActiveRecord::Schema[8.2].define(version: 2026_11_23_050000) do
+   create_table "accesses", id: :uuid, force: :cascade do |t|
+     t.datetime "accessed_at"
+     t.uuid "account_id", null: false
+@@ -66,7 +66,12 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.bigint "external_account_id"
+     t.string "name", limit: 255, null: false
+     t.datetime "updated_at", null: false
++    t.bigint "bytes_used", default: 0, null: false
++    t.boolean "storage_usage_dirty", default: false, null: false
++    t.bigint "storage_usage_revision", default: 0, null: false
++    t.datetime "storage_usage_job_claimed_at"
+     t.index ["external_account_id"], name: "index_accounts_on_external_account_id", unique: true
++    t.index ["storage_usage_dirty", "storage_usage_job_claimed_at"], name: "idx_accounts_on_storage_usage_state"
+   end
+ 
+   create_table "action_pack_passkeys", id: :uuid, force: :cascade do |t|
+@@ -175,8 +180,13 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.uuid "creator_id", null: false
+     t.string "name", limit: 255, null: false
+     t.datetime "updated_at", null: false
++    t.bigint "bytes_used", default: 0, null: false
++    t.boolean "storage_usage_dirty", default: false, null: false
++    t.bigint "storage_usage_revision", default: 0, null: false
++    t.datetime "storage_usage_job_claimed_at"
+     t.index ["account_id"], name: "index_boards_on_account_id"
+     t.index ["creator_id"], name: "index_boards_on_creator_id"
++    t.index ["storage_usage_dirty", "storage_usage_job_claimed_at"], name: "idx_boards_on_storage_usage_state"
+   end
+ 
+   create_table "boards_filters", id: false, force: :cascade do |t|
+diff --git a/test/models/storage/usage_test.rb b/test/models/storage/usage_test.rb
+new file mode 100644
+index 0000000..7100e50
+--- /dev/null
++++ b/test/models/storage/usage_test.rb
+@@ -0,0 +1,134 @@
++require "test_helper"
++
++class Storage::UsageTest < ActiveSupport::TestCase
++  setup do
++    Current.session = sessions(:david)
++    @account = accounts("37s")
++    @board = boards(:writebook)
++  end
++
++  test "counts card images and files embedded in board descriptions, card descriptions, and comments" do
++    board_blob = create_blob("board file")
++    image_blob = create_blob("card image")
++    description_blob = create_blob("card description file")
++    comment_blob = create_blob("comment file")
++
++    perform_enqueued_jobs only: Storage::UsageJob do
++      embed_in(@board, :public_description, board_blob)
++      cards(:logo).image.attach(image_blob)
++      embed_in(cards(:logo), :description, description_blob)
++      embed_in(comments(:logo_agreement_kevin), :body, comment_blob)
++    end
++
++    expected = [ board_blob, image_blob, description_blob, comment_blob ].sum(&:byte_size)
++
++    assert_equal expected, @board.bytes_used
++    assert_equal expected, @account.bytes_used
++  end
++
++  test "counts every board toward the account but only the board's own cards toward that board" do
++    writebook_blob = create_blob("writebook")
++    private_blob = create_blob("private")
++
++    perform_enqueued_jobs only: Storage::UsageJob do
++      embed_in(@board, :public_description, writebook_blob)
++      embed_in(boards(:private), :public_description, private_blob)
++    end
++
++    assert_equal writebook_blob.byte_size, @board.bytes_used
++    assert_equal private_blob.byte_size, boards(:private).bytes_used
++    assert_equal writebook_blob.byte_size + private_blob.byte_size, @account.bytes_used
++  end
++
++  test "ignores blobs attached outside the counted locations" do
++    blob = create_blob("outside")
++
++    perform_enqueued_jobs only: Storage::UsageJob do
++      users(:david).avatar.attach(blob)
++    end
++
++    assert_equal 0, @board.bytes_used
++    assert_equal 0, @account.bytes_used
++  end
++
++  test "updates usage in the background when an image is removed" do
++    blob = create_blob("image")
++
++    perform_enqueued_jobs only: Storage::UsageJob do
++      cards(:logo).image.attach(blob)
++    end
++
++    assert_equal blob.byte_size, @board.bytes_used
++    assert_equal blob.byte_size, @account.bytes_used
++
++    cards(:logo).image.purge_later
++
++    assert_equal blob.byte_size, @board.bytes_used
++    run_storage_jobs
++
++    assert_equal 0, @board.bytes_used
++    assert_equal 0, @account.bytes_used
++  end
++
++  test "moves a card's attachments from one board's usage to another" do
++    blob = create_blob("image")
++
++    perform_enqueued_jobs only: Storage::UsageJob do
++      cards(:logo).image.attach(blob)
++    end
++
++    cards(:logo).move_to(boards(:private))
++    run_storage_jobs
++
++    assert_equal 0, @board.bytes_used
++    assert_equal blob.byte_size, boards(:private).bytes_used
++    assert_equal blob.byte_size, @account.bytes_used
++  end
++
++  test "coalesces repeated attachment changes into one board recalculation" do
++    blobs = 10.times.map { |index| create_blob("file #{index}") }
++
++    assert_enqueued_jobs 1, only: Storage::UsageJob do
++      blobs.each { |blob| embed_in(@board, :public_description, blob) }
++    end
++
++    run_storage_jobs
++
++    assert_equal blobs.last.byte_size, @board.bytes_used
++    assert_equal blobs.last.byte_size, @account.bytes_used
++  end
++
++  test "removes a deleted board's usage from its account" do
++    board = @account.boards.create!(name: "Temporary", creator: users(:david), all_access: true)
++    blob = create_blob("temporary")
++
++    perform_enqueued_jobs only: Storage::UsageJob do
++      embed_in(board, :public_description, blob)
++    end
++
++    assert_equal blob.byte_size, @account.bytes_used
++
++    board.destroy!
++    run_storage_jobs
++
++    assert_equal 0, @account.bytes_used
++  end
++
++  private
++    def create_blob(contents)
++      ActiveStorage::Blob.create_and_upload!(
++        io: StringIO.new(contents),
++        filename: "file.txt",
++        content_type: "text/plain"
++      )
++    end
++
++    def embed_in(record, attribute, blob)
++      attachment = ActionText::Attachment.from_attachable(blob)
++      record.update!(attribute => attachment.to_html)
++    end
++
++    def run_storage_jobs
++      2.times { perform_enqueued_jobs only: Storage::UsageJob }
++    end
++end

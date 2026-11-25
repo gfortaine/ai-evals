@@ -1,0 +1,856 @@
+diff --git a/README.md b/README.md
+index fd9477e..19bf26d 100644
+--- a/README.md
++++ b/README.md
+@@ -22,6 +22,8 @@ bin/rails server
+ 
+ All product endpoints are JSON endpoints under `/api/v1`. Requests other than account creation select a business with `X-Helpdesk-Account`. Authenticated requests use `Authorization: Bearer TOKEN`.
+ 
++Customers register at `POST /api/v1/registrations`, then use the standard verification and session endpoints. Authenticated customers use `/api/v1/requests` and its nested `/comments` route; staff use `/api/v1/tickets`. Replies and status changes are submitted with `PATCH`. Lists accept `page` and `per_page` and include pagination metadata with the records.
++
+ Verification and password-reset emails contain links to the configured frontend URL. The confirmation API endpoints are `/api/v1/email_verifications/confirm` and `/api/v1/password_resets/confirm`.
+ 
+ ## Account cleanup
+diff --git a/app/controllers/api/v1/base_controller.rb b/app/controllers/api/v1/base_controller.rb
+index 65c6dc4..a2a9116 100644
+--- a/app/controllers/api/v1/base_controller.rb
++++ b/app/controllers/api/v1/base_controller.rb
+@@ -2,6 +2,7 @@ class Api::V1::BaseController < ApplicationController
+   rescue_from ActiveRecord::RecordInvalid, with: :render_record_invalid
+   rescue_from ActiveRecord::RecordNotFound, with: :render_not_found
+   rescue_from ActiveRecord::RecordNotUnique, with: :render_record_not_unique
++  rescue_from ActionController::BadRequest, with: :render_bad_request
+   rescue_from ActionController::ParameterMissing, with: :render_parameter_missing
+ 
+   attr_reader :current_account, :current_user, :current_session
+@@ -45,6 +46,18 @@ class Api::V1::BaseController < ApplicationController
+     render json: { error: "Only the account owner may perform this action" }, status: :forbidden
+   end
+ 
++  def require_customer!
++    return if current_user.customer?
++
++    render json: { error: "Only customers may perform this action" }, status: :forbidden
++  end
++
++  def require_staff!
++    return if current_user.staff?
++
++    render json: { error: "Only staff may perform this action" }, status: :forbidden
++  end
++
+   def bearer_token
+     authorization = request.headers["Authorization"].to_s
+     return unless authorization.match?(/\ABearer\s+/i)
+@@ -76,6 +89,56 @@ class Api::V1::BaseController < ApplicationController
+     }
+   end
+ 
++  def ticket_json(ticket, include_requester: false)
++    json = {
++      id: ticket.id,
++      subject: ticket.subject,
++      status: ticket.status,
++      requester_id: ticket.requester_id,
++      created_at: ticket.created_at.iso8601,
++      updated_at: ticket.updated_at.iso8601
++    }
++
++    if include_requester
++      json[:requester] = {
++        id: ticket.requester.id,
++        name: ticket.requester.name,
++        email: ticket.requester.email
++      }
++    end
++
++    json
++  end
++
++  def comment_json(comment)
++    {
++      id: comment.id,
++      body: comment.body,
++      author: {
++        id: comment.author.id,
++        name: comment.author.name
++      },
++      public: comment.public,
++      created_at: comment.created_at.iso8601
++    }
++  end
++
++  def paginate(scope)
++    page = positive_integer_parameter(:page, default: 1)
++    per_page = positive_integer_parameter(:per_page, default: 25)
++    count = scope.count
++    records = scope.offset((page - 1) * per_page).limit(per_page)
++    metadata = {
++      count: count,
++      page: page,
++      per_page: per_page,
++      next_page: page * per_page < count ? page + 1 : nil,
++      previous_page: page > 1 ? page - 1 : nil
++    }
++
++    [ records, metadata ]
++  end
++
+   def render_record_invalid(error)
+     render json: { errors: error.record.errors.to_hash }, status: :unprocessable_content
+   end
+@@ -91,4 +154,18 @@ class Api::V1::BaseController < ApplicationController
+   def render_parameter_missing(error)
+     render json: { error: "Missing parameter: #{error.param}" }, status: :bad_request
+   end
++
++  def render_bad_request(error)
++    render json: { error: error.message }, status: :bad_request
++  end
++
++  def positive_integer_parameter(name, default:)
++    raw_value = params[name]
++    return default if raw_value.nil?
++
++    value = Integer(raw_value.to_s, 10, exception: false)
++    return value if value&.positive?
++
++    raise ActionController::BadRequest, "#{name} must be a positive integer"
++  end
+ end
+diff --git a/app/controllers/api/v1/registrations_controller.rb b/app/controllers/api/v1/registrations_controller.rb
+new file mode 100644
+index 0000000..3022d50
+--- /dev/null
++++ b/app/controllers/api/v1/registrations_controller.rb
+@@ -0,0 +1,17 @@
++class Api::V1::RegistrationsController < Api::V1::BaseController
++  before_action :set_account
++  before_action :require_active_account!
++
++  def create
++    attributes = params.require(:user).permit(:name, :email, :password)
++    token = nil
++
++    User.transaction do
++      @user = current_account.users.create!(attributes.merge(role: "member"))
++      token = @user.rotate_email_verification_token!
++    end
++
++    UserMailer.with(user: @user, token: token).email_verification.deliver_now
++    render json: { user: user_json(@user) }, status: :created
++  end
++end
+diff --git a/app/controllers/api/v1/requests_controller.rb b/app/controllers/api/v1/requests_controller.rb
+new file mode 100644
+index 0000000..5438a62
+--- /dev/null
++++ b/app/controllers/api/v1/requests_controller.rb
+@@ -0,0 +1,91 @@
++class Api::V1::RequestsController < Api::V1::BaseController
++  before_action :set_account
++  before_action :authenticate_user!
++  before_action :require_active_account!
++  before_action :require_customer!
++  before_action :set_request, only: %i[show update comments]
++
++  def index
++    requests, pagination = paginate(current_user.requested_tickets.recently_active)
++    render json: {
++      requests: requests.map { |ticket| ticket_json(ticket) }
++    }.merge(pagination)
++  end
++
++  def show
++    render json: { request: ticket_json(@ticket) }
++  end
++
++  def create
++    request_params = params.require(:request)
++    subject = request_params.require(:subject)
++    body = request_params.require(:comment).permit(:body).require(:body)
++
++    ticket = Ticket.new(
++      account: current_account,
++      requester: current_user,
++      subject: subject,
++      status: "open"
++    )
++
++    ticket.transaction do
++      ticket.save!
++      ticket.comments.create!(author: current_user, body: body, public: true)
++    end
++
++    render json: { request: ticket_json(ticket) }, status: :created
++  end
++
++  def update
++    request_params = params.require(:request)
++    comment_supplied = request_params.key?(:comment)
++    body = comment_body(request_params)
++    status_supplied = request_params.key?(:status)
++    supplied_status = request_params[:status]
++
++    if status_supplied && supplied_status != "solved"
++      @ticket.errors.add(:status, "can only be set to solved by a customer")
++      raise ActiveRecord::RecordInvalid, @ticket
++    end
++
++    @ticket.with_lock do
++      if comment_supplied
++        @ticket.comments.create!(author: current_user, body: body, public: true)
++      end
++
++      if status_supplied
++        @ticket.status = "solved"
++      elsif comment_supplied && %w[pending solved].include?(@ticket.status)
++        @ticket.status = "open"
++      end
++
++      @ticket.save! if @ticket.changed?
++    end
++
++    render json: { request: ticket_json(@ticket) }
++  end
++
++  def comments
++    comments, pagination = paginate(
++      @ticket.comments.visible_to_customers.includes(:author).oldest_first
++    )
++    render json: {
++      comments: comments.map { |comment| comment_json(comment) }
++    }.merge(pagination)
++  end
++
++  private
++
++  def set_request
++    @ticket = current_account.tickets.find_by!(
++      id: params[:id],
++      requester_id: current_user.id
++    )
++  end
++
++  def comment_body(request_params)
++    return unless request_params.key?(:comment)
++
++    request_params.require(:comment).permit(:body).require(:body)
++  end
++end
+diff --git a/app/controllers/api/v1/tickets_controller.rb b/app/controllers/api/v1/tickets_controller.rb
+new file mode 100644
+index 0000000..bbf37c0
+--- /dev/null
++++ b/app/controllers/api/v1/tickets_controller.rb
+@@ -0,0 +1,64 @@
++class Api::V1::TicketsController < Api::V1::BaseController
++  before_action :set_account
++  before_action :authenticate_user!
++  before_action :require_active_account!
++  before_action :require_staff!
++  before_action :set_ticket, only: %i[show update comments]
++
++  def index
++    tickets, pagination = paginate(
++      current_account.tickets.includes(:requester).recently_active
++    )
++    render json: {
++      tickets: tickets.map { |ticket| ticket_json(ticket, include_requester: true) }
++    }.merge(pagination)
++  end
++
++  def show
++    render json: { ticket: ticket_json(@ticket, include_requester: true) }
++  end
++
++  def update
++    ticket_params = params.require(:ticket)
++    comment = comment_parameters(ticket_params)
++    status_supplied = ticket_params.key?(:status)
++
++    @ticket.with_lock do
++      if comment
++        @ticket.comments.create!(
++          author: current_user,
++          body: comment.require(:body),
++          public: comment.fetch(:public, true)
++        )
++      end
++
++      if status_supplied
++        @ticket.status = ticket_params[:status]
++        @ticket.save!
++      end
++    end
++
++    render json: { ticket: ticket_json(@ticket, include_requester: true) }
++  end
++
++  def comments
++    comments, pagination = paginate(
++      @ticket.comments.includes(:author).oldest_first
++    )
++    render json: {
++      comments: comments.map { |comment| comment_json(comment) }
++    }.merge(pagination)
++  end
++
++  private
++
++  def set_ticket
++    @ticket = current_account.tickets.includes(:requester).find(params[:id])
++  end
++
++  def comment_parameters(ticket_params)
++    return unless ticket_params.key?(:comment)
++
++    ticket_params.require(:comment).permit(:body, :public)
++  end
++end
+diff --git a/app/models/account.rb b/app/models/account.rb
+index 1af66dc..5a8cf56 100644
+--- a/app/models/account.rb
++++ b/app/models/account.rb
+@@ -1,6 +1,7 @@
+ class Account < ApplicationRecord
+   has_many :users, dependent: :destroy
+   has_many :sessions, through: :users
++  has_many :tickets, dependent: :destroy
+   has_one :owner, -> { where(owner: true) }, class_name: "User"
+ 
+   before_validation :normalize_subdomain
+diff --git a/app/models/comment.rb b/app/models/comment.rb
+new file mode 100644
+index 0000000..ca7aed2
+--- /dev/null
++++ b/app/models/comment.rb
+@@ -0,0 +1,20 @@
++class Comment < ApplicationRecord
++  belongs_to :ticket, touch: true
++  belongs_to :author, class_name: "User", inverse_of: :comments
++
++  validates :body, presence: true, length: { maximum: 20_000 }
++  validates :public, inclusion: { in: [ true, false ] }
++  validate :author_belongs_to_ticket_account
++
++  scope :oldest_first, -> { order(created_at: :asc, id: :asc) }
++  scope :visible_to_customers, -> { where(public: true) }
++
++  private
++
++  def author_belongs_to_ticket_account
++    return unless author && ticket
++    return if author.account_id == ticket.account_id
++
++    errors.add(:author, "must belong to the ticket account")
++  end
++end
+diff --git a/app/models/ticket.rb b/app/models/ticket.rb
+new file mode 100644
+index 0000000..be5a2a2
+--- /dev/null
++++ b/app/models/ticket.rb
+@@ -0,0 +1,22 @@
++class Ticket < ApplicationRecord
++  STATUSES = %w[open pending solved].freeze
++
++  belongs_to :account
++  belongs_to :requester, class_name: "User", inverse_of: :requested_tickets
++  has_many :comments, dependent: :destroy
++
++  validates :subject, presence: true, length: { maximum: 255 }
++  validates :status, inclusion: { in: STATUSES }
++  validate :requester_belongs_to_account
++
++  scope :recently_active, -> { order(updated_at: :desc, id: :desc) }
++
++  private
++
++  def requester_belongs_to_account
++    return unless account && requester
++    return if requester.account_id == account_id
++
++    errors.add(:requester, "must belong to the account")
++  end
++end
+diff --git a/app/models/user.rb b/app/models/user.rb
+index 8e6381e..b8bb2b1 100644
+--- a/app/models/user.rb
++++ b/app/models/user.rb
+@@ -7,6 +7,15 @@ class User < ApplicationRecord
+ 
+   belongs_to :account
+   has_many :sessions, dependent: :destroy
++  has_many :requested_tickets,
++    class_name: "Ticket",
++    foreign_key: :requester_id,
++    dependent: :destroy,
++    inverse_of: :requester
++  has_many :comments,
++    foreign_key: :author_id,
++    dependent: :destroy,
++    inverse_of: :author
+ 
+   has_secure_password
+ 
+@@ -60,6 +69,14 @@ class User < ApplicationRecord
+     )
+   end
+ 
++  def customer?
++    role == "member"
++  end
++
++  def staff?
++    !customer?
++  end
++
+   private
+ 
+   def token_matches_and_unexpired?(token, expected_digest, sent_at, lifetime)
+diff --git a/config/routes.rb b/config/routes.rb
+index 6c01cec..ab0a5e3 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -10,9 +10,19 @@ Rails.application.routes.draw do
+ 
+       get "portal", to: "portals#show"
+ 
++      post "registrations", to: "registrations#create"
++
+       post "sessions", to: "sessions#create"
+       delete "session", to: "sessions#destroy"
+ 
++      resources :requests, only: %i[index show create update] do
++        get :comments, on: :member
++      end
++
++      resources :tickets, only: %i[index show update] do
++        get :comments, on: :member
++      end
++
+       get "me", to: "profiles#show"
+       patch "me", to: "profiles#update"
+       put "me/password", to: "passwords#update"
+diff --git a/db/migrate/20261123010000_create_tickets_and_comments.rb b/db/migrate/20261123010000_create_tickets_and_comments.rb
+new file mode 100644
+index 0000000..47c47c4
+--- /dev/null
++++ b/db/migrate/20261123010000_create_tickets_and_comments.rb
+@@ -0,0 +1,33 @@
++class CreateTicketsAndComments < ActiveRecord::Migration[8.1]
++  def change
++    create_table :tickets do |t|
++      t.references :account, null: false, foreign_key: { on_delete: :cascade }
++      t.references :requester,
++        null: false,
++        foreign_key: { to_table: :users, on_delete: :cascade }
++      t.string :subject, null: false
++      t.string :status, null: false, default: "open"
++
++      t.timestamps
++    end
++
++    add_index :tickets, %i[account_id updated_at id]
++    add_index :tickets, %i[requester_id updated_at id]
++    add_check_constraint :tickets,
++      "status IN ('open', 'pending', 'solved')",
++      name: "tickets_status_valid"
++
++    create_table :comments do |t|
++      t.references :ticket, null: false, foreign_key: { on_delete: :cascade }
++      t.references :author,
++        null: false,
++        foreign_key: { to_table: :users, on_delete: :cascade }
++      t.text :body, null: false
++      t.boolean :public, null: false, default: true
++
++      t.timestamps
++    end
++
++    add_index :comments, %i[ticket_id created_at id]
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 60956a1..9454ed4 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.1].define(version: 2026_11_23_000000) do
++ActiveRecord::Schema[8.1].define(version: 2026_11_23_010000) do
+   # These are extensions that must be enabled in order to support this database
+   enable_extension "pg_catalog.plpgsql"
+ 
+@@ -23,6 +23,18 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_23_000000) do
+     t.index ["subdomain"], name: "index_accounts_on_subdomain", unique: true
+   end
+ 
++  create_table "comments", force: :cascade do |t|
++    t.bigint "ticket_id", null: false
++    t.bigint "author_id", null: false
++    t.text "body", null: false
++    t.boolean "public", default: true, null: false
++    t.datetime "created_at", null: false
++    t.datetime "updated_at", null: false
++    t.index ["author_id"], name: "index_comments_on_author_id"
++    t.index ["ticket_id", "created_at", "id"], name: "index_comments_on_ticket_id_and_created_at_and_id"
++    t.index ["ticket_id"], name: "index_comments_on_ticket_id"
++  end
++
+   create_table "sessions", force: :cascade do |t|
+     t.bigint "user_id", null: false
+     t.string "token_digest", null: false
+@@ -32,6 +44,20 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_23_000000) do
+     t.index ["user_id"], name: "index_sessions_on_user_id"
+   end
+ 
++  create_table "tickets", force: :cascade do |t|
++    t.bigint "account_id", null: false
++    t.bigint "requester_id", null: false
++    t.string "subject", null: false
++    t.string "status", default: "open", null: false
++    t.datetime "created_at", null: false
++    t.datetime "updated_at", null: false
++    t.index ["account_id", "updated_at", "id"], name: "index_tickets_on_account_id_and_updated_at_and_id"
++    t.index ["account_id"], name: "index_tickets_on_account_id"
++    t.index ["requester_id", "updated_at", "id"], name: "index_tickets_on_requester_id_and_updated_at_and_id"
++    t.index ["requester_id"], name: "index_tickets_on_requester_id"
++    t.check_constraint "status::text = ANY (ARRAY['open'::character varying, 'pending'::character varying, 'solved'::character varying]::text[])", name: "tickets_status_valid"
++  end
++
+   create_table "users", force: :cascade do |t|
+     t.bigint "account_id", null: false
+     t.string "name", null: false
+@@ -53,6 +79,10 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_23_000000) do
+     t.index ["password_reset_token_digest"], name: "index_users_on_password_reset_token_digest", unique: true
+   end
+ 
++  add_foreign_key "comments", "tickets", on_delete: :cascade
++  add_foreign_key "comments", "users", column: "author_id", on_delete: :cascade
+   add_foreign_key "sessions", "users", on_delete: :cascade
++  add_foreign_key "tickets", "accounts", on_delete: :cascade
++  add_foreign_key "tickets", "users", column: "requester_id", on_delete: :cascade
+   add_foreign_key "users", "accounts", on_delete: :cascade
+ end
+diff --git a/test/integration/portal_conversations_api_test.rb b/test/integration/portal_conversations_api_test.rb
+new file mode 100644
+index 0000000..49b2e6a
+--- /dev/null
++++ b/test/integration/portal_conversations_api_test.rb
+@@ -0,0 +1,312 @@
++require "test_helper"
++require "uri"
++
++class PortalConversationsApiTest < ActionDispatch::IntegrationTest
++  setup do
++    ActionMailer::Base.deliveries.clear
++  end
++
++  test "customers register and use the existing identity flows" do
++    account = Account.create!(name: "Acme", subdomain: "acme")
++
++    post "/api/v1/registrations",
++      params: {
++        user: {
++          name: "Avery",
++          email: "AVERY@example.test",
++          password: "my-customer-password"
++        }
++      },
++      headers: account_headers(account),
++      as: :json
++
++    assert_response :created
++    user_id = response.parsed_body.dig("user", "id")
++    assert_equal "member", response.parsed_body.dig("user", "role")
++    assert_equal "avery@example.test", response.parsed_body.dig("user", "email")
++    assert_equal false, response.parsed_body.dig("user", "verified")
++
++    post "/api/v1/sessions",
++      params: { session: { email: "avery@example.test", password: "my-customer-password" } },
++      headers: account_headers(account),
++      as: :json
++    assert_response :unauthorized
++
++    post "/api/v1/email_verifications/confirm",
++      params: { email_verification: { token: token_from_latest_mail } },
++      headers: account_headers(account),
++      as: :json
++    assert_response :success
++    assert_equal true, response.parsed_body.dig("user", "verified")
++
++    post "/api/v1/sessions",
++      params: { session: { email: "avery@example.test", password: "my-customer-password" } },
++      headers: account_headers(account),
++      as: :json
++    assert_response :success
++    token = response.parsed_body.dig("session", "token")
++
++    get "/api/v1/me", headers: authenticated_headers(token, account)
++    assert_response :success
++    assert_equal user_id, response.parsed_body.dig("user", "id")
++
++    post "/api/v1/password_resets",
++      params: { password_reset: { email: "avery@example.test" } },
++      headers: account_headers(account),
++      as: :json
++    assert_response :accepted
++
++    post "/api/v1/password_resets/confirm",
++      params: {
++        password_reset: {
++          token: token_from_latest_mail,
++          password: "new-customer-password"
++        }
++      },
++      headers: account_headers(account),
++      as: :json
++    assert_response :success
++
++    get "/api/v1/me", headers: authenticated_headers(token, account)
++    assert_response :unauthorized
++  end
++
++  test "request comments and replies enforce owner and customer status transitions" do
++    account, owner, customer = create_portal_users
++    owner_token = issue_token(owner)
++    customer_token = issue_token(customer)
++
++    post "/api/v1/requests",
++      params: {
++        request: {
++          subject: "Cannot download my receipt",
++          comment: { body: "The download button does nothing." }
++        }
++      },
++      headers: authenticated_headers(customer_token, account),
++      as: :json
++
++    assert_response :created
++    ticket_id = response.parsed_body.dig("request", "id")
++    assert_equal "open", response.parsed_body.dig("request", "status")
++    assert_equal customer.id, response.parsed_body.dig("request", "requester_id")
++    assert response.parsed_body.dig("request", "created_at")
++    assert response.parsed_body.dig("request", "updated_at")
++
++    patch "/api/v1/tickets/#{ticket_id}",
++      params: {
++        ticket: {
++          comment: { body: "Please try again now." },
++          status: "pending"
++        }
++      },
++      headers: authenticated_headers(owner_token, account),
++      as: :json
++    assert_response :success
++    assert_equal "pending", response.parsed_body.dig("ticket", "status")
++    assert_equal(
++      { "id" => customer.id, "name" => customer.name, "email" => customer.email },
++      response.parsed_body.dig("ticket", "requester")
++    )
++
++    patch "/api/v1/requests/#{ticket_id}",
++      params: { request: { comment: { body: "It still fails." } } },
++      headers: authenticated_headers(customer_token, account),
++      as: :json
++    assert_response :success
++    assert_equal "open", response.parsed_body.dig("request", "status")
++
++    patch "/api/v1/tickets/#{ticket_id}",
++      params: { ticket: { comment: { body: "I checked the account." } } },
++      headers: authenticated_headers(owner_token, account),
++      as: :json
++    assert_response :success
++    assert_equal "open", response.parsed_body.dig("ticket", "status")
++
++    patch "/api/v1/tickets/#{ticket_id}",
++      params: { ticket: { status: "solved" } },
++      headers: authenticated_headers(owner_token, account),
++      as: :json
++    assert_response :success
++
++    patch "/api/v1/requests/#{ticket_id}",
++      params: {
++        request: {
++          comment: { body: "Confirmed, thank you." },
++          status: "solved"
++        }
++      },
++      headers: authenticated_headers(customer_token, account),
++      as: :json
++    assert_response :success
++    assert_equal "solved", response.parsed_body.dig("request", "status")
++
++    patch "/api/v1/requests/#{ticket_id}",
++      params: { request: { comment: { body: "One more question." } } },
++      headers: authenticated_headers(customer_token, account),
++      as: :json
++    assert_response :success
++    assert_equal "open", response.parsed_body.dig("request", "status")
++
++    get "/api/v1/requests/#{ticket_id}/comments",
++      headers: authenticated_headers(customer_token, account)
++    assert_response :success
++    comments = response.parsed_body.fetch("comments")
++    assert_equal 6, comments.length
++    assert_equal "The download button does nothing.", comments.first["body"]
++    assert_equal(
++      { "id" => customer.id, "name" => customer.name },
++      comments.first["author"]
++    )
++    assert_equal true, comments.first["public"]
++    assert comments.first["created_at"]
++
++    get "/api/v1/tickets/#{ticket_id}/comments",
++      headers: authenticated_headers(customer_token, account)
++    assert_response :forbidden
++
++    get "/api/v1/requests",
++      headers: authenticated_headers(owner_token, account)
++    assert_response :forbidden
++    assert_equal 0, ActionMailer::Base.deliveries.size
++  end
++
++  test "portal lists are paginated and scoped to the current customer and account" do
++    account, owner, first_customer = create_portal_users
++    second_customer = account.users.create!(
++      name: "Blake",
++      email: "blake@example.test",
++      password: "blake-password",
++      role: "member",
++      verified: true
++    )
++    owner_token = issue_token(owner)
++    customer_token = issue_token(first_customer)
++    second_customer_token = issue_token(second_customer)
++
++    first_ticket = create_request(first_customer, "First", customer_token, account)
++    second_ticket = create_request(first_customer, "Second", customer_token, account)
++    create_request(second_customer, "Other customer", second_customer_token, account)
++
++    first_ticket.update_columns(updated_at: 2.days.ago)
++    second_ticket.update_columns(updated_at: 1.day.ago)
++
++    get "/api/v1/requests", params: { page: 1, per_page: 1 },
++      headers: authenticated_headers(customer_token, account)
++    assert_response :success
++    assert_equal 2, response.parsed_body["count"]
++    assert_equal 1, response.parsed_body["page"]
++    assert_equal 1, response.parsed_body["per_page"]
++    assert_equal 2, response.parsed_body["next_page"]
++    assert_nil response.parsed_body["previous_page"]
++    assert_equal second_ticket.id, response.parsed_body.dig("requests", 0, "id")
++
++    get "/api/v1/requests", params: { page: 2, per_page: 1 },
++      headers: authenticated_headers(customer_token, account)
++    assert_response :success
++    assert_nil response.parsed_body["next_page"]
++    assert_equal 1, response.parsed_body["previous_page"]
++    assert_equal first_ticket.id, response.parsed_body.dig("requests", 0, "id")
++
++    get "/api/v1/requests/#{Ticket.where(requester: second_customer).pick(:id)}",
++      headers: authenticated_headers(customer_token, account)
++    assert_response :not_found
++
++    patch "/api/v1/tickets/#{first_ticket.id}",
++      params: { ticket: { comment: { body: "A new update." } } },
++      headers: authenticated_headers(owner_token, account),
++      as: :json
++    assert_response :success
++
++    get "/api/v1/tickets", params: { page: 1, per_page: 25 },
++      headers: authenticated_headers(owner_token, account)
++    assert_response :success
++    assert_equal 3, response.parsed_body["count"]
++    assert_equal first_ticket.id, response.parsed_body.dig("tickets", 0, "id")
++    assert_equal first_customer.id,
++      response.parsed_body.dig("tickets", 0, "requester", "id")
++
++    get "/api/v1/requests", params: { page: 0 },
++      headers: authenticated_headers(customer_token, account)
++    assert_response :bad_request
++  end
++
++  test "staff comments can be private while customer replies stay public" do
++    account, owner, customer = create_portal_users
++    owner_token = issue_token(owner)
++    customer_token = issue_token(customer)
++    ticket = create_request(customer, "Private note", customer_token, account)
++
++    patch "/api/v1/tickets/#{ticket.id}",
++      params: {
++        ticket: {
++          comment: { body: "Internal handoff", public: false }
++        }
++      },
++      headers: authenticated_headers(owner_token, account),
++      as: :json
++    assert_response :success
++
++    get "/api/v1/tickets/#{ticket.id}/comments",
++      headers: authenticated_headers(owner_token, account)
++    assert_response :success
++    assert_equal [ true, false ], response.parsed_body["comments"].map { |comment| comment["public"] }
++
++    get "/api/v1/requests/#{ticket.id}/comments",
++      params: { per_page: 1 },
++      headers: authenticated_headers(customer_token, account)
++    assert_response :success
++    assert_equal 1, response.parsed_body["count"]
++    assert_equal true, response.parsed_body.dig("comments", 0, "public")
++  end
++
++  private
++
++  def create_portal_users
++    account = Account.create!(name: "Acme", subdomain: "acme")
++    owner = account.users.create!(
++      name: "Jo",
++      email: "jo@acme.test",
++      password: "owner-password",
++      role: "admin",
++      owner: true,
++      verified: true
++    )
++    customer = account.users.create!(
++      name: "Avery",
++      email: "avery@example.test",
++      password: "customer-password",
++      role: "member",
++      verified: true
++    )
++
++    [ account, owner, customer ]
++  end
++
++  def create_request(customer, subject, token, account)
++    post "/api/v1/requests",
++      params: { request: { subject: subject, comment: { body: "Please help." } } },
++      headers: authenticated_headers(token, account),
++      as: :json
++    assert_response :created
++
++    Ticket.find(response.parsed_body.dig("request", "id"))
++  end
++
++  def issue_token(user)
++    Session.issue_for(user).last
++  end
++
++  def token_from_latest_mail
++    link = ActionMailer::Base.deliveries.last.body.decoded[%r{https?://[^\s]+}]
++    URI.decode_www_form_component(link[/[?&]token=([^&\s]+)/, 1])
++  end
++
++  def account_headers(account)
++    { "X-Helpdesk-Account" => account.subdomain }
++  end
++
++  def authenticated_headers(token, account)
++    account_headers(account).merge("Authorization" => "Bearer #{token}")
++  end
++end
