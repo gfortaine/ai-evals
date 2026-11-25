@@ -1,0 +1,247 @@
+diff --git a/app/models/book/access_import.rb b/app/models/book/access_import.rb
+index 4d920cf..3580242 100644
+--- a/app/models/book/access_import.rb
++++ b/app/models/book/access_import.rb
+@@ -6,20 +6,73 @@ class Book::AccessImport
+   end
+ 
+   def import
+-    accesses = []
+-    duplicate_index = nil
+-
+-    Access.transaction do
+-      @grants.each_with_index do |grant, index|
+-        access = @book.accesses.create!(user_id: grant[:user_id], level: grant[:level])
+-        Book::AccessNotificationJob.perform_later(access)
+-        accesses << access
+-      rescue ActiveRecord::RecordNotUnique
+-        duplicate_index = index
+-        raise ActiveRecord::Rollback
++    rows = @grants.map do |grant|
++      {
++        user_id: Access.type_for_attribute("user_id").cast(grant[:user_id]),
++        level: grant[:level].to_s
++      }
++    end
++
++    return Result.new([], nil) if rows.empty?
++
++    duplicate_index = find_duplicate_index(rows)
++    return Result.new([], duplicate_index) if duplicate_index
++
++    inserted = nil
++
++    begin
++      Access.transaction do
++        inserted = @book.accesses.insert_all!(
++          rows,
++          returning: %w[id book_id user_id level created_at updated_at]
++        )
+       end
++    rescue ActiveRecord::RecordNotUnique
++      duplicate_index = find_duplicate_index(rows) || 0
++      return Result.new([], duplicate_index)
+     end
+ 
+-    duplicate_index ? Result.new([], duplicate_index) : Result.new(accesses, nil)
++    inserted_by_user_id = inserted.to_a.index_by { |attributes| attributes["user_id"] }
++    accesses = rows.map do |row|
++      Access.instantiate(inserted_by_user_id[row[:user_id]]).tap do |access|
++        access.book = @book
++      end
++    end
++
++    accesses.each { |access| Book::AccessNotificationJob.perform_later(access) }
++
++    Result.new(accesses, nil)
+   end
++
++  private
++    def find_duplicate_index(rows)
++      seen_user_ids = {}
++      input_duplicate_index = nil
++
++      rows.each_with_index do |row, index|
++        if !Access.levels.key?(row[:level])
++          input_duplicate_index ||= index
++        elsif seen_user_ids.key?(row[:user_id])
++          input_duplicate_index ||= index
++        else
++          seen_user_ids[row[:user_id]] = true
++        end
++      end
++
++      return input_duplicate_index if input_duplicate_index == 0
++
++      rows_to_check = input_duplicate_index ? rows.first(input_duplicate_index) : rows
++      user_ids = rows_to_check.filter_map { |row| row[:user_id] }.uniq
++      existing_user_ids = if user_ids.empty?
++        {}
++      else
++        @book.accesses.where(user_id: user_ids).pluck(:user_id).index_with(true)
++      end
++
++      existing_duplicate_index = rows_to_check.index do |row|
++        existing_user_ids.key?(row[:user_id])
++      end
++
++      [ input_duplicate_index, existing_duplicate_index ].compact.min
++    end
+ end
+diff --git a/test/models/book/access_import_test.rb b/test/models/book/access_import_test.rb
+new file mode 100644
+index 0000000..e6b8f7a
+--- /dev/null
++++ b/test/models/book/access_import_test.rb
+@@ -0,0 +1,151 @@
++require "test_helper"
++require "active_job/test_helper"
++
++class Book::AccessImportTest < ActiveSupport::TestCase
++  include ActiveJob::TestHelper
++
++  test "bulk imports all grants and notifies after success" do
++    book = Book.create!(title: "Import success", everyone_access: false)
++
++    assert_enqueued_jobs 2, only: Book::AccessNotificationJob do
++      result = Book::AccessImport.new(book, [
++        { user_id: users(:jz).id, level: :reader },
++        { user_id: users(:kevin).id, level: :editor }
++      ]).import
++
++      assert_equal [ users(:jz).id, users(:kevin).id ], result.accesses.map(&:user_id)
++      assert_nil result.duplicate_index
++    end
++
++    assert_equal 2, book.accesses.count
++  end
++
++  test "rejects an existing access without inserting or notifying" do
++    book = books(:manual)
++    original_count = book.accesses.count
++
++    assert_no_enqueued_jobs only: Book::AccessNotificationJob do
++      result = Book::AccessImport.new(book, [
++        { user_id: users(:kevin).id, level: :reader },
++        { user_id: users(:jz).id, level: :editor }
++      ]).import
++
++      assert_empty result.accesses
++      assert_equal 1, result.duplicate_index
++    end
++
++    assert_equal original_count, book.accesses.count
++  end
++
++  test "rejects a repeated user without inserting or notifying" do
++    book = Book.create!(title: "Import duplicate", everyone_access: false)
++
++    assert_no_enqueued_jobs only: Book::AccessNotificationJob do
++      result = Book::AccessImport.new(book, [
++        { user_id: users(:jz).id, level: :reader },
++        { user_id: users(:jz).id, level: :editor }
++      ]).import
++
++      assert_empty result.accesses
++      assert_equal 1, result.duplicate_index
++    end
++
++    assert_equal 0, book.accesses.count
++  end
++
++  test "rejects an unknown level without inserting or notifying" do
++    book = Book.create!(title: "Import unknown level", everyone_access: false)
++
++    assert_no_enqueued_jobs only: Book::AccessNotificationJob do
++      result = nil
++
++      assert_nothing_raised do
++        result = Book::AccessImport.new(book, [
++          { user_id: users(:jz).id, level: :reader },
++          { user_id: users(:kevin).id, level: :owner }
++        ]).import
++      end
++
++      assert_empty result.accesses
++      assert_equal 1, result.duplicate_index
++    end
++
++    assert_equal 0, book.accesses.count
++  end
++
++  test "four and sixteen grants use the same number of write queries" do
++    import_users = 16.times.map do |index|
++      User.create!(
++        name: "Import user #{index}",
++        email_address: "import-user-#{index}@example.com",
++        password: "secret123456"
++      )
++    end
++
++    book_4 = Book.create!(title: "Import four", everyone_access: false)
++    book_16 = Book.create!(title: "Import sixteen", everyone_access: false)
++
++    write_queries = lambda do |book, grants|
++      count = 0
++
++      ActiveSupport::Notifications.subscribed(->(_name, _start, _finish, _id, payload) {
++        count += 1 if payload[:sql]&.match?(/\A\s*(INSERT|UPDATE|DELETE)/i)
++      }, "sql.active_record") do
++        Book::AccessImport.new(book, grants).import
++      end
++
++      count
++    end
++
++    four_count = write_queries.call(
++      book_4,
++      import_users.first(4).map { |user| { user_id: user.id, level: :reader } }
++    )
++    sixteen_count = write_queries.call(
++      book_16,
++      import_users.map { |user| { user_id: user.id, level: :reader } }
++    )
++
++    assert_equal four_count, sixteen_count
++  end
++
++  test "larger rejected rosters use no write queries" do
++    import_users = 16.times.map do |index|
++      User.create!(
++        name: "Rejected import user #{index}",
++        email_address: "rejected-import-user-#{index}@example.com",
++        password: "secret123456"
++      )
++    end
++
++    book_4 = Book.create!(title: "Rejected four", everyone_access: false)
++    book_16 = Book.create!(title: "Rejected sixteen", everyone_access: false)
++
++    book_4.accesses.create!(user_id: import_users.first.id, level: :reader)
++    book_16.accesses.create!(user_id: import_users.first.id, level: :reader)
++
++    write_queries = lambda do |book, grants|
++      count = 0
++
++      ActiveSupport::Notifications.subscribed(->(_name, _start, _finish, _id, payload) {
++        count += 1 if payload[:sql]&.match?(/\A\s*(INSERT|UPDATE|DELETE)/i)
++      }, "sql.active_record") do
++        Book::AccessImport.new(book, grants).import
++      end
++
++      count
++    end
++
++    four_count = write_queries.call(
++      book_4,
++      import_users.first(4).map { |user| { user_id: user.id, level: :reader } }
++    )
++    sixteen_count = write_queries.call(
++      book_16,
++      import_users.map { |user| { user_id: user.id, level: :reader } }
++    )
++
++    assert_equal 0, four_count
++    assert_equal four_count, sixteen_count
++  end
++end

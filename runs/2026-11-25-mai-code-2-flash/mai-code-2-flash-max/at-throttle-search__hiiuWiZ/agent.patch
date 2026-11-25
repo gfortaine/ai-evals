@@ -1,0 +1,190 @@
+diff --git a/app/controllers/books/searches_controller.rb b/app/controllers/books/searches_controller.rb
+index 5268c55..891f78c 100644
+--- a/app/controllers/books/searches_controller.rb
++++ b/app/controllers/books/searches_controller.rb
+@@ -1,6 +1,13 @@
+ class Books::SearchesController < ApplicationController
+   allow_unauthenticated_access
+ 
++  rate_limit to: 30,
++    within: 1.minute,
++    only: :create,
++    by: -> { request.remote_ip },
++    with: -> { head :too_many_requests },
++    store: SearchRateLimitStore.instance
++
+   include BookScoped
+ 
+   def create
+diff --git a/lib/search_rate_limit_store.rb b/lib/search_rate_limit_store.rb
+new file mode 100644
+index 0000000..a844f17
+--- /dev/null
++++ b/lib/search_rate_limit_store.rb
+@@ -0,0 +1,96 @@
++require "securerandom"
++
++class SearchRateLimitStore
++  LIMIT = 30
++  WINDOW_MS = 60_000
++  RETENTION_MS = 300_000
++
++  LUA_INCREMENT = <<~LUA
++    local cutoff = tonumber(ARGV[1])
++    redis.call("ZREMRANGEBYSCORE", KEYS[1], "-inf", cutoff)
++
++    local count = redis.call("ZCARD", KEYS[1])
++    local amount = tonumber(ARGV[2])
++
++    if count + amount > tonumber(ARGV[3]) then
++      redis.call("PEXPIRE", KEYS[1], ARGV[5])
++      return count + amount
++    end
++
++    local now = tonumber(ARGV[4])
++    local member_prefix = ARGV[6]
++    for i = 1, amount do
++      redis.call("ZADD", KEYS[1], now, member_prefix .. i)
++    end
++    redis.call("PEXPIRE", KEYS[1], ARGV[5])
++
++    return count + amount
++  LUA
++
++  def self.instance
++    @instance ||= new
++  end
++
++  def initialize
++    @memory = {}
++    @memory_mutex = Mutex.new
++  end
++
++  def clear
++    @memory_mutex.synchronize { @memory.clear }
++  end
++
++  def increment(key, amount = 1, expires_in: nil)
++    amount = [ amount.to_i, 0 ].max
++    redis = redis_cache_client
++
++    redis ? increment_in_redis(redis, key, amount) : increment_in_memory(key, amount)
++  rescue Redis::BaseError, RedisClient::Error, ConnectionPool::TimeoutError, IOError, SystemCallError => error
++    Rails.logger&.warn("Search rate limit store is using process-local memory because Redis is unavailable: #{error.class}: #{error.message}")
++    increment_in_memory(key, amount)
++  end
++
++  private
++    def redis_cache_client
++      cache = Rails.cache
++      cache.redis if cache.respond_to?(:redis)
++    end
++
++    def increment_in_redis(redis, key, amount)
++      now_ms = (Time.now.to_f * 1000).to_i
++      cutoff_ms = now_ms - WINDOW_MS
++
++      arguments = {
++        keys: [ "search-rate-limit:#{key}" ],
++        argv: [ cutoff_ms, amount, LIMIT, now_ms, RETENTION_MS, "#{SecureRandom.hex(8)}:" ]
++      }
++
++      if redis.respond_to?(:with)
++        redis.with { |connection| connection.eval(LUA_INCREMENT, **arguments) }
++      else
++        redis.eval(LUA_INCREMENT, **arguments)
++      end
++    end
++
++    def increment_in_memory(key, amount)
++      now_ms = (Time.now.to_f * 1000).to_i
++      cutoff_ms = now_ms - WINDOW_MS
++
++      @memory_mutex.synchronize do
++        @memory.delete_if do |_memory_key, timestamps|
++          timestamps.reject! { |timestamp| timestamp <= cutoff_ms }
++          timestamps.empty?
++        end
++
++        timestamps = (@memory[key] ||= [])
++        count = timestamps.length
++
++        if count + amount <= LIMIT
++          amount.times { timestamps << now_ms }
++          timestamps.length
++        else
++          count + amount
++        end
++      end
++    end
++end
+diff --git a/test/controllers/books/searches_controller_test.rb b/test/controllers/books/searches_controller_test.rb
+index b48726d..b9f497c 100644
+--- a/test/controllers/books/searches_controller_test.rb
++++ b/test/controllers/books/searches_controller_test.rb
+@@ -2,11 +2,65 @@ require "test_helper"
+ 
+ class Books::SearchesControllerTest < ActionDispatch::IntegrationTest
+   setup do
++    SearchRateLimitStore.instance.clear
+     sign_in :kevin
+ 
+     Leaf.reindex_all
+   end
+ 
++  teardown do
++    SearchRateLimitStore.instance.clear
++  end
++
++  test "create limits searches to 30 per IP per minute" do
++    sign_out
++    books(:handbook).update!(published: true)
++    ip_address = "203.0.113.10"
++
++    30.times do
++      post book_search_url(books(:handbook)), params: { search: "Thanks" }, headers: { "REMOTE_ADDR" => ip_address }
++      assert_response :success
++    end
++
++    post book_search_url(books(:handbook)), params: { search: "Thanks" }, headers: { "REMOTE_ADDR" => ip_address }
++    assert_response :too_many_requests
++
++    travel 61.seconds
++
++    post book_search_url(books(:handbook)), params: { search: "Thanks" }, headers: { "REMOTE_ADDR" => ip_address }
++    assert_response :success
++  end
++
++  test "create rate limiting does not affect another IP" do
++    sign_out
++    books(:handbook).update!(published: true)
++    ip_address = "203.0.113.11"
++
++    31.times do
++      post book_search_url(books(:handbook)), params: { search: "Thanks" }, headers: { "REMOTE_ADDR" => ip_address }
++    end
++
++    assert_response :too_many_requests
++
++    post book_search_url(books(:handbook)), params: { search: "Thanks" }, headers: { "REMOTE_ADDR" => "198.51.100.20" }
++    assert_response :success
++  end
++
++  test "create rate limiting does not block book pages for the refused IP" do
++    sign_out
++    books(:handbook).update!(published: true)
++    ip_address = "203.0.113.12"
++
++    31.times do
++      post book_search_url(books(:handbook)), params: { search: "Thanks" }, headers: { "REMOTE_ADDR" => ip_address }
++    end
++
++    assert_response :too_many_requests
++
++    get book_slug_path(books(:handbook)), headers: { "REMOTE_ADDR" => ip_address }
++    assert_response :success
++  end
++
+   test "create finds matching pages" do
+     post book_search_url(books(:handbook)), params: { search: "Thanks" }
+ 

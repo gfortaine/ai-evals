@@ -1,0 +1,586 @@
+diff --git a/app/controllers/bots_controller.rb b/app/controllers/bots_controller.rb
+index e843c07..fc5850c 100644
+--- a/app/controllers/bots_controller.rb
++++ b/app/controllers/bots_controller.rb
+@@ -43,6 +43,6 @@ class BotsController < ApplicationController
+     end
+ 
+     def bot_params
+-      params.require(:bot).permit(:name, :avatar, :webhook_url)
++      params.require(:bot).permit(:name, :avatar, :webhook_url, :add_to_all_open_rooms)
+     end
+ end
+diff --git a/app/jobs/bot/joined_webhook_job.rb b/app/jobs/bot/joined_webhook_job.rb
+new file mode 100644
+index 0000000..7f9bdfc
+--- /dev/null
++++ b/app/jobs/bot/joined_webhook_job.rb
+@@ -0,0 +1,60 @@
++require "net/http"
++require "uri"
++
++class Bot::JoinedWebhookJob < ApplicationJob
++  OPEN_TIMEOUT = 5
++  READ_TIMEOUT = 10
++
++  def perform(bot, room)
++    return if room.direct?
++    return unless bot.active? && bot.webhook_url.present?
++
++    event = BotRoomJoinEvent.pending_for(bot, room)
++    return unless event.claim!
++
++    uri = URI.parse(bot.webhook_url)
++    raise URI::InvalidURIError unless uri.is_a?(URI::HTTP)
++
++    response = Net::HTTP.start(
++      uri.host,
++      uri.port,
++      use_ssl: uri.scheme == "https",
++      open_timeout: OPEN_TIMEOUT,
++      read_timeout: READ_TIMEOUT
++    ) do |http|
++      request = Net::HTTP::Post.new(uri.request_uri)
++      request["Content-Type"] = "application/json"
++      request.body = payload_for(bot, room).to_json
++      http.request(request)
++    end
++
++    post_synchronous_reply(bot, room, response)
++  rescue StandardError => error
++    Rails.logger.warn "Bot joined webhook failed for bot #{bot&.id}: #{error.class}: #{error.message}"
++  end
++
++  private
++    def payload_for(bot, room)
++      {
++        event: "joined",
++        room: {
++          id: room.id,
++          name: room.name,
++          reply_to: "/rooms/#{room.id}/#{bot.bot_code}/messages"
++        }
++      }
++    end
++
++    def post_synchronous_reply(bot, room, response)
++      return unless response.is_a?(Net::HTTPOK)
++
++      content_type = response["Content-Type"].to_s.split(";", 2).first.to_s.strip.downcase
++      return unless %w[text/plain text/html].include?(content_type)
++
++      body = response.body.to_s.dup.force_encoding(Encoding::UTF_8).scrub
++      return if body.strip.blank?
++
++      reply = room.messages.create_with_attachment!(creator: bot, body: body)
++      reply.broadcast_create
++    end
++end
+diff --git a/app/jobs/bot/webhook_job.rb b/app/jobs/bot/webhook_job.rb
+index f859ee4..7ed98fa 100644
+--- a/app/jobs/bot/webhook_job.rb
++++ b/app/jobs/bot/webhook_job.rb
+@@ -1 +1,9 @@
+-Bot::WebhookJob = Bot::MentionWebhookJob
++class Bot::WebhookJob < ApplicationJob
++  def perform(bot, subject)
++    if subject.is_a?(Message)
++      Bot::MentionWebhookJob.new.perform(bot, subject)
++    elsif subject.is_a?(Room)
++      Bot::JoinedWebhookJob.new.perform(bot, subject)
++    end
++  end
++end
+diff --git a/app/models/bot.rb b/app/models/bot.rb
+index 0a796c5..dda14e9 100644
+--- a/app/models/bot.rb
++++ b/app/models/bot.rb
+@@ -3,8 +3,13 @@ class Bot < User
+ 
+   default_scope -> { where(bot: true) }
+ 
++  after_create_commit :join_all_open_rooms_when_enabled
++  after_update_commit :update_open_room_memberships
++
+   has_secure_token :bot_code, length: 32
+ 
++  has_many :bot_room_join_events, foreign_key: :bot_id, dependent: :delete_all
++
+   alias_attribute :bot_webhook_url, :webhook_url
+ 
+   belongs_to :creator, class_name: "User", foreign_key: :bot_creator_id,
+@@ -35,7 +40,32 @@ class Bot < User
+     find_by(bot_code: code)
+   end
+ 
++  def join_all_open_rooms_when_enabled
++    return unless add_to_all_open_rooms?
++
++    Rooms::Open.find_each { |room| room.memberships.grant_to([ self ]) }
++  end
++
++  def enqueue_pending_join_events
++    rooms.without_directs.find_each do |room|
++      event = BotRoomJoinEvent.pending_for(self, room)
++      if active? && webhook_url.present? && event.enqueue!
++        Bot::JoinedWebhookJob.perform_later(self, room)
++      end
++    end
++  end
++
+   private
++    def update_open_room_memberships
++      if saved_change_to_add_to_all_open_rooms? && add_to_all_open_rooms?
++        join_all_open_rooms_when_enabled
++      end
++
++      if (saved_change_to_add_to_all_open_rooms? || saved_change_to_webhook_url? || saved_change_to_status?) && webhook_url.present? && active?
++        enqueue_pending_join_events
++      end
++    end
++
+     def normalize_webhook_url
+       self.webhook_url = webhook_url.to_s.strip.presence
+     end
+diff --git a/app/models/bot_room_join_event.rb b/app/models/bot_room_join_event.rb
+new file mode 100644
+index 0000000..885a817
+--- /dev/null
++++ b/app/models/bot_room_join_event.rb
+@@ -0,0 +1,32 @@
++class BotRoomJoinEvent < ApplicationRecord
++  belongs_to :bot, class_name: "Bot"
++  belongs_to :room
++
++  validates :bot_id, uniqueness: { scope: :room_id }
++
++  def self.pending_for(bot, room)
++    find_or_create_by!(bot_id: bot.id, room_id: room.id)
++  end
++
++  def enqueue!
++    with_lock do
++      if queued_at.nil? && dispatched_at.nil?
++        update!(queued_at: Time.current)
++        true
++      else
++        false
++      end
++    end
++  end
++
++  def claim!
++    with_lock do
++      if dispatched_at.nil?
++        update!(dispatched_at: Time.current)
++        true
++      else
++        false
++      end
++    end
++  end
++end
+diff --git a/app/models/membership.rb b/app/models/membership.rb
+index 74c225b..21bf9d2 100644
+--- a/app/models/membership.rb
++++ b/app/models/membership.rb
+@@ -4,6 +4,7 @@ class Membership < ApplicationRecord
+   belongs_to :room
+   belongs_to :user
+ 
++  after_create_commit :announce_bot_join
+   after_destroy_commit { user.reset_remote_connections }
+ 
+   enum :involvement, %w[ invisible nothing mentions everything ].index_by(&:itself), prefix: :involved_in
+@@ -21,4 +22,18 @@ class Membership < ApplicationRecord
+   def unread?
+     unread_at.present?
+   end
++
++  private
++    def announce_bot_join
++      return unless user.bot?
++      return if room.direct?
++
++      bot = Bot.find_by(id: user_id)
++      return unless bot
++
++      event = BotRoomJoinEvent.pending_for(bot, room)
++      if bot.active? && bot.webhook_url.present? && event.enqueue!
++        Bot::JoinedWebhookJob.perform_later(bot, room)
++      end
++    end
+ end
+diff --git a/app/models/room.rb b/app/models/room.rb
+index 543fee2..4eb816a 100644
+--- a/app/models/room.rb
++++ b/app/models/room.rb
+@@ -2,7 +2,11 @@ class Room < ApplicationRecord
+   has_many :memberships, dependent: :delete_all do
+     def grant_to(users)
+       room = proxy_association.owner
+-      Membership.insert_all(Array(users).collect { |user| { room_id: room.id, user_id: user.id, involvement: room.default_involvement } })
++      Array(users).each do |user|
++        Membership.find_or_create_by!(room_id: room.id, user_id: user.id) do |membership|
++          membership.involvement = room.default_involvement
++        end
++      end
+     end
+ 
+     def revoke_from(users)
+@@ -19,6 +23,7 @@ class Room < ApplicationRecord
+ 
+   has_many :users, through: :memberships
+   has_many :messages, dependent: :destroy
++  has_many :bot_room_join_events, dependent: :delete_all
+ 
+   belongs_to :creator, class_name: "User", default: -> { Current.user }
+ 
+diff --git a/app/models/rooms/open.rb b/app/models/rooms/open.rb
+index 9a53690..5ade292 100644
+--- a/app/models/rooms/open.rb
++++ b/app/models/rooms/open.rb
+@@ -4,6 +4,9 @@ class Rooms::Open < Room
+ 
+   private
+     def grant_access_to_all_users
+-      memberships.grant_to(User.members) if type_previously_changed?(to: "Rooms::Open")
++      if type_previously_changed?(to: "Rooms::Open")
++        memberships.grant_to(User.humans.members)
++        memberships.grant_to(Bot.members.where(add_to_all_open_rooms: true))
++      end
+     end
+ end
+diff --git a/app/models/user.rb b/app/models/user.rb
+index 578b1d3..07abaf3 100644
+--- a/app/models/user.rb
++++ b/app/models/user.rb
+@@ -55,7 +55,9 @@ class User < ApplicationRecord
+ 
+   private
+     def grant_membership_to_open_rooms
+-      Membership.insert_all(Rooms::Open.pluck(:id).collect { |room_id| { room_id: room_id, user_id: id } })
++      return if bot?
++
++      Rooms::Open.find_each { |room| room.memberships.grant_to([ self ]) }
+     end
+ 
+     def deactived_email_address
+diff --git a/app/views/bots/_form.html.erb b/app/views/bots/_form.html.erb
+index 4de651e..2a0fea8 100644
+--- a/app/views/bots/_form.html.erb
++++ b/app/views/bots/_form.html.erb
+@@ -19,6 +19,14 @@
+         aria: { label: "Webhook URL" } %>
+   </label>
+ 
++  <label class="flex align-center gap flex-item-grow input input--actor">
++    <span class="flex-item-grow">Add to all open rooms</span>
++    <span class="switch">
++      <%= form.check_box :add_to_all_open_rooms, class: "switch__input", aria: { label: "Add to all open rooms" } %>
++      <span class="switch__btn round"></span>
++    </span>
++  </label>
++
+   <%= form.button type: "submit", class: "btn btn--reversed txt-large center" do %>
+     <span>Save changes</span>
+   <% end %>
+diff --git a/db/migrate/20261121140000_add_all_open_rooms_and_join_tracking.rb b/db/migrate/20261121140000_add_all_open_rooms_and_join_tracking.rb
+new file mode 100644
+index 0000000..ad10287
+--- /dev/null
++++ b/db/migrate/20261121140000_add_all_open_rooms_and_join_tracking.rb
+@@ -0,0 +1,15 @@
++class AddAllOpenRoomsAndJoinTracking < ActiveRecord::Migration[8.1]
++  def change
++    add_column :users, :add_to_all_open_rooms, :boolean, default: false, null: false
++
++    create_table :bot_room_join_events do |t|
++      t.references :bot, null: false, foreign_key: { to_table: :users }
++      t.references :room, null: false, foreign_key: true
++      t.datetime :dispatched_at
++
++      t.timestamps
++    end
++
++    add_index :bot_room_join_events, [ :bot_id, :room_id ], unique: true
++  end
++end
+diff --git a/db/migrate/20261121141000_add_join_queue_tracking.rb b/db/migrate/20261121141000_add_join_queue_tracking.rb
+new file mode 100644
+index 0000000..90ede94
+--- /dev/null
++++ b/db/migrate/20261121141000_add_join_queue_tracking.rb
+@@ -0,0 +1,5 @@
++class AddJoinQueueTracking < ActiveRecord::Migration[8.1]
++  def change
++    add_column :bot_room_join_events, :queued_at, :datetime
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 1bf0624..259934d 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.1].define(version: 2026_11_21_123000) do
++ActiveRecord::Schema[8.1].define(version: 2026_11_21_141000) do
+   create_table "accounts", force: :cascade do |t|
+     t.datetime "created_at", null: false
+     t.text "custom_styles"
+@@ -79,6 +79,18 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_21_123000) do
+     t.index ["message_id"], name: "index_boosts_on_message_id"
+   end
+ 
++  create_table "bot_room_join_events", force: :cascade do |t|
++    t.integer "bot_id", null: false
++    t.datetime "created_at", null: false
++    t.datetime "dispatched_at"
++    t.datetime "queued_at"
++    t.integer "room_id", null: false
++    t.datetime "updated_at", null: false
++    t.index ["bot_id", "room_id"], name: "index_bot_room_join_events_on_bot_id_and_room_id", unique: true
++    t.index ["bot_id"], name: "index_bot_room_join_events_on_bot_id"
++    t.index ["room_id"], name: "index_bot_room_join_events_on_room_id"
++  end
++
+   create_table "memberships", force: :cascade do |t|
+     t.datetime "connected_at"
+     t.integer "connections", default: 0, null: false
+@@ -145,6 +157,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_21_123000) do
+   end
+ 
+   create_table "users", force: :cascade do |t|
++    t.boolean "add_to_all_open_rooms", default: false, null: false
+     t.text "bio"
+     t.boolean "bot", default: false, null: false
+     t.string "bot_code"
+@@ -166,6 +179,8 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_21_123000) do
+   add_foreign_key "active_storage_variant_records", "active_storage_blobs", column: "blob_id"
+   add_foreign_key "bans", "users"
+   add_foreign_key "boosts", "messages"
++  add_foreign_key "bot_room_join_events", "rooms"
++  add_foreign_key "bot_room_join_events", "users", column: "bot_id"
+   add_foreign_key "messages", "rooms"
+   add_foreign_key "messages", "users", column: "creator_id"
+   add_foreign_key "push_subscriptions", "users"
+diff --git a/test/controllers/bots/messages_controller_test.rb b/test/controllers/bots/messages_controller_test.rb
+index 0d1d458..42e127c 100644
+--- a/test/controllers/bots/messages_controller_test.rb
++++ b/test/controllers/bots/messages_controller_test.rb
+@@ -4,6 +4,7 @@ class Bots::MessagesControllerTest < ActionDispatch::IntegrationTest
+   setup do
+     @bot = Bot.create!(name: "Deploy Bot", creator: users(:david))
+     @room = rooms(:hq)
++    @room.memberships.grant_to(@bot)
+   end
+ 
+   test "raw body creates a bot message and returns the location" do
+diff --git a/test/controllers/bots_controller_test.rb b/test/controllers/bots_controller_test.rb
+index b09f85b..be2bf3d 100644
+--- a/test/controllers/bots_controller_test.rb
++++ b/test/controllers/bots_controller_test.rb
+@@ -65,6 +65,20 @@ class BotsControllerTest < ActionDispatch::IntegrationTest
+     assert_nil bot.reload.webhook_url
+   end
+ 
++  test "bot forms label and submit the add to all open rooms switch" do
++    get new_bot_url
++    assert_response :success
++    assert_select "label", text: /Add to all open rooms/
++    assert_select "input[type='checkbox'][name='bot[add_to_all_open_rooms]'][aria-label='Add to all open rooms']"
++
++    bot = Bot.create!(name: "Deploy Bot", creator: users(:david))
++    patch bot_url(bot), params: { bot: { add_to_all_open_rooms: "1" } }
++    assert bot.reload.add_to_all_open_rooms?
++
++    patch bot_url(bot), params: { bot: { add_to_all_open_rooms: "0" } }
++    assert_not bot.reload.add_to_all_open_rooms?
++  end
++
+   test "bot forms label the webhook URL" do
+     get new_bot_url
+     assert_response :success
+diff --git a/test/jobs/bot/joined_webhook_job_test.rb b/test/jobs/bot/joined_webhook_job_test.rb
+new file mode 100644
+index 0000000..17471db
+--- /dev/null
++++ b/test/jobs/bot/joined_webhook_job_test.rb
+@@ -0,0 +1,71 @@
++require "test_helper"
++
++class Bot::JoinedWebhookJobTest < ActiveSupport::TestCase
++  setup do
++    @bot = Bot.create!(
++      name: "Deploy Bot",
++      creator: users(:david),
++      webhook_url: "https://example.com/hooks/deploy"
++    )
++    @room = rooms(:hq)
++  end
++
++  test "posts the joined payload and accepts a text synchronous reply once" do
++    stub_request(:post, @bot.webhook_url).with do |request|
++      payload = JSON.parse(request.body)
++
++      assert_equal "application/json", request.headers["Content-Type"]
++      assert_equal "joined", payload["event"]
++      assert_equal @room.id, payload["room"]["id"]
++      assert_equal @room.name, payload["room"]["name"]
++      assert_equal "/rooms/#{@room.id}/#{@bot.bot_code}/messages", payload["room"]["reply_to"]
++
++      true
++    end.to_return(status: 200, body: "Hello from the bot", headers: { "Content-Type" => "text/plain" })
++
++    assert_difference -> { Message.count }, 1 do
++      Bot::JoinedWebhookJob.new.perform(@bot, @room)
++      Bot::JoinedWebhookJob.new.perform(@bot, @room)
++    end
++
++    reply = Message.order(:created_at).last
++    assert_equal @bot, reply.creator
++    assert_equal @room, reply.room
++    assert_equal "Hello from the bot", reply.plain_text_body
++  end
++
++  test "accepts an HTML synchronous reply" do
++    stub_request(:post, @bot.webhook_url).to_return(
++      status: 200,
++      body: "<div>Hello from the bot</div>",
++      headers: { "Content-Type" => "text/html" }
++    )
++
++    assert_difference -> { Message.count }, 1 do
++      Bot::JoinedWebhookJob.new.perform(@bot, @room)
++    end
++
++    assert_equal "Hello from the bot", Message.order(:created_at).last.plain_text_body
++  end
++
++  test "does not post or create an event for a direct room" do
++    direct = rooms(:david_and_jason)
++
++    stub = stub_request(:post, @bot.webhook_url).to_return(status: 200, body: "Hello")
++
++    assert_no_difference -> { Message.count } do
++      Bot::JoinedWebhookJob.new.perform(@bot, direct)
++    end
++
++    assert_not_requested stub
++    assert_not BotRoomJoinEvent.exists?(bot: @bot, room: direct)
++  end
++
++  test "204 does not post a reply" do
++    stub_request(:post, @bot.webhook_url).to_return(status: 204)
++
++    assert_no_difference -> { Message.count } do
++      Bot::JoinedWebhookJob.new.perform(@bot, @room)
++    end
++  end
++end
+diff --git a/test/models/bot_test.rb b/test/models/bot_test.rb
+index c7c2c4b..e2bb266 100644
+--- a/test/models/bot_test.rb
++++ b/test/models/bot_test.rb
+@@ -1,14 +1,32 @@
+ require "test_helper"
+ 
+ class BotTest < ActiveSupport::TestCase
+-  test "creating a bot grants membership to open rooms" do
++  test "creating a bot does not grant membership to open rooms by default" do
+     bot = Bot.create!(name: "Deploy Bot", creator: users(:david))
+ 
+     assert bot.bot?
+     assert bot.bot_code.present?
++    assert_not bot.add_to_all_open_rooms?
++    assert_empty bot.rooms
++  end
++
++  test "the add to all open rooms switch joins existing open rooms" do
++    bot = Bot.create!(name: "Deploy Bot", creator: users(:david))
++
++    bot.update!(add_to_all_open_rooms: true)
++
+     assert_equal Rooms::Open.pluck(:id).sort, bot.rooms.pluck(:id).sort
+   end
+ 
++  test "turning off the add to all open rooms switch keeps memberships" do
++    bot = Bot.create!(name: "Deploy Bot", creator: users(:david), add_to_all_open_rooms: true)
++    room_ids = bot.rooms.pluck(:id)
++
++    bot.update!(add_to_all_open_rooms: false)
++
++    assert_equal room_ids.sort, bot.reload.rooms.pluck(:id).sort
++  end
++
+   test "bot codes are unique" do
+     bot = Bot.create!(name: "Deploy Bot", creator: users(:david))
+ 
+@@ -16,11 +34,13 @@ class BotTest < ActiveSupport::TestCase
+     assert_not_equal bot.bot_code, Bot.create!(name: "Other Bot", creator: users(:david)).bot_code
+   end
+ 
+-  test "new open rooms grant membership to bots" do
+-    bot = Bot.create!(name: "Deploy Bot", creator: users(:david))
++  test "new open rooms only grant membership to opted-in bots" do
++    opted_in = Bot.create!(name: "Opted In Bot", creator: users(:david), add_to_all_open_rooms: true)
++    opted_out = Bot.create!(name: "Opted Out Bot", creator: users(:david))
+ 
+     room = Rooms::Open.create!(name: "New Open Room", creator: users(:david))
+ 
+-    assert_includes room.users, bot
++    assert_includes room.users, opted_in
++    assert_not_includes room.users, opted_out
+   end
+ end
+diff --git a/test/models/membership_test.rb b/test/models/membership_test.rb
+index 25f8502..aa4f781 100644
+--- a/test/models/membership_test.rb
++++ b/test/models/membership_test.rb
+@@ -82,6 +82,31 @@ class MembershipTest < ActiveSupport::TestCase
+     assert @membership.connected?
+   end
+ 
++test "granting a bot to a room enqueues one joined event for duplicate and re-added memberships" do
++  bot = Bot.create!(name: "Deploy Bot", creator: users(:david), webhook_url: "https://example.com/hooks/deploy")
++  room = rooms(:watercooler)
++
++  assert_enqueued_jobs 1, only: Bot::JoinedWebhookJob do
++    room.memberships.grant_to(bot)
++    room.memberships.grant_to(bot)
++    room.memberships.revoke_from(bot)
++    room.memberships.grant_to(bot)
++  end
++
++  assert room.memberships.exists?(user_id: bot.id)
++end
++
++test "direct room memberships do not enqueue joined events" do
++  bot = Bot.create!(name: "Deploy Bot", creator: users(:david), webhook_url: "https://example.com/hooks/deploy")
++  room = rooms(:david_and_jason)
++
++  assert_no_enqueued_jobs only: Bot::JoinedWebhookJob do
++    room.memberships.grant_to(bot)
++  end
++
++  assert_not BotRoomJoinEvent.exists?(bot: bot, room: room)
++end
++
+   test "removing a membership resets the user's connections" do
+     @membership.user.expects :reset_remote_connections
+ 
+diff --git a/test/models/message_test.rb b/test/models/message_test.rb
+index a65d81d..0c0a4a0 100644
+--- a/test/models/message_test.rb
++++ b/test/models/message_test.rb
+@@ -32,7 +32,7 @@ class MessageTest < ActiveSupport::TestCase
+     room = rooms(:designers)
+     message_body = "<div>#{mention_attachment_for_bot(bot)} restart the build please</div>"
+ 
+-    assert_enqueued_jobs 2, only: [ Room::PushMessageJob, Bot::MentionWebhookJob ] do
++    assert_enqueued_jobs 3, only: [ Room::PushMessageJob, Bot::MentionWebhookJob, Bot::JoinedWebhookJob ] do
+       message = room.messages.create!(creator: users(:jason), body: message_body, client_message_id: "bot-mention")
+       assert_includes message.mentionees, bot
+     end
